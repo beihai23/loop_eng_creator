@@ -36,6 +36,11 @@ func (e *Enforcer) AfterCall(u model.Usage) {
 	e.spent += u.TokensIn + u.TokensOut
 }
 
+// Spent returns the running total of tokens accounted via AfterCall. Exposed
+// for the budget.Client decorator test (carry-forward from Task 12: prove the
+// decorator accumulates spend on every verify Call) and for run reports.
+func (e *Enforcer) Spent() int { return e.spent }
+
 // ShouldRetry: attempt 是当前第几次执行（1 起）；attempt <= MaxRetries 才重试。
 func (e *Enforcer) ShouldRetry(attempt int) bool {
 	return attempt <= e.MaxRetries
