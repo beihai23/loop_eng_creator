@@ -65,8 +65,8 @@ func (c *Config) validate() error {
 	if c.Budget.PerCallTokens <= 0 || c.Budget.PerTaskTokens <= 0 || c.Budget.MaxRetries <= 0 {
 		return fmt.Errorf("budget: per_call_tokens/per_task_tokens/max_retries 必须 > 0")
 	}
-	if c.Models.Triage.Name == "" {
-		return fmt.Errorf("models.triage.name 必填")
+	if c.Models.Triage.Name == "" && c.Models.Triage.Binary == "" {
+		return fmt.Errorf("models.triage 未配置（需 name 或 binary 之一）")
 	}
 	return nil
 }
