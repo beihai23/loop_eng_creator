@@ -12,6 +12,7 @@ func NewRootCmd() *cobra.Command {
 		Use:   "loop-eng",
 		Short: "loop engineering 工具",
 	}
+	cmd.AddCommand(NewInitCmd())
 	return cmd
 }
 
