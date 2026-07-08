@@ -95,3 +95,64 @@ func (s *Store) GetTask(id string) (TaskRow, error) {
 	_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
 	return t, nil
 }
+
+type StepRow struct {
+	RunID, Role, Skill, ModelRef   string
+	Seq                            int
+	InputJSON, OutputJSON          string
+	TokensIn, TokensOut            int
+	Status, Error                  string
+}
+
+func (s *Store) AppendStep(r StepRow) error {
+	id := newID("step")
+	_, err := s.db.Exec(
+		`INSERT INTO steps(id, run_id, seq, role, skill, model_ref, input_hash, input_json, output_json,
+			           tokens_in, tokens_out, status, error, at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, r.RunID, r.Seq, r.Role, r.Skill, r.ModelRef, "", r.InputJSON, r.OutputJSON,
+		r.TokensIn, r.TokensOut, r.Status, r.Error, nowISO())
+	return err
+}
+
+func (s *Store) AppendTransition(taskID, from, to, reason string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
+		 VALUES(?,?,?,?,?,?)`,
+		newID("tr"), taskID, from, to, reason, nowISO())
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
+		to, nowISO(), taskID)
+	return err
+}
+
+func (s *Store) Replay(runID string) ([]StepRow, error) {
+	rows, err := s.db.Query(
+		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,
+		        tokens_in, tokens_out, status, error
+		 FROM steps WHERE run_id=? ORDER BY seq`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StepRow
+	for rows.Next() {
+		var r StepRow
+		if err := rows.Scan(&r.RunID, &r.Seq, &r.Role, &r.Skill, &r.ModelRef, &r.InputJSON,
+			&r.OutputJSON, &r.TokensIn, &r.TokensOut, &r.Status, &r.Error); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AppendBudget(runID, scope, kind string, amount, limit int) error {
+	_, err := s.db.Exec(
+		`INSERT INTO budget_ledger(id, run_id, scope, kind, amount, limit_val, at)
+		 VALUES(?,?,?,?,?,?,?)`,
+		newID("bg"), runID, scope, kind, amount, limit, nowISO())
+	return err
+}
