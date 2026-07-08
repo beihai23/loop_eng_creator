@@ -2732,3 +2732,42 @@ git add -A && git commit -m "feat(skill): 四个 skill 的初稿 prompt"
 - `run-once` 用 panic 处理加载失败（开发入口；M3 daemon 改 error+评论）。
 - `SubLoop.Run` 的 runID 复用 taskID（Replay 测试宽松断言）。
 - tier1 确定性脚本在 `buildTiers` 里暂未从 config 动态装配（M1 链 = LLM + HumanStub）；`Deterministic` 已实现并可单测，M3 在 daemon 组装时接入 config 列表。
+
+---
+
+## 实现裁决（2026-07-08 预检 + 设计意图对齐）
+
+> 预检发现 plan 字面代码与 spec 意图 / DoD 在若干处自相矛盾。以下按 spec 意图裁决，**实现时以此为准**（优先级高于上方各 Task 的字面样例代码）。每条标注 spec 依据。
+
+**A. tier-3 stub 不得阻断 M1 成功路径 —— 改 `SubLoop`，不改 `HumanStub`。**
+- 矛盾：`HumanStub.Check` 返回 `{Passed:true, NeedsHuman:true}`（Task 10），`Chain` 返回末层结果故带 `NeedsHuman:true`；而 `SubLoop.Run` 先判 `NeedsHuman`→`needs-review`，永远到不了 `done`——与 Task 12/14/16 的 `done` 断言、DoD 2702、plan 注释 1539（"M1 里 tier3 不阻断"）全冲突。
+- spec 依据：§2（M1 = tier1/2 + stub）、§7.2/§8.6（tier-3 = **异步**人审 + park + 释放活跃位，**全靠 daemon**）、plan Global Constraint（M1 不做 daemon/park/异步 tier-3）。M1 无 daemon ⇒ tier-3 无法真正执行 ⇒ `HumanStub` 仅占位 + 供 `Chain` 单测。
+- **裁决 A1**：`SubLoop.Run` 尾部，`res.Passed==true` → `done`，**不**因 `res.NeedsHuman` 走 needs-review（那是 M3 park 路由）。把 `NeedsHuman` 记进该 verify step 的 trace（信息不丢），留 `// M3: NeedsHuman → park via daemon` 钩子。`HumanStub` / `Chain` / 各任务 `Tiers` 接线**不变**。`needs-review`/`needs-info` 保留为 `Outcome.Status` 枚举（M3 才产生）。
+
+**B. `done` 必须写战报 —— `SubLoop` 每个终态 PostComment。**
+- 矛盾：`SubLoop` 仅 `blocked` 时 `PostComment`（plan:1948），`done` 不写；但 DoD 2702（"跑出 done **并写战报**"）、Task 14 `outbox/1.md` 断言都要求写。
+- spec 依据：§7.2d（写回 = 落盘 trace + 战报(issue 评论) + 摄取回主循环）、§14（issue 评论即战报）——写回是**每个终态**的动作。
+- **裁决 B1**：`SubLoop` 在每个终态 PostComment：`done`→`DONE: <detail>`、`blocked`→`BLOCKED: <reason>`（已有）、`needs-info`/`needs-review` 各写一条（M3 用）。建议抽 `sl.report(ctx, taskID, task, status, detail)` 统一 `AppendTransition`+`PostComment`。
+
+**C. `worktreeDiff` 在 worktree 内取 —— 修 Task 12。**
+- 矛盾：plan:1953 `git -C repo diff HEAD -- wt` 抓不到 worktree 的改动。
+- spec 依据：§8.9（"验证通过时，worktree 的 diff 就是产物"）。
+- **裁决**：实现为 `git -C wt --no-pager diff HEAD`（worktree 内、相对 base HEAD 的改动；M1 execute 不 commit，足够）。commit 场景的 diff 留 M3。
+
+**D. embed 统一在 `internal/cli/embed/skills/` —— Task 8 起即在此建。**
+- 矛盾：Task 8 写 `internal/embed/skills/`、Task 13（plan:2159）改 `internal/cli/embed/skills/`。
+- **裁决**：Task 8 直接在 `internal/cli/embed/skills/` 建 4 个 md；`skill.Defaults.DefaultEmbedPath` 同步改为 `internal/cli/embed/skills/<name>.md`。免来回挪。
+
+**E. tier-1 动态装配确认延后到 M3 —— 非 M1 疏漏。**
+- spec 依据：§8.6/§8.2（tier-1 = 配置的 `verify.deterministic` 在 worktree 里跑）。但 `Deterministic.Dir` 需 = 每轮新建的 worktree 路径，而 `Tier.Check` 签名被 Global Constraint 冻结、`buildTiers` 在 run-once 起点调用时还不知道 worktree —— 干净接入要动签名或重构 SubLoop，超出 M1 同步单任务切片。
+- **裁决**：M1 运行时链 = `[tier-2 LLM, HumanStub]`（`Deterministic` 原语在 Task 9 完整实现+单测；M3 daemon 组装时按 config 动态接入并注入 worktree Dir）。DoD 2703「tier1 跑确定性脚本（手动 smoke 验证）」由 Task 9 单测 + 手动 smoke 满足，不接入 run-once 自动链。
+
+**F. Task 15 不戳私有字段 —— 加 `state.Store.ListStatuses()`。**
+- spec 依据：§6.2（`state.Store` 只追加写入器 + 回放读取器 + 生命周期读写，通过类型化接口）。plan:2441 已注。
+- **裁决**：给 `state.Store` 加 `ListStatuses() ([]struct{ ID, Status string }, error)`（读 `task_status`）；status 命令用它，不在 cli 戳 `st.db`。
+
+**G. Task 7 api.go 清理无用 import。**
+- **裁决**：去掉 dummy `init(){ _ = json.Marshal }` / `var _ = fmt.Sprint`，直接删未用的 `encoding/json`、`fmt` import。anthropic SDK 字段名按 `go doc` 对齐所 pin 版本，不留 TODO。
+
+**H. init 把 `.loop/` 加进 `.gitignore` —— Task 13 小改。**
+- 理由：worktree 在 `.loop/worktrees/`，不 ignore 会污染用户仓库 `git status`。init 时 append `.loop/`（无 `.gitignore` 则新建）。
