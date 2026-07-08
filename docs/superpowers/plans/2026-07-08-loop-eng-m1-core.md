@@ -2102,8 +2102,8 @@ var skillFiles embed.FS
 
 var defaultConfig = `
 models:
-  triage: { provider: anthropic, name: claude-haiku-4-5 }
-  plan:   { provider: anthropic, name: claude-sonnet-5 }
+  triage:  { via: claude-p, binary: claude }
+  plan:    { via: claude-p, binary: claude }
   execute: { via: claude-p, binary: claude }
   verify:  { via: claude-p, binary: claude }
 budget:
@@ -2771,3 +2771,13 @@ git add -A && git commit -m "feat(skill): 四个 skill 的初稿 prompt"
 
 **H. init 把 `.loop/` 加进 `.gitignore` —— Task 13 小改。**
 - 理由：worktree 在 `.loop/worktrees/`，不 ignore 会污染用户仓库 `git status`。init 时 append `.loop/`（无 `.gitignore` 则新建）。
+
+**I. 单路径 claude-p —— 移除 anthropic SDK 直连（v3.1 决策，覆盖 §8.10 原两条路径）。**
+- 用户决策（2026-07-08）：triage/plan/execute/verify 全走 `claude -p`，**不**直连 API。
+- 理由：① 安装/配置最简（只需 `claude` CLI，无需配 `ANTHROPIC_API_KEY`）；② 不碰用户的 key（`claude` 自管认证）；③ agent 可替换（shell-out 是 provider 中立的，换 agent 只改 config 里的 `binary`）。
+- 代价：triage/plan 轻量判断也要拉起 `claude` 会话，比直连 API 重——个人工具接受。
+- **落地（覆盖 Task 7/2/13/14 的字面样例）：**
+  - Task 7：删除 `internal/model/api.go` + 移除 `anthropics/anthropic-sdk-go` 依赖（`go mod tidy`）；只留 `Client` 接口 + `Usage` + `FakeClient`（测试）+ `ClaudeClient`（唯一真实实现）。裁决 G（api.go 清理）随 api.go 一并消失。
+  - Task 2：config validate 放宽——model 只要有 `Name` 或 `Binary` 之一即视为已配置（不再强制 `triage.name` 非空）。
+  - Task 13：默认 config 四个角色全 `{ via: claude-p, binary: claude }`。
+  - Task 14：`buildModels` real 模式已是全 `ClaudeClient`（原注释「plan 也用 claude 简化」现改为设计本意）；不再有任何 API 分支。

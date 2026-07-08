@@ -59,7 +59,7 @@
 - 子循环编排：计划 → 执行 → 验证 → 写回，带重试；tier-3 时 park
 - 完整三层验证链（确定性 → LLM 新鲜上下文 → **异步**人审）
 - 4 个 skill（含初稿 prompt）：`triage`、`plan`、`verify`、`help`（执行直接用 `claude`，不造 skill）
-- 两条模型集成路径：直连 API（triage、plan）和 `claude -p`（execute、verify-tier2）
+- 单条模型集成路径：`claude -p`（triage、plan、execute、verify-tier2 全走；**不**直连 API）
 - 可插拔工单通道接口 + v1 实现 `githubChannel`（轮询）
 - 可回放的 SQLite trace（可观测性数据层）+ 任务生命周期状态
 - 预算强制（三道刹车）+ 只追加的账本
@@ -117,7 +117,7 @@ internal/
   `UpdateStatus(ctx, taskRef, status) error`
   `CreateTask(ctx, desc, criteria) (taskRef, error)` （仅 `task new` 助手用）
   v1 实现：`githubChannel`（按标签 `loop:task` 过滤 issue；轮询）。
-- `model.Client` —— `Call(ctx, prompt, schema) (output, usage, err)`。两个实现（`apiClient`、`claudeClient`）；循环只依赖接口，测试时注入 stub。
+- `model.Client` —— `Call(ctx, prompt) (output, usage, err)`。一个真实实现 `claudeClient`（`claude -p`）+ 测试用 `FakeClient`；循环只依赖接口，测试时注入 stub。
 - `skill.Skill` —— `{Name, Version, Render(input) (prompt string), Parse(output) (typed, err)}`。无状态。
 - `verify.Tier` —— `Check(ctx, diff, criteria, priorFailure) (result, err)`。tier-3 的实现不阻塞：返回 `needs-human`，由 daemon park。
 - `state.Store` —— 只追加写入器 + 回放读取器 + 任务生命周期读写。trace 行**禁止原地改写**。
@@ -201,8 +201,8 @@ daemon:
   poll_interval: 60s
   # 单活跃子循环；无并发，故无 concurrency 配置
 models:
-  triage: { provider: anthropic, name: claude-haiku-4-5 }   # 小/便宜/快
-  plan:   { provider: anthropic, name: claude-sonnet-5 }
+  triage:  { via: claude-p, binary: claude }                 # 全角色统一走 claude -p
+  plan:    { via: claude-p, binary: claude }
   execute: { via: claude-p, binary: claude }
   verify:  { via: claude-p, binary: claude }                 # 每次调用开新会话
 budget:
@@ -292,12 +292,18 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 
 每个子循环在一个全新 git worktree 里执行，从当前仓库 HEAD 分叉，路径 `.loop/worktrees/<run-id>/`。验证通过时，worktree 的 diff 就是产物（后续：提为 PR）。失败/中止时，worktree 分支丢弃。这是回滚原语（文章 2）：「跑飞了丢这个分支」。**parked 任务（等人）期间其 worktree 保留**，恢复时续用。
 
-### 8.10 模型集成（两条路径）
+### 8.10 模型集成（单路径：`claude -p`）
 
-- **直连 API**（`apiClient`，anthropic Go SDK）：`triage`、`plan`。便宜、快、结构化 JSON 输出。triage 用小模型。让重量级的 `claude` 启动不拖累轻量判断。
-- **`claude -p`**（`claudeClient`，`os/exec`）：`execute`、`verify`-tier2。execute 要用工具/改文件；verify-tier2 按文章要求需要全新 Claude Code 会话。`claudeClient` 每次都开**新**会话（不共享对话）——这是验证独立性强制的一部分。
+**所有四个角色（triage、plan、execute、verify-tier2）都走 `claude -p`**（`claudeClient`，`os/exec`），每次调用开**全新会话**（不共享对话）——这也是验证独立性强制的一部分（verify-tier2 永远是干净上下文）。
 
-循环只依赖 `model.Client`；两个实现可换、可 stub。
+**为什么不直连 API（v3.1 砍掉曾经设计的 SDK 直连路径）：**
+1. **安装/配置最简**：用户只需装好 `claude` CLI（execute/verify 本来就要用），无需再配 `ANTHROPIC_API_KEY`——一条认证路径。
+2. **不碰用户的 key**：`claude` CLI 自管认证（Claude Code 登录），本工具永远不接触/存储 API key。
+3. **agent 可替换**：shell-out 到一个 agent CLI 是 provider 中立的；将来换别的 agent（或别的二进制）只改 config 里的 `binary`，不动代码。
+
+代价：triage/plan 这种轻量判断也要拉起一个 `claude` 会话，比直连 API 重。个人工具接受这个代价，换取上面三点（v3.1 决策；见 §12）。
+
+循环只依赖 `model.Client` 接口；`claudeClient` 是唯一真实实现，`FakeClient` 供测试注入。
 
 ### 8.11 工单通道（可插拔）
 
@@ -356,7 +362,7 @@ type: bugfix
 - **v1 工单 = GitHub Issue，通道可插拔** —— 最常见、和仓库同源；Jira/Linear 后续走同一 `channel.Channel` 接口。
 - **选 Go 而非 Python** —— 单一静态二进制（部署）、goroutine 原生的 daemon、强类型的 skill I/O 契约。常被提起的「Python LLM 生态」反对理由在这里消解：这个工具只做薄 HTTP 调用 + shell out 到 `claude`。
 - **`modernc.org/sqlite`（纯 Go）** 而非 CGO 驱动 —— 保持二进制全静态、可交叉编译。
-- **两条模型路径**（triage/plan 走 API，execute/verify 走 `claude -p`）——忠于文章；让轻量判断保持便宜，又给 execute/verify 它们需要的工具使用/新鲜会话。
+- **单条模型路径（全 `claude -p`）** —— v3.1 砍掉曾经设计的 API 直连：安装/配置最简（无需配 API key）、不碰用户的 key、agent 可替换（shell-out 是 provider 中立的）。代价是 triage/plan 轻量判断也要拉起 `claude` 会话——个人工具接受。每次调用开新会话天然满足验证独立性。
 - **验证独立由结构强制**（独立包、不共享上下文、新会话）——命门是一个架构属性，不是一句约定。
 - **skill 作为用户拥有的 markdown，覆盖 `go:embed` 默认；v1 内置初稿** —— B 的所有权线；调优能在升级后存活；初稿让 v1 开箱可跑，再用 seed 任务调。
 - **只追加、可回放的 trace** —— 靠回放调试，不靠复现（文章 2）。
