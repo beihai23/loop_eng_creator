@@ -1,0 +1,14 @@
+# Built binary
+/loop-eng
+loop-eng
+
+# loop-eng local state (if run on itself: .loop/config.yaml, state.db, worktrees/)
+.loop/
+
+# Go
+*.prof
+coverage.out
+coverage.html
+
+# OS / editor
+.DS_Store
