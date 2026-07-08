@@ -14,6 +14,9 @@ func NewRootCmd() *cobra.Command {
 	}
 	cmd.AddCommand(NewInitCmd())
 	cmd.AddCommand(NewRunOnceCmd())
+	cmd.AddCommand(NewStatusCmd())
+	cmd.AddCommand(NewReplayCmd())
+	cmd.AddCommand(NewSkillCmd())
 	return cmd
 }
 

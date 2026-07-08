@@ -96,6 +96,32 @@ func (s *Store) GetTask(id string) (TaskRow, error) {
 	return t, nil
 }
 
+// StatusRow is one row of the task_status table surfaced to the CLI status
+// command. 裁决 F: status.go does not touch the Store's private db field —
+// it reads task_status via this method only.
+type StatusRow struct {
+	ID, Status string
+}
+
+// ListStatuses returns every task_status row (id + status). Ordered by
+// updated_at so the most recently touched tasks surface first.
+func (s *Store) ListStatuses() ([]StatusRow, error) {
+	rows, err := s.db.Query(`SELECT task_id, status FROM task_status ORDER BY updated_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StatusRow
+	for rows.Next() {
+		var r StatusRow
+		if err := rows.Scan(&r.ID, &r.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 type StepRow struct {
 	RunID, Role, Skill, ModelRef   string
 	Seq                            int
