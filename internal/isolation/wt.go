@@ -24,7 +24,10 @@ func Create(baseRepo, runID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("git worktree add: %s", out)
 	}
-	return wtPath, nil
+	// filepath.Join stays relative when baseRepo == "."; resolve to absolute so
+	// the doc comment ("返回其绝对路径") is truthful and downstream git -C calls
+	// work regardless of the caller's cwd.
+	return filepath.Abs(wtPath)
 }
 
 // Discard 删 worktree 及其分支。

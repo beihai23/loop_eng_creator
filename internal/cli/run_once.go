@@ -97,20 +97,35 @@ func buildModels(_ *config.Config, mode string, bz *budget.Enforcer) (
 		m = model.NewClaudeClient("claude", nil) // M1：执行/验证/计划都走 claude -p
 	}
 	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{
-		Name: "plan", PromptTmpl: "PLAN: {{.Task}}",
+		Name: "plan", PromptTmpl: mustSkillPrompt("plan"),
 		ParseJSON: parseJSON[skill.PlanOutput], Model: m,
 	}
 	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{
-		Name: "verify", PromptTmpl: "VERIFY: {{.Diff}}",
+		Name: "verify", PromptTmpl: mustSkillPrompt("verify"),
 		ParseJSON: parseJSON[skill.VerifyOutput],
 		Model:     &budget.Client{Base: m, Enf: bz}, // ← verify-budget gap closed
 	}
 	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{
-		Name: "triage", PromptTmpl: "TRIAGE: {{.TaskDescription}}",
+		Name: "triage", PromptTmpl: mustSkillPrompt("triage"),
 		ParseJSON: parseJSON[skill.TriageOutput], Model: m,
 	}
 	exec = m
 	return
+}
+
+// mustSkillPrompt reads an embedded skill template (embed/skills/<name>.md) and
+// panics on read failure. The embedded templates render ALL Input fields (spec
+// §8.5) — notably verify.md carries AcceptanceCriteria + PriorFailureSignal, so
+// the verifier sees the criteria it must judge against (§8.6 命门 — the old
+// truncated "VERIFY: {{.Diff}}" literal omitted them). Each template begins with
+// its role prefix (TRIAGE:/PLAN:/VERIFY:), so FakeClient's HasPrefix matching is
+// preserved unchanged.
+func mustSkillPrompt(name string) string {
+	b, err := skillFiles.ReadFile("embed/skills/" + name + ".md")
+	if err != nil {
+		panic("read embedded skill " + name + ": " + err.Error())
+	}
+	return string(b)
 }
 
 // buildTiers returns the M1 verify chain. Per 裁决 E, the tier1 deterministic

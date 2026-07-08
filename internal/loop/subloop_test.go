@@ -52,7 +52,6 @@ func TestSubLoopDoneOnFirstPass(t *testing.T) {
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
 		Execute: fake,
 		Plan:    mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		Verify:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
 		Tiers:   []verify.Tier{verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)}, verify.HumanStub{}},
 		Channel: channel.NewLocal(t.TempDir()),
 	}

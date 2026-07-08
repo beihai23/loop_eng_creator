@@ -6,6 +6,7 @@ package loop
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"loop-eng/internal/budget"
@@ -34,7 +35,6 @@ type SubLoop struct {
 	Budget  *budget.Enforcer
 	Execute model.Client
 	Plan    skill.Skill[skill.PlanInput, skill.PlanOutput]
-	Verify  verify.LLM    // 备用（Run 走 Tiers via verify.Chain）
 	Tiers   []verify.Tier // 完整链：tier1[], tier2, tier3
 	Channel channel.Channel
 }
@@ -119,8 +119,19 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 // terminal outcome (done or blocked) and returns the corresponding Outcome.
 // Per spec §7.2d / §14, writeback happens on EVERY terminal outcome — not just
 // blocked.
+//
+// Writeback errors (state DB write, channel comment post) are surfaced rather
+// than swallowed: each is logged to os.Stderr AND folded into the returned
+// Detail so callers/tests can see partial writeback. The Outcome status itself
+// is unchanged — a writeback failure does not flip a done to a blocked.
 func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task, status, detail string) Outcome {
-	sl.Store.AppendTransition(taskID, "running", status, detail)
-	sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail)
+	if err := sl.Store.AppendTransition(taskID, "running", status, detail); err != nil {
+		fmt.Fprintf(os.Stderr, "writeback error: AppendTransition failed: %v\n", err)
+		detail += " [writeback partial: transition: " + err.Error() + "]"
+	}
+	if err := sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail); err != nil {
+		fmt.Fprintf(os.Stderr, "writeback error: PostComment failed: %v\n", err)
+		detail += " [writeback partial: comment: " + err.Error() + "]"
+	}
 	return Outcome{Status: status, Detail: detail}
 }

@@ -175,6 +175,13 @@ func (s *Store) Replay(runID string) ([]StepRow, error) {
 	return out, rows.Err()
 }
 
+// AppendBudget records one budget event into the durable budget_ledger table.
+//
+// M1 DEFERRAL NOTE: this method is defined but NOT yet wired — no M1 caller
+// emits budget_ledger rows. The durable budget trace (per-call/per-task token
+// accounting persisted alongside the in-memory Enforcer) is deferred to M3:
+// the M3 daemon will emit budget rows alongside the centralized client wiring.
+// The schema + method ship now so M3 does not need a migration.
 func (s *Store) AppendBudget(runID, scope, kind string, amount, limit int) error {
 	_, err := s.db.Exec(
 		`INSERT INTO budget_ledger(id, run_id, scope, kind, amount, limit_val, at)

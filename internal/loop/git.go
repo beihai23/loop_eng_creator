@@ -2,7 +2,6 @@ package loop
 
 import (
 	"os/exec"
-	"strings"
 )
 
 func execGit(repo string, args ...string) (string, error) {
@@ -31,8 +30,6 @@ func errStr(err error) string {
 	}
 	return err.Error()
 }
-
-var _ = strings.TrimSpace
 
 // worktreeDiff returns the diff of the worktree's changes vs its checked-out
 // HEAD. It MUST run inside the worktree: `git -C <repo> diff HEAD -- <wt>`
