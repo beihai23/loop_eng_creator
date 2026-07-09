@@ -5,6 +5,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -95,6 +96,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		sl.Budget.AfterCall(u)
 		sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
 		if err != nil {
+			if errors.Is(err, model.ErrClaudeFatal) {
+				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
+			}
 			priorFailure = "plan error: " + err.Error()
 			continue
 		}
@@ -120,6 +124,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		_ = execOut
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
+			if errors.Is(err, model.ErrClaudeFatal) {
+				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
+			}
 			priorFailure = "execute error: " + err.Error()
 			sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", Error: err.Error()})
 			continue
@@ -137,9 +144,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			OutputJSON: fmt.Sprintf("passed=%v needs_human=%v detail=%s", res.Passed, res.NeedsHuman, res.Detail),
 		})
 		if err != nil {
-			// verify 基础设施错误（如 claude -p 瞬时失败）→ 当作可重试失败，不致命。
-			// 硬化项：原本 verify err 直接返 Outcome{error}，一次 claude flake 就报废整 run。
+			// verify 基础设施错误：致命（auth）→ 立刻中断；可重试 flake → 当作可重试失败。
 			isolation.Discard(sl.Repo, wt)
+			if errors.Is(err, model.ErrClaudeFatal) {
+				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
+			}
 			priorFailure = "verify error: " + err.Error()
 			continue
 		}
