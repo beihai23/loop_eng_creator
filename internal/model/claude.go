@@ -17,9 +17,11 @@ import (
 const claudeRetry = 3
 
 // claudeBackoffBase is the base delay for exponential backoff between retries:
-// claudeBackoffBase, 2x, 4x (1s, 2s, 4s by default). It is a package var so
-// tests can zero it for speed. Immediate retries hammer a rate-limited server.
-var claudeBackoffBase = time.Second
+// claudeBackoffBase, 2x, 4x (30s, 60s, 120s by default). A small base (1s) does
+// NOT give an overloaded inference gateway time to recover — GLM 529 "该模型
+// 访问量过大" needs tens of seconds, not 1s. 30s does. It is a package var so
+// tests can zero it for speed.
+var claudeBackoffBase = 30 * time.Second
 
 // ErrClaudeFatal marks a NON-retryable claude error (auth/credential — HTTP
 // 401/403, expired token, not-logged-in). SubLoop treats errors wrapping this
@@ -103,7 +105,7 @@ func (c *ClaudeClient) callWithRetry(ctx context.Context, dir, prompt string) (s
 				ErrClaudeFatal, lastErr, lastErrBuf, lastOut)
 		}
 		if attempt < claudeRetry {
-			backoff := claudeBackoffBase << (attempt - 1) // 1s, 2s, 4s
+			backoff := claudeBackoffBase << (attempt - 1) // 30s, 60s, 120s
 			jitter := time.Duration(rand.Intn(400)-200) * time.Millisecond
 			time.Sleep(backoff + jitter)
 		}
