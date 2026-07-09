@@ -178,12 +178,14 @@ func criteriaBlock(c []string) string {
 // report writes the terminal state transition + channel battle report for a
 // terminal outcome (done or blocked) and returns the corresponding Outcome.
 // Per spec §7.2d / §14, writeback happens on EVERY terminal outcome — not just
-// blocked.
+// blocked. Writeback has three legs: state transition, channel comment, and a
+// channel status mark (Local: status/<ref>; GitHub: loop:<status> label).
 //
-// Writeback errors (state DB write, channel comment post) are surfaced rather
-// than swallowed: each is logged to os.Stderr AND folded into the returned
-// Detail so callers/tests can see partial writeback. The Outcome status itself
-// is unchanged — a writeback failure does not flip a done to a blocked.
+// Writeback errors (state DB write, channel comment post, status mark) are
+// surfaced rather than swallowed: each is logged to os.Stderr AND folded into
+// the returned Detail so callers/tests can see partial writeback. The Outcome
+// status itself is unchanged — a writeback failure does not flip a done to a
+// blocked.
 func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task, status, detail string) Outcome {
 	if err := sl.Store.AppendTransition(taskID, "running", status, detail); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: AppendTransition failed: %v\n", err)
@@ -192,6 +194,13 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 	if err := sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: PostComment failed: %v\n", err)
 		detail += " [writeback partial: comment: " + err.Error() + "]"
+	}
+	// Mark the ticket's status: Local writes status/<ref>; GitHub adds a
+	// loop:<status> label. Same error contract as PostComment — surface to
+	// stderr + fold into Detail, but never flip the outcome status.
+	if err := sl.Channel.UpdateStatus(ctx, task.Ref, status); err != nil {
+		fmt.Fprintf(os.Stderr, "writeback error: UpdateStatus failed: %v\n", err)
+		detail += " [writeback partial: status: " + err.Error() + "]"
 	}
 	return Outcome{Status: status, Detail: detail}
 }

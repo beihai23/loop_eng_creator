@@ -3,9 +3,11 @@ package loop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"loop-eng/internal/budget"
@@ -164,6 +166,120 @@ func TestSubLoopWritesBudgetLedger(t *testing.T) {
 	if !hasTokens {
 		t.Fatalf("budget_ledger missing a tokens check row: %+v", rows)
 	}
+}
+
+// TestSubLoopWritesStatusDone closes the M2 deferral (§7.2d status mark): a
+// done outcome must mark the ticket via Channel.UpdateStatus — for Local that
+// means a <root>/status/<ref> file whose content is the lowercase "done".
+func TestSubLoopWritesStatusDone(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	root := t.TempDir()
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(root),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "7", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	got, rerr := os.ReadFile(filepath.Join(root, "status", "7"))
+	if rerr != nil {
+		t.Fatalf("status/<ref> not written for done: %v", rerr)
+	}
+	if string(got) != "done" {
+		t.Fatalf("status file content = %q, want %q", string(got), "done")
+	}
+}
+
+// TestSubLoopWritesStatusBlocked: tier1 always-fail → blocked, and the blocked
+// outcome must mark the ticket status — for Local, status/<ref> == "blocked".
+func TestSubLoopWritesStatusBlocked(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	root := t.TempDir()
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:             fake,
+		Plan:                mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyDeterministic: []verify.Deterministic{{Label: "go-test", Cmd: []string{"false"}}}, // tier1 永失败
+		VerifyLLM:           verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human:          true,
+		Channel:             channel.NewLocal(root),
+	}
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "8", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("tier1 always-fail must block, got %s", out.Status)
+	}
+	got, rerr := os.ReadFile(filepath.Join(root, "status", "8"))
+	if rerr != nil {
+		t.Fatalf("status/<ref> not written for blocked: %v", rerr)
+	}
+	if string(got) != "blocked" {
+		t.Fatalf("status file content = %q, want %q", string(got), "blocked")
+	}
+}
+
+// TestSubLoopUpdateStatusErrorSurfaced: when Channel.UpdateStatus fails, the
+// error must surface (stderr + Detail) but must NOT flip the outcome status —
+// the same contract as PostComment. errStatusCh isolates the status leg by
+// failing only UpdateStatus (PostComment still succeeds via the embedded Local).
+func TestSubLoopUpdateStatusErrorSurfaced(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    errStatusCh{Local: channel.NewLocal(t.TempDir())},
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "9", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("UpdateStatus error must not flip status: want done, got %s", out.Status)
+	}
+	if !strings.Contains(out.Detail, "boom status") || !strings.Contains(out.Detail, "writeback partial: status") {
+		t.Fatalf("UpdateStatus error must surface in Detail, got %q", out.Detail)
+	}
+}
+
+// errStatusCh wraps *channel.Local but fails only UpdateStatus, to verify the
+// status-leg writeback error surfaces in Detail without flipping the outcome
+// status (same contract as PostComment). PostComment etc. stay promoted from
+// the embedded Local, so this isolates the third writeback leg cleanly.
+type errStatusCh struct{ *channel.Local }
+
+func (errStatusCh) UpdateStatus(context.Context, string, string) error {
+	return errors.New("boom status")
 }
 
 func mustJSON(v any) string {
