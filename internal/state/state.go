@@ -3,6 +3,7 @@ package state
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	_ "modernc.org/sqlite"
@@ -142,6 +143,32 @@ func (s *Store) IssueRefs() (map[string]bool, error) {
 		out[ref] = true
 	}
 	return out, rows.Err()
+}
+
+// NextReadyTask returns the head of the dispatch FIFO: the oldest task whose
+// status is "new", ordered by created_at (spec §8.7 — FIFO order is by
+// ingested time) with the implicit rowid as a deterministic tiebreak for
+// same-timestamp inserts. The bool is false when no new task is ready (empty
+// queue). This is the daemon's dispatch pick (spec §7.1 step 3): one tick,
+// one task, oldest first.
+func (s *Store) NextReadyTask() (TaskRow, bool, error) {
+	row := s.db.QueryRow(
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		 FROM tasks t
+		 JOIN task_status ts ON ts.task_id = t.id
+		 WHERE ts.status = 'new'
+		 ORDER BY t.created_at ASC, t.rowid ASC
+		 LIMIT 1`)
+	var t TaskRow
+	var critJSON string
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TaskRow{}, false, nil
+		}
+		return TaskRow{}, false, err
+	}
+	_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
+	return t, true, nil
 }
 
 type StepRow struct {
