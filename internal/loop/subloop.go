@@ -30,13 +30,30 @@ type Outcome struct {
 // on verify failure up to Budget.MaxRetries. Each attempt executes in a fresh
 // worktree; a non-passing attempt discards that worktree.
 type SubLoop struct {
-	Repo    string
-	Store   *state.Store
-	Budget  *budget.Enforcer
-	Execute model.Executer
-	Plan    skill.Skill[skill.PlanInput, skill.PlanOutput]
-	Tiers   []verify.Tier // 完整链：tier1[], tier2, tier3
-	Channel channel.Channel
+	Repo                string
+	Store               *state.Store
+	Budget              *budget.Enforcer
+	Execute             model.Executer
+	Plan                skill.Skill[skill.PlanInput, skill.PlanOutput]
+	VerifyDeterministic []verify.Deterministic // tier1：Dir 每轮设为 wt
+	VerifyLLM           verify.LLM             // tier2
+	Tier3Human          bool                   // tier3 stub 开关
+	Channel             channel.Channel
+}
+
+// tiersFor 在每轮按 worktree 重建 tier 链：tier1（在 wt 里跑）→ tier2 → tier3。
+// 这是裁决 E 的落地——execute 已 worktree 化（Task 2/3），故 tier1 的 Dir 可注入。
+func (sl *SubLoop) tiersFor(wt string) []verify.Tier {
+	var tiers []verify.Tier
+	for _, d := range sl.VerifyDeterministic {
+		d.Dir = wt
+		tiers = append(tiers, d)
+	}
+	tiers = append(tiers, sl.VerifyLLM)
+	if sl.Tier3Human {
+		tiers = append(tiers, verify.HumanStub{})
+	}
+	return tiers
 }
 
 // Run executes the plan→execute→verify→writeback loop for one task.
@@ -97,7 +114,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
 
 		// ---- verify (Chain of tiers; independent judgment) ----
-		res, err := verify.Chain(ctx, sl.Tiers, diff, task.AcceptanceCriteria, priorFailure)
+		res, err := verify.Chain(ctx, sl.tiersFor(wt), diff, task.AcceptanceCriteria, priorFailure)
 		// M3: NeedsHuman → park via daemon. In M1 NeedsHuman must NOT change the
 		// outcome; record it into the verify trace for forward-reference only.
 		sl.Store.AppendStep(state.StepRow{

@@ -61,8 +61,9 @@ func TestHelloWorldEndToEnd(t *testing.T) {
 				return o, json.Unmarshal(b, &o)
 			}, Model: m,
 		},
-		Tiers:   []verify.Tier{verify.LLM{Skill: vskill}, verify.HumanStub{}},
-		Channel: channel.NewLocal(t.TempDir()),
+		VerifyLLM:  verify.LLM{Skill: vskill},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
 	}
 
 	out, err := sl.Run(context.Background(), channel.Task{

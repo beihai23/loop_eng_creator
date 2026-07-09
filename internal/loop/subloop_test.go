@@ -50,10 +50,11 @@ func TestSubLoopDoneOnFirstPass(t *testing.T) {
 
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
-		Execute: fake,
-		Plan:    mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		Tiers:   []verify.Tier{verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)}, verify.HumanStub{}},
-		Channel: channel.NewLocal(t.TempDir()),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
 	}
 	_ = tri // triage 在 M1 的 SubLoop 外（CLI 层先分诊），这里跳过
 
@@ -77,14 +78,39 @@ func TestSubLoopBlockedAfterRetries(t *testing.T) {
 	})
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
-		Execute: fake,
-		Plan:    mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		Tiers:   []verify.Tier{verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)}, verify.HumanStub{}},
-		Channel: channel.NewLocal(t.TempDir()),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
 	}
 	out, _ := sl.Run(context.Background(), channel.Task{Ref: "2", Description: "d"})
 	if out.Status != "blocked" {
 		t.Fatalf("want blocked, got %s", out.Status)
+	}
+}
+
+func TestSubLoopTier1FailBlocks(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:             fake,
+		Plan:                mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyDeterministic: []verify.Deterministic{{Label: "go-test", Cmd: []string{"false"}}}, // 永远失败
+		VerifyLLM:           verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human:          true,
+		Channel:             channel.NewLocal(t.TempDir()),
+	}
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "3", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("tier1 always-fail must block, got %s", out.Status)
 	}
 }
 

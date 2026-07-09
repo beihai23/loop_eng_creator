@@ -41,19 +41,21 @@ func NewRunOnceCmd() *cobra.Command {
 			exec, plan, verifySkill, triage := buildModels(cfg, models, bz)
 			_ = triage // M1 SubLoop 外分诊（M3 daemon 调用）
 
-			tiers := buildTiers(cfg, repo, verifySkill)
 			ch := channel.NewLocal(repo)
 
 			tasks, err := ch.ListNewTasks(context.Background())
 			if err != nil || len(tasks) == 0 {
 				return fmt.Errorf("no task in inbox %s", inbox)
 			}
+			// interim（M2-4）：tier1 仍未从 cfg.Verify.Deterministic 接入（Task 6 才做）；
+			// 这里仅给 SubLoop 喂 tier2/tier3，与旧 buildTiers 输出等价。
 			sl := &loop.SubLoop{
 				Repo: repo, Store: st, Budget: bz,
-				Execute: exec,
-				Plan:    plan,
-				Tiers:   tiers,
-				Channel: ch,
+				Execute:    exec,
+				Plan:       plan,
+				VerifyLLM:  verify.LLM{Skill: verifySkill},
+				Tier3Human: true,
+				Channel:    ch,
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
 			fmt.Printf("outcome: %s — %s\n", out.Status, out.Detail)
@@ -131,12 +133,9 @@ func mustSkillPrompt(name string) string {
 	return string(b)
 }
 
-// buildTiers returns the M1 verify chain. Per 裁决 E, the tier1 deterministic
-// script is NOT wired here — M3 daemon will assemble tiers dynamically from
-// cfg.Verify.Deterministic. M1 ships tier2 (LLM) + tier3 (HumanStub) only.
-func buildTiers(_ *config.Config, _ string, vs skill.Skill[skill.VerifyInput, skill.VerifyOutput]) []verify.Tier {
-	return []verify.Tier{verify.LLM{Skill: vs}, verify.HumanStub{}}
-}
+// buildTiers 已移除：裁决 E 落地后 SubLoop 每轮按 worktree 重建 tier 链
+// （tiersFor(wt)），run-once 不再预构 []verify.Tier。tier1 从
+// cfg.Verify.Deterministic 正式接入在 M2-6。
 
 func parseJSON[O any](b []byte) (O, error) {
 	var o O
