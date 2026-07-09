@@ -6,7 +6,13 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"time"
 )
+
+// ghRetry is the number of attempts gh() makes per call. The GitHub API
+// intermittently TLS-timeouts from some networks; retrying absorbs the blip so a
+// single transient ListNewTasks/PostComment failure doesn't abort the whole run.
+const ghRetry = 3
 
 // GitHub is a channel.Channel backed by the authenticated `gh` CLI (no SDK,
 // no stored token — reuses the operator's `gh auth`). Issues with TaskLabel
@@ -107,16 +113,27 @@ func (g *GitHub) ListReplies(ctx context.Context, refs []string) (map[string][]R
 	return out, nil
 }
 
-// gh runs a `gh` command and returns stdout. stderr is folded into the error.
+// gh runs a `gh` command (retried on transient failure) and returns stdout.
+// stderr is folded into the error. The GitHub API intermittently TLS-timeouts
+// from some networks; retrying (ghRetry ×, 2s/4s backoff) absorbs those blips so
+// a single ListNewTasks/PostComment failure doesn't abort the whole run.
 func (g *GitHub) gh(ctx context.Context, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "gh", args...)
-	var out, errBuf outBuf
-	cmd.Stdout = &out
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("gh %v: %w: %s", args, err, errBuf.String())
+	var lastErr error
+	for attempt := 1; attempt <= ghRetry; attempt++ {
+		cmd := exec.CommandContext(ctx, "gh", args...)
+		var out, errBuf outBuf
+		cmd.Stdout = &out
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err == nil {
+			return out.Bytes(), nil
+		} else {
+			lastErr = fmt.Errorf("gh %v: %w: %s", args, err, errBuf.String())
+		}
+		if attempt < ghRetry {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
 	}
-	return out.Bytes(), nil
+	return nil, lastErr
 }
 
 type outBuf struct{ b []byte }
