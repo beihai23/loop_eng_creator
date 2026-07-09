@@ -15,16 +15,17 @@ import (
 //go:embed embed/skills/*.md
 var skillFiles embed.FS
 
-// defaultConfig: all roles via `claude -p` (决策 K — no SDK, no API key).
-// plan/verify/triage on the LIGHT model (name: haiku → glm-5-turbo) to avoid the
-// heavy default model's congestion (GLM 529 on glm-5.2); execute on the capable
-// default model (no name). Users override per-role in .loop/config.yaml.
+// defaultConfig: all roles via `claude -p`, NO model pinned — each uses claude's
+// default model (model-agnostic; avoids hardcoding aliases that drift over time).
+// No SDK, no API key. Escape hatch: if a role hits model congestion (e.g. GLM 529
+// on a heavy default), set a per-role `name` in .loop/config.yaml (e.g.
+// plan: {name: haiku}) as an opt-in — the ClaudeClient passes name as --model.
 var defaultConfig = `
 models:
-  triage:  { via: claude-p, binary: claude, name: haiku, cmd: ["--dangerously-skip-permissions"] }
-  plan:    { via: claude-p, binary: claude, name: haiku, cmd: ["--dangerously-skip-permissions"] }
+  triage:  { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  plan:    { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
   execute: { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  verify:  { via: claude-p, binary: claude, name: haiku, cmd: ["--dangerously-skip-permissions"] }
+  verify:  { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
