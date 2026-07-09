@@ -71,7 +71,7 @@ const planExecEstimate = 1000
 func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) {
 	taskID, err := sl.Store.InsertTask(state.TaskRow{
 		IssueRef: task.Ref, Description: task.Description,
-		TaskType: task.TaskType, Source: "local", Criteria: task.AcceptanceCriteria,
+		TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
 	})
 	if err != nil {
 		return Outcome{Status: "error"}, err
@@ -118,7 +118,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
 			"上下文：若任务/issue 引用了设计文档或 spec，开工前先读相关章节；也可浏览仓库的 README/docs 了解项目约定与冻结接口，再动手。\n" +
-			"在当前目录实现任务，确保 `go test ./...` 通过且满足全部验收标准。\n" +
+			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
 		sl.Budget.AfterCall(u2)

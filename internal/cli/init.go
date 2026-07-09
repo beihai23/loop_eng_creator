@@ -15,11 +15,11 @@ import (
 //go:embed embed/skills/*.md
 var skillFiles embed.FS
 
-// defaultConfig: all roles via `claude -p`, NO model pinned — each uses claude's
-// default model (model-agnostic; avoids hardcoding aliases that drift over time).
-// No SDK, no API key. Escape hatch: if a role hits model congestion (e.g. GLM 529
-// on a heavy default), set a per-role `name` in .loop/config.yaml (e.g.
-// plan: {name: haiku}) as an opt-in — the ClaudeClient passes name as --model.
+// defaultConfig: all roles via `claude -p`, NO model pinned (model-agnostic; no
+// SDK, no API key, no alias drift). verify.deterministic is EMPTY by default —
+// configure your project's test command in .loop/config.yaml (e.g.
+// ["pytest","-q"] or ["go","test","./..."]). Per-role model opt-in: set `name`
+// in .loop/config.yaml if a role needs a different model.
 var defaultConfig = `
 models:
   triage:  { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
@@ -31,8 +31,7 @@ budget:
   per_task_tokens: 200000
   max_retries: 3
 verify:
-  deterministic:
-    - { label: go-test, cmd: ["go", "test", "./..."] }
+  deterministic: []   # 配你项目的测试命令，如 { label: tests, cmd: ["pytest","-q"] }
   tier3_human: true
 isolation: { worktree: true }
 skills: { dir: .loop/skills }

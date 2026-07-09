@@ -136,11 +136,11 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: f}
 		return
 	}
-	// real: all via `claude -p` (no SDK, no API key — 决策 K supersedes 决策 J).
-	// plan/verify/triage run on the LIGHT model (--model haiku → glm-5-turbo) so the
-	// single-response skills avoid the heavy default model's congestion (GLM 529 on
-	// glm-5.2); execute uses the capable default model (it edits code). Per-role model
-	// from config (cfg.Models.<role>.Name → --model; empty = default).
+	// real: all via `claude -p` (no SDK, no API key). Each role uses claude's
+	// default model unless its config sets `name` (→ --model <name>) as an opt-in
+	// (e.g. a lighter model for plan/verify to ease a congested default). History:
+	// direct-API (决策 J) rejected (needs key/SDK); alias-pinning (决策 K) rejected
+	// (aliases drift); final = model-agnostic default + config-opt-in per role.
 	exec = model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Name, cfg.Models.Execute.Cmd)
 	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.NewClaudeClient(cfg.Models.Plan.Binary, cfg.Models.Plan.Name, cfg.Models.Plan.Cmd)}
 	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.NewClaudeClient(cfg.Models.Verify.Binary, cfg.Models.Verify.Name, cfg.Models.Verify.Cmd), Enf: bz}}

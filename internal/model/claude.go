@@ -35,10 +35,9 @@ var ErrClaudeFatal = errors.New("claude: fatal (non-retryable) error")
 // no conversation state is shared between calls, which is required for
 // verification independence.
 //
-// Model selects the model per role (决策 K): plan/verify/triage set it to
-// "haiku" (the light glm-5-turbo) so the single-response skills don't hit the
-// heavy default model's congestion (GLM 529) — execute leaves it empty to use
-// the capable default model. All via `claude -p`; no SDK, no API key.
+// Model, if non-empty, is passed as --model <name> for this role (overriding
+// claude's default). Config-driven opt-in (cfg.Models.<role>.Name); empty =
+// default model. All via `claude -p`; no SDK, no API key.
 type ClaudeClient struct {
 	Binary string   // path to the claude executable (e.g. "claude")
 	Model  string   // if set, passed as --model (e.g. "haiku"); empty = default model
