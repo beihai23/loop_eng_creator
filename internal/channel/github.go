@@ -26,6 +26,16 @@ type ghIssue struct {
 	Body   string `json:"body"`
 }
 
+// ghComment is the slice of `gh issue view <ref> --json comments`; only body
+// is carried — Replies are body-only by design.
+type ghComment struct {
+	Body string `json:"body"`
+}
+
+type ghIssueComments struct {
+	Comments []ghComment `json:"comments"`
+}
+
 // parseIssuesJSON decodes `gh issue list --json` output into Tasks.
 func parseIssuesJSON(raw []byte) ([]Task, error) {
 	var issues []ghIssue
@@ -42,6 +52,22 @@ func parseIssuesJSON(raw []byte) ([]Task, error) {
 		tasks = append(tasks, t)
 	}
 	return tasks, nil
+}
+
+// parseIssueCommentsJSON decodes `gh issue view <ref> --json comments` output
+// into Replies — one Reply per comment, body verbatim (other fields like
+// author/createdAt are ignored). M3 daemon polls these to surface human-review
+// responses on parked tasks.
+func parseIssueCommentsJSON(raw []byte) ([]Reply, error) {
+	var c ghIssueComments
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return nil, fmt.Errorf("parse gh issue comments: %w", err)
+	}
+	replies := make([]Reply, 0, len(c.Comments))
+	for _, cm := range c.Comments {
+		replies = append(replies, Reply{Body: cm.Body})
+	}
+	return replies, nil
 }
 
 func (g *GitHub) ListNewTasks(ctx context.Context) ([]Task, error) {
@@ -65,8 +91,20 @@ func (g *GitHub) UpdateStatus(ctx context.Context, ref, status string) error {
 }
 
 func (g *GitHub) ListReplies(ctx context.Context, refs []string) (map[string][]Reply, error) {
-	// M2 单次 run-once 不需要回复（无 daemon/park）；返回空。M3 daemon 实现真回复拉取。
-	return map[string][]Reply{}, nil
+	// M3 daemon 轮询 parked 任务的人审回复：逐个 issue 拉 comments，解析成 map[ref][]Reply。
+	out := make(map[string][]Reply, len(refs))
+	for _, ref := range refs {
+		raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "comments")
+		if err != nil {
+			return nil, err
+		}
+		replies, err := parseIssueCommentsJSON(raw)
+		if err != nil {
+			return nil, err
+		}
+		out[ref] = replies
+	}
+	return out, nil
 }
 
 // gh runs a `gh` command and returns stdout. stderr is folded into the error.
