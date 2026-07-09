@@ -41,6 +41,7 @@ type SubLoop struct {
 	Tier3Human          bool                   // tier3 开关：true 时挂 tier-3（HumanTier，否则回落 HumanStub）
 	HumanTier           verify.Tier            // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
 	Channel             channel.Channel
+	PreinsertedTaskID   string                 // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
 }
 
 // tiersFor 在每轮按 worktree 重建 tier 链：tier1（在 wt 里跑）→ tier2 → tier3。
@@ -77,12 +78,18 @@ const planExecEstimate = 1000
 // an auto-pass placeholder (NeedsHuman=false), so M1/M2 done/blocked outcomes
 // are unchanged. Every terminal outcome writes a state transition + battle report.
 func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) {
-	taskID, err := sl.Store.InsertTask(state.TaskRow{
-		IssueRef: task.Ref, Description: task.Description,
-		TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
-	})
-	if err != nil {
-		return Outcome{Status: "error"}, err
+	var taskID string
+	if sl.PreinsertedTaskID != "" {
+		taskID = sl.PreinsertedTaskID // daemon path: task already ingested by tick
+	} else {
+		var err error
+		taskID, err = sl.Store.InsertTask(state.TaskRow{
+			IssueRef: task.Ref, Description: task.Description,
+			TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
+		})
+		if err != nil {
+			return Outcome{Status: "error"}, err
+		}
 	}
 	sl.Store.AppendTransition(taskID, "", "running", "dispatched")
 

@@ -17,6 +17,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.AddCommand(NewStatusCmd())
 	cmd.AddCommand(NewReplayCmd())
 	cmd.AddCommand(NewSkillCmd())
+	cmd.AddCommand(NewDaemonCmd())
 	return cmd
 }
 
