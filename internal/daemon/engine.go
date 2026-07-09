@@ -1,19 +1,21 @@
 // Package daemon implements the resident M3 control loop (Engine): a slow
 // ticker that polls the ticket channel, ingests newly-arrived tasks into the
-// durable FIFO, and — once dispatch/reap/park land in later issues — drives a
-// single active SubLoop to completion. The daemon never blocks on a human
-// (spec principle 7): tier-3 human review parks the task, freeing the active
-// slot, and is resumed on a later tick.
+// durable FIFO, and drives a single active SubLoop to completion. The daemon
+// never blocks on a human (spec principle 7): tier-3 human review parks the
+// task, freeing the active slot, and is resumed on a later tick.
 //
-// This first cut implements only the tick loop + §7.1 step 1 (ingest with
-// dedup). Dispatch (step 3), reap (step 4), gate (step 5), and park/resume
-// arrive in subsequent issues.
+// This cut implements the tick loop + §7.1 step 1 (ingest with dedup), step 2
+// (poll parked tasks for human replies → resume with feedback), and step 3
+// (dispatch the FIFO head; reap collapses into "RunTask returned", and a
+// needs-review return parks the task). Gate (step 5) and the SubLoop wiring
+// land in subsequent issues.
 package daemon
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"loop-eng/internal/channel"
@@ -29,9 +31,13 @@ import (
 type RunTaskFunc func(ctx context.Context, task state.TaskRow) (status string, err error)
 
 // Engine is the resident M3 daemon. It polls Channel every Interval, ingesting
-// new tasks into Store (the durable FIFO) deduped by issue_ref, then dispatches
-// the head of the FIFO by running it through RunTask. Later fields (active
-// slot, parked set, SubLoop wiring) are added as reap/park land.
+// new tasks into Store (the durable FIFO) deduped by issue_ref, resuming parked
+// tasks whose human has replied, then dispatching the head of the FIFO by
+// running it through RunTask. The active slot is implicit (single-active by
+// construction — one synchronous RunTask per tick, spec §12) and the parked set
+// is the durable query Store.ParkedTasks() (status=needs-review), so the Engine
+// holds no task-lifecycle state of its own — it is all rebuildable from disk
+// (principle 4). The SubLoop wiring (RunTask → real SubLoop.Run) lands later.
 type Engine struct {
 	Channel  channel.Channel
 	Store    *state.Store
@@ -62,18 +68,17 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
-// tick is one daemon pass (spec §7.1). This cut implements step 1 (ingest) and
-// step 3 (dispatch): poll the channel for new tasks, dedup each by issue_ref
-// against the Store's already-persisted tasks, insert the unseen ones
-// (status=new, into the FIFO), then take the FIFO head and run it to
-// completion. Steps 2 (replies), 5 (gate), and park/resume arrive in later
-// issues.
+// tick is one daemon pass (spec §7.1). This cut implements step 1 (ingest with
+// dedup), step 2 (resume parked tasks whose human has replied), and step 3
+// (dispatch the FIFO head; a needs-review return parks the task). Gate (step 5)
+// and the SubLoop wiring arrive in later issues.
 //
 // Dispatch is synchronous: M3 runs a single active sub-loop with no
 // concurrency (spec §12), so running the task to completion inside this tick
 // is what makes single-active structural — a second task cannot start until
 // the first finishes. Reap (step 4) collapses into "RunTask returned": the
-// terminal status is written back here.
+// terminal status is written back here, and needs-review means park (the task
+// leaves running for needs-review, freeing the active slot — spec §7.2c/§10).
 //
 // Dedup is durable: it consults the persisted tasks table, not an in-memory
 // set, so a daemon restart does not re-ingest tasks the channel still lists as
@@ -104,6 +109,14 @@ func (e *Engine) tick(ctx context.Context) error {
 		seen[t.Ref] = true
 	}
 
+	// ---- step 2: resume parked tasks whose human has replied (spec §7.1) ----
+	// Runs before dispatch: a resumed task (needs-review→new) re-enters the FIFO
+	// and may be the very task dispatched this same tick. Parked tasks with no
+	// reply stay parked — the daemon never blocks here (principle 7).
+	if err := e.pollReplies(ctx); err != nil {
+		return err
+	}
+
 	// ---- dispatch (spec §7.1 step 3) ----
 	// No task-runner wired yet → dispatch is a no-op (the SubLoop wiring lands in
 	// a later issue). This also keeps the ingest-only daemon usable.
@@ -122,11 +135,68 @@ func (e *Engine) tick(ctx context.Context) error {
 		return err
 	}
 	// Run to completion synchronously (single-active by construction, spec §12),
-	// then reap: the returned status is the terminal lifecycle state.
+	// then reap: the returned status is the terminal lifecycle state. A
+	// "needs-review" return parks the task — the AppendTransition below moves it
+	// running→needs-review, and since RunTask already returned, the active slot
+	// is free; a later tick's pollReplies resumes it on a human reply.
 	status, err := e.RunTask(ctx, ready)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch: task %s (%s) failed: %v\n", ready.ID, ready.IssueRef, err)
 		status = "error"
 	}
 	return e.Store.AppendTransition(ready.ID, "running", status, "ran")
+}
+
+// pollReplies is spec §7.1 step 2: for every task parked on tier-3 human review,
+// ask the channel for new human replies; a task that has been replied to is
+// resumed — transitioned needs-review→new with the human feedback recorded in
+// the transition reason — so the next dispatch (this tick's step 3, or a later
+// tick if the active slot is busy) re-runs it. Parked tasks with no reply stay
+// parked. The daemon never blocks here: ListReplies is a non-blocking poll, and
+// a transient channel error returns from the tick and retries next (spec §10/§11,
+// losing no persisted state).
+//
+// The feedback is durable in the transition trace (principle 4): the SubLoop
+// that re-runs the task reads it back as next round's prior-failure input. That
+// wiring (the SubLoop reading the resume reason) lands with the daemon↔SubLoop
+// glue; this method's contract is "attach the feedback + re-queue the task".
+func (e *Engine) pollReplies(ctx context.Context) error {
+	parked, err := e.Store.ParkedTasks()
+	if err != nil {
+		return err
+	}
+	if len(parked) == 0 {
+		return nil
+	}
+	refs := make([]string, len(parked))
+	for i, p := range parked {
+		refs[i] = p.IssueRef
+	}
+	replies, err := e.Channel.ListReplies(ctx, refs)
+	if err != nil {
+		return err
+	}
+	for _, p := range parked {
+		rs := replies[p.IssueRef]
+		if len(rs) == 0 {
+			continue // still waiting on a human
+		}
+		// 人回了 → 带反馈恢复：标回 new（重新入 FIFO），反馈落盘进 transition reason。
+		if err := e.Store.AppendTransition(p.ID, "needs-review", "new",
+			"resumed: "+joinReplies(rs)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// joinReplies flattens one task's human replies into a single feedback string
+// for the durable resume record. A human may post several replies; they are
+// joined so the resumed task sees the whole thread as next round's feedback.
+func joinReplies(rs []channel.Reply) string {
+	parts := make([]string, len(rs))
+	for i, r := range rs {
+		parts[i] = r.Body
+	}
+	return strings.Join(parts, " | ")
 }

@@ -171,6 +171,40 @@ func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 	return t, true, nil
 }
 
+// ParkedTasks returns every task currently parked on tier-3 human review
+// (status="needs-review"), oldest first by created_at with rowid tiebreak —
+// same FIFO ordering as NextReadyTask. The daemon polls these each tick (spec
+// §7.1 step 2) for new human replies on the channel. A parked task keeps its
+// active slot freed (spec §7.2c/§10): tier-3 review released it, and this read
+// does not re-occupy it — only a reply (resume) or a fresh dispatch does.
+//
+// Scope: only needs-review (tier-3) is polled here. The other parked states in
+// spec §10 (needs-info/needs-human-decision/blocked) wait on different human
+// inputs and land with the triage/gate/help-skills issues.
+func (s *Store) ParkedTasks() ([]TaskRow, error) {
+	rows, err := s.db.Query(
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		 FROM tasks t
+		 JOIN task_status ts ON ts.task_id = t.id
+		 WHERE ts.status = 'needs-review'
+		 ORDER BY t.created_at ASC, t.rowid ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskRow
+	for rows.Next() {
+		var t TaskRow
+		var critJSON string
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 type StepRow struct {
 	RunID, Role, Skill, ModelRef string
 	Seq                          int
@@ -201,6 +235,37 @@ func (s *Store) AppendTransition(taskID, from, to, reason string) error {
 	_, err = s.db.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
 		to, nowISO(), taskID)
 	return err
+}
+
+// TransitionRow is one lifecycle transition in the append-only transitions
+// trace (spec §10: which task is active / parked / pending-resume is rebuildable
+// from task_status + transitions).
+type TransitionRow struct {
+	From, To, Reason string
+}
+
+// Transitions returns the lifecycle trace for one task — every status change in
+// the order it happened. The daemon's park/resume logic and its tests read this:
+// it is how a resumed task's human feedback (recorded in the resume transition's
+// reason) is recovered, even across a daemon restart (principle 4 — recover from
+// disk). Ordered by rowid = insertion order = chronological.
+func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
+	rows, err := s.db.Query(
+		`SELECT from_status, to_status, reason FROM transitions
+		 WHERE task_id=? ORDER BY rowid`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TransitionRow
+	for rows.Next() {
+		var r TransitionRow
+		if err := rows.Scan(&r.From, &r.To, &r.Reason); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) Replay(runID string) ([]StepRow, error) {

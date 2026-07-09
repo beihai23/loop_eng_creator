@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,11 +11,13 @@ import (
 )
 
 // scriptedChannel hands ListNewTasks a scripted sequence of task batches,
-// advancing one batch per call. The other three Channel methods are no-ops —
-// this cut of the engine only ingests (spec §7.1 step 1); replies / comments /
-// status marks belong to dispatch+reap, which land in later issues.
+// advancing one batch per call, and hands ListReplies a fixed reply map (set by
+// the test to simulate a human answering a parked task). PostComment /
+// UpdateStatus are no-ops — writeback belongs to the SubLoop, not the daemon
+// tick under test.
 type scriptedChannel struct {
 	batches [][]channel.Task
+	replies map[string][]channel.Reply // human replies per issue ref; nil/empty → none
 	calls   int
 }
 
@@ -27,8 +30,17 @@ func (f *scriptedChannel) ListNewTasks(ctx context.Context) ([]channel.Task, err
 	return b, nil
 }
 
+// ListReplies returns the scripted human replies for the parked refs the daemon
+// asks about. The daemon only calls this with parked (needs-review) refs, so a
+// test simulates "human answered" by setting replies[<ref>] before the tick.
 func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string) (map[string][]channel.Reply, error) {
-	return nil, nil
+	out := make(map[string][]channel.Reply)
+	for _, r := range refs {
+		if rs, ok := f.replies[r]; ok {
+			out[r] = rs
+		}
+	}
+	return out, nil
 }
 func (f *scriptedChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
 func (f *scriptedChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
@@ -218,5 +230,137 @@ func TestTickDispatchesOldestFirst(t *testing.T) {
 	// A was ingested before B, so it is the FIFO head and is dispatched first.
 	if dispatched != "A" {
 		t.Fatalf("expected oldest task A dispatched first, got %q", dispatched)
+	}
+}
+
+// statusOf looks up one task's current status by id via ListStatuses (the
+// daemon's lifecycle writer is the Store, so tests read it back through the
+// Store's own read API rather than poking Engine internals).
+func statusOf(t *testing.T, st *state.Store, id string) string {
+	t.Helper()
+	rows, err := st.ListStatuses()
+	if err != nil {
+		t.Fatalf("list statuses: %v", err)
+	}
+	for _, r := range rows {
+		if r.ID == id {
+			return r.Status
+		}
+	}
+	t.Fatalf("no task_status row for %s", id)
+	return ""
+}
+
+// TestTickParksAndResumes is the M3 park/resume acceptance test (spec §7.1
+// step 2 + §7.2c/§10): a fake channel returns one task, a scripted RunTask
+// returns needs-review (tier-3 NeedsHuman) on the first call then done on the
+// second, and the channel produces a human reply between the two ticks. Tick 1
+// must park the task (status=needs-review, active slot freed); tick 2 must
+// resume it — poll the reply, transition needs-review→new carrying the human
+// feedback, and re-dispatch it to done.
+func TestTickParksAndResumes(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{{Ref: "A", Description: "task A", TaskType: "feat"}}, // tick 1: ingest A
+		{}, // tick 2: no new tasks (A deduped against the Store)
+	}}
+	var runCalls int
+	var taskID string
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+			runCalls++
+			taskID = task.ID
+			if runCalls == 1 {
+				return "needs-review", nil // tier-3 human review → park
+			}
+			return "done", nil // resumed re-run passes
+		},
+	}
+
+	// ---- tick 1: dispatch A → tier-3 parks it (active slot freed) ----
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("tick 1 must dispatch A exactly once, got %d RunTask calls", runCalls)
+	}
+	if s := statusOf(t, st, taskID); s != "needs-review" {
+		t.Fatalf("after tick 1, A must be parked (needs-review), got %q", s)
+	}
+
+	// Human answers on the issue before tick 2 (simulated reply on the channel).
+	ch.replies = map[string][]channel.Reply{"A": {{Body: "use approach 2 instead"}}}
+
+	// ---- tick 2: poll parked A → reply → resume (needs-review→new, feedback
+	// recorded) → re-dispatch → done ----
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if runCalls != 2 {
+		t.Fatalf("tick 2 must resume+re-dispatch A (a 2nd RunTask call), got %d", runCalls)
+	}
+	if s := statusOf(t, st, taskID); s != "done" {
+		t.Fatalf("after tick 2 (resumed re-dispatch), A must be done, got %q", s)
+	}
+
+	// The resume left a durable needs-review→new transition carrying the human
+	// feedback in its reason — observable in the trace even though step 3 of the
+	// same tick then ran A to done. This is criterion 2 ("改回 new" + 带反馈) and
+	// the recoverable feedback record (spec principle 4).
+	trans, err := st.Transitions(taskID)
+	if err != nil {
+		t.Fatalf("transitions: %v", err)
+	}
+	var resumed bool
+	for _, tr := range trans {
+		if tr.From == "needs-review" && tr.To == "new" && strings.Contains(tr.Reason, "use approach 2 instead") {
+			resumed = true
+		}
+	}
+	if !resumed {
+		t.Fatalf("expected a needs-review→new resume transition carrying the reply, got %+v", trans)
+	}
+}
+
+// TestTickParksThenRunsAnother proves a parked task frees the active slot (spec
+// §7.2c/§10 "parked 不占活跃位"): A parks on tier-3, then a later tick with no
+// reply for A still dispatches a freshly-ingested B. A stays parked; B runs.
+func TestTickParksThenRunsAnother(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{{Ref: "A", Description: "task A", TaskType: "feat"}}, // tick 1: A
+		{{Ref: "B", Description: "task B", TaskType: "feat"}}, // tick 2: B (no reply for A)
+	}}
+	var dispatched []string
+	var idsByRef = map[string]string{}
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+			dispatched = append(dispatched, task.IssueRef)
+			idsByRef[task.IssueRef] = task.ID
+			if task.IssueRef == "A" {
+				return "needs-review", nil // A parks
+			}
+			return "done", nil // B passes
+		},
+	}
+
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+
+	// B was dispatched even though A is still parked — the slot was free.
+	if len(dispatched) != 2 || dispatched[0] != "A" || dispatched[1] != "B" {
+		t.Fatalf("expected A then B dispatched, got %v", dispatched)
+	}
+	if s := statusOf(t, st, idsByRef["A"]); s != "needs-review" {
+		t.Fatalf("A must still be parked (no reply), got %q", s)
+	}
+	if s := statusOf(t, st, idsByRef["B"]); s != "done" {
+		t.Fatalf("B must be done, got %q", s)
 	}
 }
