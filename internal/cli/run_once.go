@@ -79,22 +79,26 @@ func NewRunOnceCmd() *cobra.Command {
 // its tokens would never accrue into spent (spec §8.8 deviation). plan and
 // execute keep the raw client because SubLoop already budget-wraps those
 // two manually — wrapping them again would double-count.
-func buildModels(_ *config.Config, mode string, bz *budget.Enforcer) (
-	exec model.Client,
+func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
+	exec model.Executer,
 	plan skill.Skill[skill.PlanInput, skill.PlanOutput],
 	vs skill.Skill[skill.VerifyInput, skill.VerifyOutput],
 	triage skill.Skill[skill.TriageInput, skill.TriageOutput],
 ) {
 	var m model.Client
 	if mode == "fake" {
-		m = model.NewFake(map[string]string{
+		f := model.NewFake(map[string]string{
 			"TRIAGE:":  jsonStr(skill.TriageOutput{Startable: true, LoopDoable: true}),
 			"PLAN:":    jsonStr(skill.PlanOutput{}),
 			"EXECUTE:": "ok",
 			"VERIFY:":  jsonStr(skill.VerifyOutput{Passed: true}),
 		})
+		m = f
+		exec = f
 	} else {
-		m = model.NewClaudeClient("claude", nil) // M1：执行/验证/计划都走 claude -p
+		c := model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Cmd)
+		m = c
+		exec = c
 	}
 	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{
 		Name: "plan", PromptTmpl: mustSkillPrompt("plan"),
@@ -109,7 +113,6 @@ func buildModels(_ *config.Config, mode string, bz *budget.Enforcer) (
 		Name: "triage", PromptTmpl: mustSkillPrompt("triage"),
 		ParseJSON: parseJSON[skill.TriageOutput], Model: m,
 	}
-	exec = m
 	return
 }
 

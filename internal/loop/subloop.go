@@ -33,7 +33,7 @@ type SubLoop struct {
 	Repo    string
 	Store   *state.Store
 	Budget  *budget.Enforcer
-	Execute model.Client
+	Execute model.Executer
 	Plan    skill.Skill[skill.PlanInput, skill.PlanOutput]
 	Tiers   []verify.Tier // 完整链：tier1[], tier2, tier3
 	Channel channel.Channel
@@ -80,7 +80,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			isolation.Discard(sl.Repo, wt)
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
-		execOut, u2, err := sl.Execute.Call(ctx, "EXECUTE: "+task.Description+" @ "+wt)
+			execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
+				"任务: " + task.Description + "\n" +
+				"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
+				"在当前目录实现任务，确保 `go test ./...` 通过且满足全部验收标准。"
+			execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
 		sl.Budget.AfterCall(u2)
 		_ = execOut
 		if err != nil {
@@ -113,6 +117,19 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		isolation.Discard(sl.Repo, wt)
 	}
 	return sl.report(ctx, taskID, task, "blocked", "retries exhausted: "+priorFailure), nil
+}
+
+// criteriaBlock formats acceptance criteria into a bullet list string.
+// Returns "(未提供)" when the list is empty.
+func criteriaBlock(c []string) string {
+	if len(c) == 0 {
+		return "(未提供)"
+	}
+	b := ""
+	for _, line := range c {
+		b += "- " + line + "\n"
+	}
+	return b
 }
 
 // report writes the terminal state transition + channel battle report for a
