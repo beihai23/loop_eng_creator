@@ -29,7 +29,7 @@ func (s Skill[I, O]) Run(ctx context.Context, input I) (O, model.Usage, error) {
 	if err != nil {
 		return zero, usage, err
 	}
-	parsed, err := s.ParseJSON([]byte(out))
+	parsed, err := s.ParseJSON([]byte(extractJSON(out)))
 	if err != nil {
 		return zero, usage, fmt.Errorf("parse skill %s output: %w (raw=%q)", s.Name, err, out)
 	}
