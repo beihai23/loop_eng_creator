@@ -47,3 +47,28 @@ func TestLoadRejectsMissingBudget(t *testing.T) {
 		t.Fatal("expected error for missing budget")
 	}
 }
+
+func TestLoadParsesChannel(t *testing.T) {
+	p := writeFile(t, `
+models:
+  triage: { binary: claude }
+budget:
+  per_call_tokens: 20000
+  per_task_tokens: 200000
+  max_retries: 3
+channel:
+  provider: github
+  repo: beihai23/loop_eng_creator
+  task_label: "loop:task"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("expected ok, got %v", err)
+	}
+	if cfg.Channel.Provider != "github" || cfg.Channel.Repo != "beihai23/loop_eng_creator" {
+		t.Fatalf("channel not parsed: %+v", cfg.Channel)
+	}
+	if cfg.Channel.TaskLabel != "loop:task" {
+		t.Fatalf("task_label not parsed: %q", cfg.Channel.TaskLabel)
+	}
+}

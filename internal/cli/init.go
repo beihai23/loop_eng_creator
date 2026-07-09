@@ -22,17 +22,19 @@ var defaultConfig = `
 models:
   triage:  { via: claude-p, binary: claude }
   plan:    { via: claude-p, binary: claude }
-  execute: { via: claude-p, binary: claude }
+  execute: { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
   verify:  { via: claude-p, binary: claude }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
   max_retries: 3
 verify:
-  deterministic: []
+  deterministic:
+    - { label: go-test, cmd: ["go", "test", "./..."] }
   tier3_human: true
 isolation: { worktree: true }
 skills: { dir: .loop/skills }
+channel: { provider: local }
 `
 
 // gitignoreMarker is the line init ensures is present in the repo's .gitignore

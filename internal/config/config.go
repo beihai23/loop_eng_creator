@@ -13,6 +13,13 @@ type Config struct {
 	Verify    Verify    `yaml:"verify"`
 	Isolation Isolation `yaml:"isolation"`
 	Skills    Skills    `yaml:"skills"`
+	Channel   Channel   `yaml:"channel"`
+}
+
+type Channel struct {
+	Provider  string `yaml:"provider"`   // "" | "local" | "github"
+	Repo      string `yaml:"repo"`       // "owner/name"（github 必填）
+	TaskLabel string `yaml:"task_label"` // issue 过滤标签（github 必填）
 }
 
 type Models struct {
@@ -67,6 +74,9 @@ func (c *Config) validate() error {
 	}
 	if c.Models.Triage.Name == "" && c.Models.Triage.Binary == "" {
 		return fmt.Errorf("models.triage 未配置（需 name 或 binary 之一）")
+	}
+	if c.Channel.Provider == "github" && (c.Channel.Repo == "" || c.Channel.TaskLabel == "") {
+		return fmt.Errorf("channel: github provider 需 repo 与 task_label")
 	}
 	return nil
 }
