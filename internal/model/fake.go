@@ -32,3 +32,8 @@ func (f *FakeClient) Call(_ context.Context, prompt string) (string, Usage, erro
 	}
 	return "", Usage{}, errors.New("fake: no matching prefix for prompt")
 }
+
+// Exec delegates to Call, ignoring worktreeDir (tests don't execute real agents).
+func (f *FakeClient) Exec(_ context.Context, _ string, prompt string) (string, Usage, error) {
+	return f.Call(context.Background(), prompt)
+}

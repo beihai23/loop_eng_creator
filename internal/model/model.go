@@ -19,3 +19,11 @@ type Usage struct {
 type Client interface {
 	Call(ctx context.Context, prompt string) (output string, usage Usage, err error)
 }
+
+// Executer is the worktree-aware execute gateway. Execute must run the agent
+// INSIDE the isolated worktree (cmd.Dir = worktreeDir) so its edits land on the
+// worktree, not the base repo. Client.Call carries no directory, hence a
+// separate interface (Client.Call stays frozen).
+type Executer interface {
+	Exec(ctx context.Context, worktreeDir, prompt string) (output string, usage Usage, err error)
+}

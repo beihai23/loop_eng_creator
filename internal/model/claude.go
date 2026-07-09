@@ -40,3 +40,20 @@ func (c *ClaudeClient) Call(ctx context.Context, prompt string) (string, Usage, 
 	}
 	return out.String(), Usage{TokensOut: out.Len()}, nil
 }
+
+// Exec runs `claude -p <Args>` with the process working directory set to
+// worktreeDir and the prompt on stdin. Args (e.g. --dangerously-skip-permissions)
+// come from config so execute runs autonomously without permission stalls.
+func (c *ClaudeClient) Exec(ctx context.Context, worktreeDir, prompt string) (string, Usage, error) {
+	args := append([]string{"-p"}, c.Args...)
+	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	cmd.Dir = worktreeDir
+	cmd.Stdin = strings.NewReader(prompt)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		return "", Usage{}, fmt.Errorf("claude -p (exec @ %s): %w: %s", worktreeDir, err, errBuf.String())
+	}
+	return out.String(), Usage{TokensOut: out.Len()}, nil
+}
