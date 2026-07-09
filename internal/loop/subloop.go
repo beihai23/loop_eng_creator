@@ -41,7 +41,7 @@ type SubLoop struct {
 	Tier3Human          bool                   // tier3 开关：true 时挂 tier-3（HumanTier，否则回落 HumanStub）
 	HumanTier           verify.Tier            // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
 	Channel             channel.Channel
-	PreinsertedTaskID   string                 // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
+	PreinsertedTaskID   string // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
 }
 
 // tiersFor 在每轮按 worktree 重建 tier 链：tier1（在 wt 里跑）→ tier2 → tier3。
