@@ -28,7 +28,7 @@ import (
 // carry-forward gap from Task 12 (SubLoop budget-wraps plan+execute
 // manually; that stays untouched — no double-count).
 func NewRunOnceCmd() *cobra.Command {
-	var repo, inbox, models string
+	var repo, inbox, models, channelFlag string
 	cmd := &cobra.Command{
 		Use:   "run-once",
 		Short: "M1 同步入口：从 inbox 捞一个任务跑完整 loop",
@@ -37,25 +37,40 @@ func NewRunOnceCmd() *cobra.Command {
 			st := mustOpenState(repo)
 			defer st.Close()
 
+			// --channel 非空则覆盖 cfg.Channel.Provider（命令行优先于 config）
+			if channelFlag != "" {
+				cfg.Channel.Provider = channelFlag
+			}
+
 			bz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
 			exec, plan, verifySkill, triage := buildModels(cfg, models, bz)
 			_ = triage // M1 SubLoop 外分诊（M3 daemon 调用）
 
-			ch := channel.NewLocal(repo)
+			ch, err := buildChannel(cfg, repo)
+			if err != nil {
+				return err
+			}
 
 			tasks, err := ch.ListNewTasks(context.Background())
 			if err != nil || len(tasks) == 0 {
 				return fmt.Errorf("no task in inbox %s", inbox)
 			}
-			// interim（M2-4）：tier1 仍未从 cfg.Verify.Deterministic 接入（Task 6 才做）；
-			// 这里仅给 SubLoop 喂 tier2/tier3，与旧 buildTiers 输出等价。
+			// tier1（裁决 E）正式从 cfg.Verify.Deterministic 接入：每轮 tiersFor(wt)
+			// 会把 Deterministic.Dir 设成当前 worktree 再跑。
+			dets := make([]verify.Deterministic, 0, len(cfg.Verify.Deterministic))
+			for _, d := range cfg.Verify.Deterministic {
+				dets = append(dets, verify.Deterministic{Label: d.Label, Cmd: d.Cmd})
+			}
 			sl := &loop.SubLoop{
-				Repo: repo, Store: st, Budget: bz,
-				Execute:    exec,
-				Plan:       plan,
-				VerifyLLM:  verify.LLM{Skill: verifySkill},
-				Tier3Human: true,
-				Channel:    ch,
+				Repo:                repo,
+				Store:               st,
+				Budget:              bz,
+				Execute:             exec,
+				Plan:                plan,
+				VerifyDeterministic: dets,
+				VerifyLLM:           verify.LLM{Skill: verifySkill},
+				Tier3Human:          cfg.Verify.Tier3Human,
+				Channel:             ch,
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
 			fmt.Printf("outcome: %s — %s\n", out.Status, out.Detail)
@@ -65,7 +80,28 @@ func NewRunOnceCmd() *cobra.Command {
 	cmd.Flags().StringVar(&repo, "repo", ".", "仓库路径")
 	cmd.Flags().StringVar(&inbox, "task-inbox", "", "任务 inbox 目录（用于错误提示；实际读 <repo>/inbox）")
 	cmd.Flags().StringVar(&models, "models", "real", "real | fake（测试用）")
+	cmd.Flags().StringVar(&channelFlag, "channel", "", "local | github（空=用 cfg.Channel.Provider）")
 	return cmd
+}
+
+// buildChannel picks the channel.Channel by cfg.Channel.Provider: "" or
+// "local" → channel.Local (reads <repo>/inbox, writes <repo>/outbox);
+// "github" → channel.GitHub backed by the authenticated `gh` CLI. Unknown
+// providers error. This is the M2-6 wiring point that replaces the M1
+// hard-coded channel.NewLocal(repo).
+func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
+	prov := cfg.Channel.Provider
+	if prov == "" {
+		prov = "local"
+	}
+	switch prov {
+	case "local":
+		return channel.NewLocal(repo), nil
+	case "github":
+		return channel.NewGitHub(cfg.Channel.Repo, cfg.Channel.TaskLabel), nil
+	default:
+		return nil, fmt.Errorf("unknown channel provider: %s", prov)
+	}
 }
 
 // buildModels assembles the four skills' shared model.Client plus the typed
@@ -132,10 +168,6 @@ func mustSkillPrompt(name string) string {
 	}
 	return string(b)
 }
-
-// buildTiers 已移除：裁决 E 落地后 SubLoop 每轮按 worktree 重建 tier 链
-// （tiersFor(wt)），run-once 不再预构 []verify.Tier。tier1 从
-// cfg.Verify.Deterministic 正式接入在 M2-6。
 
 func parseJSON[O any](b []byte) (O, error) {
 	var o O

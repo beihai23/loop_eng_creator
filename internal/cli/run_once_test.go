@@ -50,6 +50,38 @@ func TestRunOnceEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRunOnceGitHubPathWiresChannel verifies run-once honors the --channel
+// flag (here: local) and still wires the SubLoop end-to-end — init a repo,
+// drop an inbox task, run-once --channel local --models fake, assert the
+// terminal battle report landed in outbox. This is the assembly test for
+// Task 6: --channel flag + buildChannel + tier1 from cfg.Verify.Deterministic.
+// It exercises the local provider path (no real `gh` call).
+func TestRunOnceGitHubPathWiresChannel(t *testing.T) {
+	repo := t.TempDir()
+	initGitRepo(t, repo)
+	initCmd := NewRootCmd()
+	initCmd.SetArgs([]string{"init", "--repo", repo})
+	if err := initCmd.Execute(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	inbox := filepath.Join(repo, "inbox")
+	if err := os.MkdirAll(inbox, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "1.md"),
+		[]byte("# 任务\ndo thing\ntype: bugfix\n## 验收标准\n- [ ] c"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := NewRootCmd()
+	cmd.SetArgs([]string{"run-once", "--repo", repo, "--channel", "local", "--models", "fake"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "outbox", "1.md")); err != nil {
+		t.Fatalf("no battle report: %v", err)
+	}
+}
+
 // TestVerifySkillCarriesAcceptanceCriteria guards spec §8.6 命门: the verify
 // skill assembled by buildModels MUST render the acceptance criteria into its
 // prompt — the verifier cannot judge a diff against criteria it cannot see.
