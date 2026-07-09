@@ -124,7 +124,11 @@ channel:
 
 func TestLoadParsesDaemonPollInterval(t *testing.T) {
 	p := writeFile(t, `
-models: { triage: { binary: claude } }
+models:
+  triage: { binary: c }
+  plan: { binary: c }
+  execute: { binary: c }
+  verify: { binary: c }
 budget: { per_call_tokens: 1, per_task_tokens: 1, max_retries: 1 }
 daemon: { poll_interval: 90s }
 `)
