@@ -100,7 +100,8 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
-			"在当前目录实现任务，确保 `go test ./...` 通过且满足全部验收标准。"
+			"在当前目录实现任务，确保 `go test ./...` 通过且满足全部验收标准。\n" +
+			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
 		sl.Budget.AfterCall(u2)
 		_ = execOut

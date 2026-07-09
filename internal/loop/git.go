@@ -32,14 +32,16 @@ func errStr(err error) string {
 }
 
 // worktreeDiff returns the diff of the worktree's changes vs its checked-out
-// HEAD. It MUST run inside the worktree: `git -C <repo> diff HEAD -- <wt>`
-// cannot capture the worktree's changes from the main repo (裁决 C). The
-// worktree is created from the repo HEAD, so its checked-out HEAD equals the
-// repo HEAD; `git -C wt --no-pager diff HEAD` captures exactly the in-worktree
-// edits. An empty string is returned on git error.
+// HEAD, INCLUDING newly-created (untracked) files. It stages all worktree
+// changes first (`git add -A`) then diffs the staged tree vs HEAD — a plain
+// `git diff HEAD` misses untracked new files (e.g. a task that creates a new
+// file), which starves verify of any diff (found by M2 bootstrap smoke #1).
+// Run inside the worktree (裁决 C). Assumes execute did NOT commit (the execute
+// prompt forbids it); loop-eng captures the diff itself. Empty string on error.
 func worktreeDiff(repo, wt string) string {
 	_ = repo
-	out, err := execGit(wt, "--no-pager", "diff", "HEAD")
+	_, _ = execGit(wt, "add", "-A")
+	out, err := execGit(wt, "--no-pager", "diff", "--cached")
 	if err != nil {
 		return ""
 	}
