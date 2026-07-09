@@ -56,6 +56,12 @@ func (sl *SubLoop) tiersFor(wt string) []verify.Tier {
 	return tiers
 }
 
+// planExecEstimate is the conservative per-call token estimate SubLoop feeds
+// the plan and execute BeforeCall pre-checks. AppendBudget logs the same value
+// so the durable budget_ledger row records exactly the estimate the Enforcer
+// checked (spec §8.8).
+const planExecEstimate = 1000
+
 // Run executes the plan→execute→verify→writeback loop for one task.
 //
 // M1 success = done: a passed verify.Chain → done, regardless of NeedsHuman
@@ -73,10 +79,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 
 	priorFailure := ""
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
+		// 预算刹车·重试：每轮入口记一行（spec §8.8）
+		sl.Store.AppendBudget(taskID, "task", "retry", attempt, sl.Budget.MaxRetries)
+
 		// ---- plan ----
-		if err := sl.Budget.BeforeCall(1000); err != nil {
+		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
+		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
+		sl.Store.AppendBudget(taskID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		_, u, err := sl.Plan.Run(ctx, skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: priorFailure,
@@ -93,10 +104,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		if err != nil {
 			return Outcome{Status: "error", Detail: err.Error()}, err
 		}
-		if err := sl.Budget.BeforeCall(1000); err != nil {
+		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
+		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）
+		sl.Store.AppendBudget(taskID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +

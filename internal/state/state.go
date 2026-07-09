@@ -177,15 +177,46 @@ func (s *Store) Replay(runID string) ([]StepRow, error) {
 
 // AppendBudget records one budget event into the durable budget_ledger table.
 //
-// M1 DEFERRAL NOTE: this method is defined but NOT yet wired — no M1 caller
-// emits budget_ledger rows. The durable budget trace (per-call/per-task token
-// accounting persisted alongside the in-memory Enforcer) is deferred to M3:
-// the M3 daemon will emit budget rows alongside the centralized client wiring.
-// The schema + method ship now so M3 does not need a migration.
+// Spec §8.8: every budget check appends a row. SubLoop.Run emits at each of its
+// budget-check sites — the retry brake on loop entry (scope=task, kind=retry,
+// amount=attempt, limit=MaxRetries) and the per-call token brake before the
+// plan/execute model calls (scope=call, kind=tokens, amount=estimate,
+// limit=PerCall). Like AppendStep this is an append-only trace: best-effort,
+// never gates the loop. The verify-call token check flows through budget.Client
+// (Task 14); its durable row awaits the runID plumbing that lands with the M3
+// daemon's centralized client wiring.
 func (s *Store) AppendBudget(runID, scope, kind string, amount, limit int) error {
 	_, err := s.db.Exec(
 		`INSERT INTO budget_ledger(id, run_id, scope, kind, amount, limit_val, at)
 		 VALUES(?,?,?,?,?,?,?)`,
 		newID("bg"), runID, scope, kind, amount, limit, nowISO())
 	return err
+}
+
+// BudgetRow is one row of the append-only budget_ledger trace.
+type BudgetRow struct {
+	RunID, Scope, Kind string
+	Amount, Limit      int
+}
+
+// BudgetLedger returns the budget trace rows for one run, in insertion order.
+// Mirrors Replay: a read over budget_ledger used by run reports and by the
+// SubLoop budget-ledger wiring test (spec §8.8).
+func (s *Store) BudgetLedger(runID string) ([]BudgetRow, error) {
+	rows, err := s.db.Query(
+		`SELECT run_id, scope, kind, amount, limit_val FROM budget_ledger
+		 WHERE run_id=? ORDER BY rowid`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BudgetRow
+	for rows.Next() {
+		var r BudgetRow
+		if err := rows.Scan(&r.RunID, &r.Scope, &r.Kind, &r.Amount, &r.Limit); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

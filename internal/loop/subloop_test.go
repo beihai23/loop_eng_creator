@@ -114,6 +114,58 @@ func TestSubLoopTier1FailBlocks(t *testing.T) {
 	}
 }
 
+// TestSubLoopWritesBudgetLedger closes the M1 deferral: every budget check in
+// SubLoop.Run must durably append a row to budget_ledger (spec §8.8). A
+// first-pass done run exercises the retry brake (loop entry) and the per-call
+// token brake (plan + execute BeforeCall), so the ledger must hold ≥1 row.
+func TestSubLoopWritesBudgetLedger(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "1", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	// Run inserts the task itself; recover its id to scope the ledger read.
+	statuses, err := st.ListStatuses()
+	if err != nil || len(statuses) != 1 {
+		t.Fatalf("want exactly 1 task status, got %d (err %v)", len(statuses), err)
+	}
+	rows, err := st.BudgetLedger(statuses[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) < 1 {
+		t.Fatalf("budget_ledger must have ≥1 row for a done run, got 0")
+	}
+	// plan + execute both run before a done verify ⇒ at least one tokens row.
+	hasTokens := false
+	for _, r := range rows {
+		if r.Kind == "tokens" {
+			hasTokens = true
+		}
+	}
+	if !hasTokens {
+		t.Fatalf("budget_ledger missing a tokens check row: %+v", rows)
+	}
+}
+
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
