@@ -76,8 +76,20 @@ func (c *Config) validate() error {
 	if c.Budget.PerCallTokens <= 0 || c.Budget.PerTaskTokens <= 0 || c.Budget.MaxRetries <= 0 {
 		return fmt.Errorf("budget: per_call_tokens/per_task_tokens/max_retries 必须 > 0")
 	}
-	if c.Models.Triage.Name == "" && c.Models.Triage.Binary == "" {
-		return fmt.Errorf("models.triage 未配置（需 name 或 binary 之一）")
+	// 每个 role（triage/plan/execute/verify）必须配置 name 或 binary 之一——
+	// 缺任一即硬错误（无法组装对应的 model.Client）。
+	for _, r := range []struct {
+		role string
+		ref  ModelRef
+	}{
+		{"triage", c.Models.Triage},
+		{"plan", c.Models.Plan},
+		{"execute", c.Models.Execute},
+		{"verify", c.Models.Verify},
+	} {
+		if r.ref.Name == "" && r.ref.Binary == "" {
+			return fmt.Errorf("models.%s 未配置（需 name 或 binary 之一）", r.role)
+		}
 	}
 	if c.Channel.Provider == "github" && (c.Channel.Repo == "" || c.Channel.TaskLabel == "") {
 		return fmt.Errorf("channel: github provider 需 repo 与 task_label")

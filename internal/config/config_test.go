@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -18,7 +19,10 @@ func writeFile(t *testing.T, body string) string {
 func TestLoadValid(t *testing.T) {
 	p := writeFile(t, `
 models:
-  triage: { provider: anthropic, name: claude-haiku-4-5 }
+  triage:  { provider: anthropic, name: claude-haiku-4-5 }
+  plan:    { name: claude-haiku-4-5 }
+  execute: { name: claude-haiku-4-5 }
+  verify:  { name: claude-haiku-4-5 }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
@@ -48,10 +52,54 @@ func TestLoadRejectsMissingBudget(t *testing.T) {
 	}
 }
 
+// roleConfig builds a valid config where every role is configured (name set)
+// EXCEPT the one named in omit, whose name+binary are both left empty.
+func roleConfig(omit string) string {
+	var b strings.Builder
+	b.WriteString("models:\n")
+	for _, role := range []string{"triage", "plan", "execute", "verify"} {
+		if role == omit {
+			b.WriteString("  " + role + ": {}\n") // name 与 binary 均空
+			continue
+		}
+		b.WriteString("  " + role + ": { name: x }\n")
+	}
+	b.WriteString(`
+budget:
+  per_call_tokens: 20000
+  per_task_tokens: 200000
+  max_retries: 3
+`)
+	return b.String()
+}
+
+// TestLoadRejectsMissingRole guards the M2-1 fix: every role (triage/plan/
+// execute/verify) must set name or binary; missing one is a hard error.
+// The plan case is the explicit acceptance criterion; execute/verify/triage
+// are covered to confirm the loop checks all four roles.
+func TestLoadRejectsMissingRole(t *testing.T) {
+	for _, role := range []string{"plan", "execute", "verify", "triage"} {
+		t.Run(role, func(t *testing.T) {
+			p := writeFile(t, roleConfig(role))
+			_, err := Load(p)
+			if err == nil {
+				t.Fatalf("expected error when models.%s missing", role)
+			}
+			// 报错必须点名缺失的 role，而非误报成 budget 等。
+			if !strings.Contains(err.Error(), "models."+role) {
+				t.Fatalf("error should blame models.%s, got: %v", role, err)
+			}
+		})
+	}
+}
+
 func TestLoadParsesChannel(t *testing.T) {
 	p := writeFile(t, `
 models:
-  triage: { binary: claude }
+  triage:  { binary: claude }
+  plan:    { binary: claude }
+  execute: { binary: claude }
+  verify:  { binary: claude }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
