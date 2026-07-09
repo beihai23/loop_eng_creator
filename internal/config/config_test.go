@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, body string) string {
@@ -118,5 +119,20 @@ channel:
 	}
 	if cfg.Channel.TaskLabel != "loop:task" {
 		t.Fatalf("task_label not parsed: %q", cfg.Channel.TaskLabel)
+	}
+}
+
+func TestLoadParsesDaemonPollInterval(t *testing.T) {
+	p := writeFile(t, `
+models: { triage: { binary: claude } }
+budget: { per_call_tokens: 1, per_task_tokens: 1, max_retries: 1 }
+daemon: { poll_interval: 90s }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("expected ok, got %v", err)
+	}
+	if cfg.Daemon.PollInterval != 90*time.Second {
+		t.Fatalf("poll_interval = %v, want 90s", cfg.Daemon.PollInterval)
 	}
 }

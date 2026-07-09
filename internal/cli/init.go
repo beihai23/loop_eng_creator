@@ -36,6 +36,7 @@ verify:
 isolation: { worktree: true }
 skills: { dir: .loop/skills }
 channel: { provider: local }
+daemon: { poll_interval: 60s }
 `
 
 // gitignoreMarker is the line init ensures is present in the repo's .gitignore

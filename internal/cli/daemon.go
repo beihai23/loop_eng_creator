@@ -83,10 +83,14 @@ func NewDaemonCmd() *cobra.Command {
 				return out.Status, nil
 			}
 
+			interval := pollInterval
+			if cfg.Daemon.PollInterval > 0 {
+				interval = cfg.Daemon.PollInterval
+			}
 			eng := &daemon.Engine{
 				Channel:  ch,
 				Store:    st,
-				Interval: pollInterval,
+				Interval: interval,
 				RunTask:  runTask,
 			}
 

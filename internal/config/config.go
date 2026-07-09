@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -14,6 +15,7 @@ type Config struct {
 	Isolation Isolation `yaml:"isolation"`
 	Skills    Skills    `yaml:"skills"`
 	Channel   Channel   `yaml:"channel"`
+	Daemon    Daemon    `yaml:"daemon"`
 }
 
 type Channel struct {
@@ -55,6 +57,13 @@ type Isolation struct {
 }
 type Skills struct {
 	Dir string `yaml:"dir"`
+}
+
+// Daemon configures the resident engine (spec §8.2). Single-active subloop, no
+// concurrency, so no concurrency field. poll_interval <= 0 → daemon command
+// falls back to its --poll-interval flag default.
+type Daemon struct {
+	PollInterval time.Duration `yaml:"poll_interval"`
 }
 
 func Load(path string) (*Config, error) {
