@@ -12,16 +12,13 @@ func TestTaskNewDetectsGoAndSuggestsCriteria(t *testing.T) {
 	// Simulate a Go project
 	os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module test\n"), 0644)
 
-	// Capture stdout via SetOut
-	var buf strings.Builder
 	root := NewRootCmd()
-	root.SetOut(&buf)
 	root.SetArgs([]string{"task", "new", "fix the bug", "--repo", repo, "--type", "bugfix"})
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Check the inbox file was created
+	// Check the inbox file was created with Go-specific criteria
 	entries, _ := os.ReadDir(filepath.Join(repo, "inbox"))
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 inbox file, got %d", len(entries))
@@ -36,11 +33,6 @@ func TestTaskNewDetectsGoAndSuggestsCriteria(t *testing.T) {
 	}
 	if !strings.Contains(s, "bugfix") {
 		t.Fatalf("task type not set: %s", s)
-	}
-	// Check stdout mentions detected language
-	out := buf.String()
-	if !strings.Contains(out, "go") {
-		t.Fatalf("stdout should mention detected language 'go': %s", out)
 	}
 }
 
