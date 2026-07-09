@@ -50,8 +50,12 @@ type Verify struct {
 	Tier3Human bool `yaml:"tier3_human"`
 }
 
-type Isolation struct{ Worktree bool `yaml:"worktree"` }
-type Skills struct{ Dir string `yaml:"dir"` }
+type Isolation struct {
+	Worktree bool `yaml:"worktree"`
+}
+type Skills struct {
+	Dir string `yaml:"dir"`
+}
 
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)

@@ -12,7 +12,7 @@ type Store struct{ db *sql.DB }
 
 type TaskRow struct {
 	ID, IssueRef, Description, TaskType, Source string
-	Criteria                                   []string
+	Criteria                                    []string
 }
 
 var schema = []string{
@@ -123,11 +123,11 @@ func (s *Store) ListStatuses() ([]StatusRow, error) {
 }
 
 type StepRow struct {
-	RunID, Role, Skill, ModelRef   string
-	Seq                            int
-	InputJSON, OutputJSON          string
-	TokensIn, TokensOut            int
-	Status, Error                  string
+	RunID, Role, Skill, ModelRef string
+	Seq                          int
+	InputJSON, OutputJSON        string
+	TokensIn, TokensOut          int
+	Status, Error                string
 }
 
 func (s *Store) AppendStep(r StepRow) error {

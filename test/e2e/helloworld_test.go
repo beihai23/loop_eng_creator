@@ -68,7 +68,7 @@ func TestHelloWorldEndToEnd(t *testing.T) {
 	out, err := sl.Run(context.Background(), channel.Task{
 		Ref: "1", Description: "创建 greet.txt 内容 hello",
 		AcceptanceCriteria: []string{"文件 greet.txt 存在且内容为 hello"},
-		TaskType:            "feature",
+		TaskType:           "feature",
 	})
 	if err != nil {
 		t.Fatal(err)

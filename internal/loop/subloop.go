@@ -80,11 +80,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			isolation.Discard(sl.Repo, wt)
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
-			execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
-				"任务: " + task.Description + "\n" +
-				"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
-				"在当前目录实现任务，确保 `go test ./...` 通过且满足全部验收标准。"
-			execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
+		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
+			"任务: " + task.Description + "\n" +
+			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
+			"在当前目录实现任务，确保 `go test ./...` 通过且满足全部验收标准。"
+		execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
 		sl.Budget.AfterCall(u2)
 		_ = execOut
 		if err != nil {
