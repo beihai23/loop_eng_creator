@@ -38,7 +38,8 @@ type SubLoop struct {
 	Plan                skill.Skill[skill.PlanInput, skill.PlanOutput]
 	VerifyDeterministic []verify.Deterministic // tier1：Dir 每轮设为 wt
 	VerifyLLM           verify.LLM             // tier2
-	Tier3Human          bool                   // tier3 stub 开关
+	Tier3Human          bool                   // tier3 开关：true 时挂 tier-3（HumanTier，否则回落 HumanStub）
+	HumanTier           verify.Tier            // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
 	Channel             channel.Channel
 }
 
@@ -51,7 +52,12 @@ func (sl *SubLoop) tiersFor(wt string) []verify.Tier {
 		tiers = append(tiers, d)
 	}
 	tiers = append(tiers, sl.VerifyLLM)
-	if sl.Tier3Human {
+	// tier-3：M3 注入了真人审 tier（HumanTier）就用它；否则 Tier3Human 时挂 HumanStub
+	// 自动通过占位。HumanStub 不再产 NeedsHuman，故 M1/M2 的 done/blocked 路径不受影响。
+	switch {
+	case sl.HumanTier != nil:
+		tiers = append(tiers, sl.HumanTier)
+	case sl.Tier3Human:
 		tiers = append(tiers, verify.HumanStub{})
 	}
 	return tiers
@@ -65,9 +71,11 @@ const planExecEstimate = 1000
 
 // Run executes the plan→execute→verify→writeback loop for one task.
 //
-// M1 success = done: a passed verify.Chain → done, regardless of NeedsHuman
-// (tier3 HumanStub returns NeedsHuman=true; parking is M3). Every terminal
-// outcome writes a state transition and a channel battle report.
+// Verify routing (spec §7.2c/§8.6/§10): NeedsHuman → needs-review (park; the
+// M3 tier-3 signal, takes precedence over Passed), else Passed → done, else the
+// failure becomes next round's feedback (retry within budget). HumanStub is now
+// an auto-pass placeholder (NeedsHuman=false), so M1/M2 done/blocked outcomes
+// are unchanged. Every terminal outcome writes a state transition + battle report.
 func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) {
 	taskID, err := sl.Store.InsertTask(state.TaskRow{
 		IssueRef: task.Ref, Description: task.Description,
@@ -137,8 +145,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 
 		// ---- verify (Chain of tiers; independent judgment) ----
 		res, err := verify.Chain(ctx, sl.tiersFor(wt), diff, task.AcceptanceCriteria, priorFailure)
-		// M3: NeedsHuman → park via daemon. In M1 NeedsHuman must NOT change the
-		// outcome; record it into the verify trace for forward-reference only.
+		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		sl.Store.AppendStep(state.StepRow{
 			RunID: taskID, Seq: attempt*10 + 3, Role: "verify",
 			Status:     statusOf2(res.Passed),
@@ -152,6 +159,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			}
 			priorFailure = "verify error: " + err.Error()
 			continue
+		}
+		// tier-3 人审 → needs-review：park、释放活跃位，worktree 保留待 daemon 恢复（spec §7.2c/§8.6/§10）。
+		// 在 Passed 之前裁决——NeedsHuman 优先于 done/反馈。注意：worktree 不丢弃（park 保留）。
+		if res.NeedsHuman {
+			return sl.report(ctx, taskID, task, "needs-review", res.Detail), nil
 		}
 		if res.Passed {
 			return sl.report(ctx, taskID, task, "done", res.Detail), nil

@@ -272,6 +272,56 @@ func TestSubLoopUpdateStatusErrorSurfaced(t *testing.T) {
 	}
 }
 
+// TestSubLoopNeedsHumanRoutesToNeedsReview closes the M3 tier-3 prep (spec
+// §7.2c/§8.6/§10): when a tier returns NeedsHuman=true, SubLoop.Run must route
+// to needs-review (park) — BEFORE the Passed check — even though Passed=false
+// would otherwise feed back and retry. The NeedsHuman-emitting tier is injected
+// via SubLoop.HumanTier; tier1/tier2 pass so the chain reaches tier-3.
+func TestSubLoopNeedsHumanRoutesToNeedsReview(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}), // tier1/2 过 → chain 走到 tier-3
+	})
+	root := t.TempDir()
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		HumanTier:  needsHumanTier{}, // 注入产 NeedsHuman 的 tier-3 人审 tier
+		Channel:    channel.NewLocal(root),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "11", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "needs-review" {
+		t.Fatalf("NeedsHuman must route to needs-review (before Passed), got %s (%s)", out.Status, out.Detail)
+	}
+	// writeback 仍触发：needs-review 的 status mark 落到 status/<ref>。
+	got, rerr := os.ReadFile(filepath.Join(root, "status", "11"))
+	if rerr != nil {
+		t.Fatalf("status/<ref> not written for needs-review: %v", rerr)
+	}
+	if string(got) != "needs-review" {
+		t.Fatalf("status file content = %q, want %q", string(got), "needs-review")
+	}
+}
+
+// needsHumanTier is an M3 tier-3 stand-in injected via SubLoop.HumanTier: it
+// emits NeedsHuman so SubLoop.Run parks the task at needs-review regardless of
+// Passed. Mirrors what a real human-review tier (issue-comment-backed) will do.
+type needsHumanTier struct{}
+
+func (needsHumanTier) Check(context.Context, string, []string, string) (verify.VerifyResult, error) {
+	return verify.VerifyResult{Passed: false, NeedsHuman: true, Detail: "needs human review"}, nil
+}
+
 // errStatusCh wraps *channel.Local but fails only UpdateStatus, to verify the
 // status-leg writeback error surfaces in Detail without flipping the outcome
 // status (same contract as PostComment). PostComment etc. stay promoted from
