@@ -122,6 +122,28 @@ func (s *Store) ListStatuses() ([]StatusRow, error) {
 	return out, rows.Err()
 }
 
+// IssueRefs returns the set of issue_ref values already persisted in the tasks
+// table. The M3 daemon ingests against it: a task whose ref is already known is
+// not re-inserted on a later tick (or after a daemon restart), so the durable
+// FIFO never gains duplicates — spec §7.1 step 1 (去重) backed by persisted
+// state, per principle 4 (recover from disk), not an in-memory set.
+func (s *Store) IssueRefs() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT issue_ref FROM tasks`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			return nil, err
+		}
+		out[ref] = true
+	}
+	return out, rows.Err()
+}
+
 type StepRow struct {
 	RunID, Role, Skill, ModelRef string
 	Seq                          int
