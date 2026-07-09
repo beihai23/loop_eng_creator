@@ -137,8 +137,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			OutputJSON: fmt.Sprintf("passed=%v needs_human=%v detail=%s", res.Passed, res.NeedsHuman, res.Detail),
 		})
 		if err != nil {
+			// verify 基础设施错误（如 claude -p 瞬时失败）→ 当作可重试失败，不致命。
+			// 硬化项：原本 verify err 直接返 Outcome{error}，一次 claude flake 就报废整 run。
 			isolation.Discard(sl.Repo, wt)
-			return Outcome{Status: "error", Detail: err.Error()}, err
+			priorFailure = "verify error: " + err.Error()
+			continue
 		}
 		if res.Passed {
 			return sl.report(ctx, taskID, task, "done", res.Detail), nil
