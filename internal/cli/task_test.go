@@ -12,7 +12,6 @@ func TestTaskNewDetectsGoAndSuggestsCriteria(t *testing.T) {
 	// Simulate a Go project
 	os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module test\n"), 0644)
 
-	cmd := NewTaskCmd()
 	// Capture stdout via SetOut
 	var buf strings.Builder
 	root := NewRootCmd()
