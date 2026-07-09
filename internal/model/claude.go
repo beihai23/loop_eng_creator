@@ -34,13 +34,21 @@ var ErrClaudeFatal = errors.New("claude: fatal (non-retryable) error")
 // plan/execute/verify stages. Each Call/Exec is a FRESH `claude -p` session —
 // no conversation state is shared between calls, which is required for
 // verification independence.
+//
+// Model selects the model per role (决策 K): plan/verify/triage set it to
+// "haiku" (the light glm-5-turbo) so the single-response skills don't hit the
+// heavy default model's congestion (GLM 529) — execute leaves it empty to use
+// the capable default model. All via `claude -p`; no SDK, no API key.
 type ClaudeClient struct {
 	Binary string   // path to the claude executable (e.g. "claude")
-	Args   []string // extra fixed flags appended after "-p"
+	Model  string   // if set, passed as --model (e.g. "haiku"); empty = default model
+	Args   []string // extra fixed flags appended after -p (and --model)
 }
 
-func NewClaudeClient(binary string, extraArgs []string) *ClaudeClient {
-	return &ClaudeClient{Binary: binary, Args: extraArgs}
+// NewClaudeClient returns a ClaudeClient backed by the given binary, using
+// model ("" = default) and extraArgs (e.g. --dangerously-skip-permissions).
+func NewClaudeClient(binary, model string, extraArgs []string) *ClaudeClient {
+	return &ClaudeClient{Binary: binary, Model: model, Args: extraArgs}
 }
 
 // fatalClaudeSignals are lowercased substrings in claude's output that indicate
@@ -65,11 +73,15 @@ func isFatalClaudeError(stderr, stdout string) bool {
 	return false
 }
 
-// runOnce executes a single `claude -p <Args>` attempt with prompt on stdin.
-// dir=="" leaves the default working directory; non-empty sets cmd.Dir (Exec).
-// Returns stdout, stderr, error.
+// runOnce executes a single `claude -p [--model M] <Args>` attempt with prompt
+// on stdin. dir=="" leaves the default working directory; non-empty sets
+// cmd.Dir (Exec). Returns stdout, stderr, error.
 func (c *ClaudeClient) runOnce(ctx context.Context, dir, prompt string) (string, string, error) {
-	args := append([]string{"-p"}, c.Args...)
+	args := []string{"-p"}
+	if c.Model != "" {
+		args = append(args, "--model", c.Model)
+	}
+	args = append(args, c.Args...)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
 	if dir != "" {
 		cmd.Dir = dir
@@ -86,8 +98,7 @@ func (c *ClaudeClient) runOnce(ctx context.Context, dir, prompt string) (string,
 //   - FATAL error (auth/credential, per fatalClaudeSignals) → abort at once,
 //     wrapped with ErrClaudeFatal so SubLoop gives up rather than retrying.
 //   - Retryable flake (rate-limit / 5xx / timeout / opaque exit-1) → retry with
-//     exponential backoff (claudeBackoffBase, 2x, 4x) + ±200ms jitter, so
-//     concurrent flaked tasks don't all retry on the same tick.
+//     exponential backoff (claudeBackoffBase, 2x, 4x) + ±200ms jitter.
 //
 // The final error carries BOTH stderr AND stdout — claude often prints its real
 // error to stdout, which a discard-on-error caller would lose.
@@ -114,14 +125,14 @@ func (c *ClaudeClient) callWithRetry(ctx context.Context, dir, prompt string) (s
 		lastErr, claudeRetry, lastErrBuf, lastOut)
 }
 
-// Call implements Client by running `claude -p <Args>` (default working
-// directory) with the prompt on stdin, retried on retryable failure.
+// Call implements Client by running `claude -p [--model M] <Args>` (default
+// working directory) with the prompt on stdin, retried on retryable failure.
 func (c *ClaudeClient) Call(ctx context.Context, prompt string) (string, Usage, error) {
 	return c.callWithRetry(ctx, "", prompt)
 }
 
-// Exec implements Executer: `claude -p <Args>` with cmd.Dir=worktreeDir so the
-// agent's edits land on the isolated worktree. Retried on retryable failure.
+// Exec implements Executer: `claude -p [--model M] <Args>` with cmd.Dir=worktreeDir
+// so the agent's edits land on the isolated worktree. Retried on retryable failure.
 func (c *ClaudeClient) Exec(ctx context.Context, worktreeDir, prompt string) (string, Usage, error) {
 	return c.callWithRetry(ctx, worktreeDir, prompt)
 }

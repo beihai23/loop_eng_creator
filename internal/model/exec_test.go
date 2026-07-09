@@ -33,7 +33,7 @@ func writeFakeBinary(t *testing.T) string {
 func TestClaudeClientExecRunsInWorktreeDir(t *testing.T) {
 	bin := writeFakeBinary(t)
 	wt := t.TempDir()
-	c := NewClaudeClient(bin, []string{"--dangerously-skip-permissions"})
+	c := NewClaudeClient(bin, "", []string{"--dangerously-skip-permissions"})
 	out, _, err := c.Exec(context.Background(), wt, "do the task")
 	if err != nil {
 		t.Fatal(err)

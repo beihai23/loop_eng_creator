@@ -40,7 +40,7 @@ func TestClaudeClientRetriesOnExit1ThenFails(t *testing.T) {
 	withNoBackoff(t)
 	bin := writeFakeBinaryFailing(t)
 	dir := filepath.Dir(bin)
-	c := NewClaudeClient(bin, nil)
+	c := NewClaudeClient(bin, "", nil)
 	_, _, err := c.Call(context.Background(), "x")
 	if err == nil {
 		t.Fatal("want error after all retries fail")
@@ -68,7 +68,7 @@ func TestClaudeClientRetriesThenSucceeds(t *testing.T) {
 	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewClaudeClient(path, nil)
+	c := NewClaudeClient(path, "", nil)
 	out, _, err := c.Call(context.Background(), "x")
 	if err != nil {
 		t.Fatalf("retry should absorb a 1-failure flake; got err: %v", err)
@@ -90,7 +90,7 @@ func TestClaudeClientFatalAbortsImmediately(t *testing.T) {
 	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
-	c := NewClaudeClient(path, nil)
+	c := NewClaudeClient(path, "", nil)
 	_, _, err := c.Call(context.Background(), "x")
 	if err == nil {
 		t.Fatal("want error for fatal auth failure")

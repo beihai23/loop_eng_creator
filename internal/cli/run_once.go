@@ -136,14 +136,15 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: f}
 		return
 	}
-	// real: execute = agentic `claude -p` (it edits files / runs go test — needs the harness);
-	// plan/verify/triage = lightweight DIRECT API. claude -p was too heavy for these
-	// single-response skills (决策 J: a 17s/406-token plan call ballooned to 2min and
-	// tripped GLM 529). The direct API reuses env ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.
-	exec = model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Cmd)
-	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.NewAPIClient(cfg.Models.Plan.Name)}
-	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.NewAPIClient(cfg.Models.Verify.Name), Enf: bz}}
-	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.NewAPIClient(cfg.Models.Triage.Name)}
+	// real: all via `claude -p` (no SDK, no API key — 决策 K supersedes 决策 J).
+	// plan/verify/triage run on the LIGHT model (--model haiku → glm-5-turbo) so the
+	// single-response skills avoid the heavy default model's congestion (GLM 529 on
+	// glm-5.2); execute uses the capable default model (it edits code). Per-role model
+	// from config (cfg.Models.<role>.Name → --model; empty = default).
+	exec = model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Name, cfg.Models.Execute.Cmd)
+	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.NewClaudeClient(cfg.Models.Plan.Binary, cfg.Models.Plan.Name, cfg.Models.Plan.Cmd)}
+	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.NewClaudeClient(cfg.Models.Verify.Binary, cfg.Models.Verify.Name, cfg.Models.Verify.Cmd), Enf: bz}}
+	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.NewClaudeClient(cfg.Models.Triage.Binary, cfg.Models.Triage.Name, cfg.Models.Triage.Cmd)}
 	return
 }
 

@@ -15,18 +15,16 @@ import (
 //go:embed embed/skills/*.md
 var skillFiles embed.FS
 
-// defaultConfig: plan/verify/triage via lightweight DIRECT API (provider:
-// anthropic, reusing env ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN); execute
-// via agentic `claude -p` (it edits files, needs the harness). See 决策 J —
-// claude -p was too heavy for single-response skills (a 17s/406-token plan
-// call became a 2-min high-traffic one that tripped GLM 529). Users override
-// per-role in .loop/config.yaml.
+// defaultConfig: all roles via `claude -p` (决策 K — no SDK, no API key).
+// plan/verify/triage on the LIGHT model (name: haiku → glm-5-turbo) to avoid the
+// heavy default model's congestion (GLM 529 on glm-5.2); execute on the capable
+// default model (no name). Users override per-role in .loop/config.yaml.
 var defaultConfig = `
 models:
-  triage:  { provider: anthropic, name: glm-5.2 }
-  plan:    { provider: anthropic, name: glm-5.2 }
+  triage:  { via: claude-p, binary: claude, name: haiku, cmd: ["--dangerously-skip-permissions"] }
+  plan:    { via: claude-p, binary: claude, name: haiku, cmd: ["--dangerously-skip-permissions"] }
   execute: { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  verify:  { provider: anthropic, name: glm-5.2 }
+  verify:  { via: claude-p, binary: claude, name: haiku, cmd: ["--dangerously-skip-permissions"] }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
