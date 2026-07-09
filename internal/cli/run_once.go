@@ -123,7 +123,6 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	vs skill.Skill[skill.VerifyInput, skill.VerifyOutput],
 	triage skill.Skill[skill.TriageInput, skill.TriageOutput],
 ) {
-	var m model.Client
 	if mode == "fake" {
 		f := model.NewFake(map[string]string{
 			"TRIAGE:":  jsonStr(skill.TriageOutput{Startable: true, LoopDoable: true}),
@@ -131,26 +130,20 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 			"EXECUTE:": "ok",
 			"VERIFY:":  jsonStr(skill.VerifyOutput{Passed: true}),
 		})
-		m = f
 		exec = f
-	} else {
-		c := model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Cmd)
-		m = c
-		exec = c
+		plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: f}
+		vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: f, Enf: bz}}
+		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: f}
+		return
 	}
-	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{
-		Name: "plan", PromptTmpl: mustSkillPrompt("plan"),
-		ParseJSON: parseJSON[skill.PlanOutput], Model: m,
-	}
-	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{
-		Name: "verify", PromptTmpl: mustSkillPrompt("verify"),
-		ParseJSON: parseJSON[skill.VerifyOutput],
-		Model:     &budget.Client{Base: m, Enf: bz}, // ← verify-budget gap closed
-	}
-	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{
-		Name: "triage", PromptTmpl: mustSkillPrompt("triage"),
-		ParseJSON: parseJSON[skill.TriageOutput], Model: m,
-	}
+	// real: execute = agentic `claude -p` (it edits files / runs go test — needs the harness);
+	// plan/verify/triage = lightweight DIRECT API. claude -p was too heavy for these
+	// single-response skills (决策 J: a 17s/406-token plan call ballooned to 2min and
+	// tripped GLM 529). The direct API reuses env ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN.
+	exec = model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Cmd)
+	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.NewAPIClient(cfg.Models.Plan.Name)}
+	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.NewAPIClient(cfg.Models.Verify.Name), Enf: bz}}
+	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.NewAPIClient(cfg.Models.Triage.Name)}
 	return
 }
 

@@ -15,15 +15,18 @@ import (
 //go:embed embed/skills/*.md
 var skillFiles embed.FS
 
-// defaultConfig is the all-claude-p baseline (triage/plan/execute/verify all
-// via `claude -p`); spec §8.1 / 裁决 I. Users override per-role later in
-// .loop/config.yaml.
+// defaultConfig: plan/verify/triage via lightweight DIRECT API (provider:
+// anthropic, reusing env ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN); execute
+// via agentic `claude -p` (it edits files, needs the harness). See 决策 J —
+// claude -p was too heavy for single-response skills (a 17s/406-token plan
+// call became a 2-min high-traffic one that tripped GLM 529). Users override
+// per-role in .loop/config.yaml.
 var defaultConfig = `
 models:
-  triage:  { via: claude-p, binary: claude }
-  plan:    { via: claude-p, binary: claude }
+  triage:  { provider: anthropic, name: glm-5.2 }
+  plan:    { provider: anthropic, name: glm-5.2 }
   execute: { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  verify:  { via: claude-p, binary: claude }
+  verify:  { provider: anthropic, name: glm-5.2 }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
