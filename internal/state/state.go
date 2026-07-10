@@ -38,6 +38,8 @@ var schema = []string{
 			id TEXT PRIMARY KEY, run_id TEXT, scope TEXT, kind TEXT, amount INTEGER, limit_val INTEGER, at TEXT)`,
 	`CREATE TABLE IF NOT EXISTS reports(
 			id TEXT PRIMARY KEY, task_id TEXT, round INTEGER, channel_ref TEXT, at TEXT)`,
+	`CREATE TABLE IF NOT EXISTS in_flight(
+			task_id TEXT PRIMARY KEY, phase TEXT, updated_at TEXT)`,
 	`CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id, seq)`,
 	`CREATE INDEX IF NOT EXISTS idx_trans_task ON transitions(task_id, at)`,
 }
@@ -109,37 +111,63 @@ type StatusRow struct {
 // occupying the active slot; Phase is that task's most recent sub-loop step
 // role (triage|plan|execute|verify). Single-active by construction (spec §12)
 // means at most one running task, so at most one InFlight — there is no list.
+// Read from the dedicated in_flight table (SetInFlight / ClearInFlight write
+// it; spec §8.7: cross-process readable, persisted on disk).
 type InFlight struct {
 	TaskID string
 	Phase  string
 }
 
-// InFlight returns the currently active sub-loop: the single task in
-// task_status with status="running" (spec §8.7: only running occupies the
-// active slot; FIFO ingest order is irrelevant once a task is dispatched) plus
-// its latest phase. ok is false when the active slot is empty. Phase is the
-// most recent steps.role for that task — the sub-loop writes steps keyed by
-// task id (RunID = task id, see subloop.go), so run_id IS the task id here and
-// no runs-table join is needed; Phase is "" before the first step lands. This
-// is the read side of the single-active invariant and the `loop-eng status
-// --watch` live view.
+// InFlight returns the currently active sub-loop from the dedicated in_flight
+// table. ok is false when the active slot is empty (no row in in_flight).
+// This is the read side of the single-active invariant and the `loop-eng
+// status --watch` live view (spec §8.7: cross-process observable).
 func (s *Store) InFlight() (InFlight, bool, error) {
-	var taskID string
+	var ifl InFlight
 	err := s.db.QueryRow(
-		`SELECT task_id FROM task_status WHERE status='running' LIMIT 1`).Scan(&taskID)
+		`SELECT task_id, phase FROM in_flight LIMIT 1`).Scan(&ifl.TaskID, &ifl.Phase)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return InFlight{}, false, nil
 		}
 		return InFlight{}, false, err
 	}
-	// Phase = newest step role for this task. Steps are append-only; ordering by
-	// at (RFC3339Nano → lexical = chronological) with rowid tiebreak is
-	// deterministic even when two steps share a timestamp.
-	var phase sql.NullString
-	_ = s.db.QueryRow(
-		`SELECT role FROM steps WHERE run_id=? ORDER BY at DESC, rowid DESC LIMIT 1`, taskID).Scan(&phase)
-	return InFlight{TaskID: taskID, Phase: phase.String}, true, nil
+	return ifl, true, nil
+}
+
+// SetInFlight records the currently active sub-loop's task and phase into the
+// durable in_flight table. At most one row exists (single-active, spec §12);
+// a DELETE-then-INSERT replaces any prior row so the table always reflects the
+// latest active task+phase regardless of which task_id was previously set.
+// This is the write side called by SubLoop before each phase
+// (plan/execute/verify); it is what makes the live --watch view
+// cross-process readable (spec §8.7).
+func (s *Store) SetInFlight(taskID, phase string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM in_flight`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO in_flight(task_id, phase, updated_at) VALUES(?,?,?)`,
+		taskID, phase, nowISO()); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearInFlight removes the active sub-loop row from the in_flight table. All
+// terminal paths in SubLoop.Run (done, blocked, needs-review, error) must call
+// this so the in_flight table is empty when the active slot is free — the
+// watch view renders "（无活跃任务）" and the next dispatch can SetInFlight
+// afresh. Idempotent: calling on an already-empty table is a no-op.
+func (s *Store) ClearInFlight() error {
+	_, err := s.db.Exec(`DELETE FROM in_flight`)
+	return err
 }
 
 // ListStatuses returns every task_status row (id + status). Ordered by
@@ -282,6 +310,8 @@ func (s *Store) AppendTransition(taskID, from, to, reason string) error {
 // a crashed/killed previous run (spec principle 4 — recover from disk). Without
 // this, a daemon killed mid-task leaves that task wedged in "running" forever
 // (NextReadyTask only returns "new" tasks, so it would never be re-dispatched).
+// Also clears in_flight: an orphaned running task's in_flight row (if any) must
+// not survive a daemon restart.
 func (s *Store) RequeueOrphanedRunning() (int, error) {
 	rows, err := s.db.Query(`SELECT task_id FROM task_status WHERE status='running'`)
 	if err != nil {
@@ -302,6 +332,9 @@ func (s *Store) RequeueOrphanedRunning() (int, error) {
 			return 0, err
 		}
 	}
+	// Clear stale in_flight: the orphan's in_flight row (if any) must not survive
+	// the restart — the watch view shows no active task until the next dispatch.
+	_ = s.ClearInFlight()
 	return len(ids), nil
 }
 

@@ -43,48 +43,92 @@ func TestAppendStepAndReplay(t *testing.T) {
 	}
 }
 
-// TestInFlight covers the single-active live view (spec §8.7/§8.3): a running
-// task surfaces with its latest step role as Phase, an empty active slot yields
-// ok=false, and only the newest step's role wins.
+// TestInFlight covers the single-active live view via the dedicated in_flight
+// table (spec §8.7 cross-process observable). SetInFlight writes the active
+// task+phase; InFlight reads it back; ClearInFlight empties it.
 func TestInFlight(t *testing.T) {
 	s, _ := Open(t.TempDir() + "/state.db")
 	defer s.Close()
 
-	// No running task yet → slot empty.
+	// No active task → slot empty.
 	if _, ok, err := s.InFlight(); err != nil || ok {
 		t.Fatalf("empty slot: ok=%v err=%v", ok, err)
 	}
 
-	tid, _ := s.InsertTask(TaskRow{Description: "x", TaskType: "t"})
-	s.AppendTransition(tid, "new", "running", "dispatched")
-	// steps.run_id IS the task id (subloop.go writes RunID = task id).
-	s.AppendStep(StepRow{RunID: tid, Seq: 1, Role: "plan", Status: "ok"})
-	s.AppendStep(StepRow{RunID: tid, Seq: 2, Role: "execute", Status: "ok"})
+	tid := "task_abc123"
+
+	// SetInFlight writes the active task + phase.
+	if err := s.SetInFlight(tid, "plan"); err != nil {
+		t.Fatalf("SetInFlight: %v", err)
+	}
+	got, ok, err := s.InFlight()
+	if err != nil || !ok {
+		t.Fatalf("InFlight after SetInFlight: ok=%v err=%v", ok, err)
+	}
+	if got.TaskID != tid {
+		t.Fatalf("TaskID = %q want %q", got.TaskID, tid)
+	}
+	if got.Phase != "plan" {
+		t.Fatalf("Phase = %q want plan", got.Phase)
+	}
+
+	// Upsert replaces the previous row (single-active).
+	if err := s.SetInFlight(tid, "execute"); err != nil {
+		t.Fatalf("SetInFlight execute: %v", err)
+	}
+	got2, ok2, _ := s.InFlight()
+	if !ok2 || got2.Phase != "execute" {
+		t.Fatalf("after upsert Phase = %q want execute", got2.Phase)
+	}
+
+	// ClearInFlight empties the slot.
+	if err := s.ClearInFlight(); err != nil {
+		t.Fatalf("ClearInFlight: %v", err)
+	}
+	if _, ok3, _ := s.InFlight(); ok3 {
+		t.Fatalf("after ClearInFlight, slot must be empty")
+	}
+}
+
+// TestSetInFlightOverwrite verifies that SetInFlight replaces any existing row
+// (single-active invariant — at most one in_flight row, spec §12).
+func TestSetInFlightOverwrite(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+
+	s.SetInFlight("task_a", "plan")
+	s.SetInFlight("task_b", "execute") // overwrites task_a
 
 	got, ok, err := s.InFlight()
 	if err != nil || !ok {
 		t.Fatalf("InFlight: ok=%v err=%v", ok, err)
 	}
-	if got.TaskID != tid {
-		t.Fatalf("TaskID = %q want %q", got.TaskID, tid)
-	}
-	if got.Phase != "execute" {
-		t.Fatalf("Phase = %q want execute (latest step)", got.Phase)
-	}
-
-	// A second running task should never happen (single-active, spec §12), but
-	// InFlight is defined to return one row regardless — sanity-check it stays
-	// scoped to a single task and does not panic on the LIMIT 1 query.
-	tid2, _ := s.InsertTask(TaskRow{Description: "y", TaskType: "t"})
-	s.AppendTransition(tid2, "new", "running", "dispatched")
-	if _, ok, err := s.InFlight(); err != nil || !ok {
-		t.Fatalf("InFlight after 2 running: ok=%v err=%v", ok, err)
+	if got.TaskID != "task_b" || got.Phase != "execute" {
+		t.Fatalf("overwrite failed: got task=%s phase=%s, want task_b/execute", got.TaskID, got.Phase)
 	}
 }
 
-// TestRequeueOrphanedRunning guards daemon restart recovery (spec principle 4):
-// tasks wedged in "running" (from a crashed/killed previous daemon) must reset
-// to "new" on the next startup so they re-enter the FIFO instead of hanging.
+// TestClearInFlightIdempotent verifies ClearInFlight on an empty table is a
+// no-op (does not error).
+func TestClearInFlightIdempotent(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+
+	// Clear an already-empty table.
+	if err := s.ClearInFlight(); err != nil {
+		t.Fatalf("first ClearInFlight (empty table) must not error: %v", err)
+	}
+	// Set then clear → clear again.
+	s.SetInFlight("task_x", "verify")
+	s.ClearInFlight()
+	if err := s.ClearInFlight(); err != nil {
+		t.Fatalf("second ClearInFlight (idempotent) must not error: %v", err)
+	}
+	if _, ok, _ := s.InFlight(); ok {
+		t.Fatal("after double clear, slot must be empty")
+	}
+}
+
 func TestRequeueOrphanedRunning(t *testing.T) {
 	s, _ := Open(t.TempDir() + "/state.db")
 	defer s.Close()
@@ -97,6 +141,9 @@ func TestRequeueOrphanedRunning(t *testing.T) {
 	s.AppendTransition(b, "new", "running", "dispatched")
 	s.AppendTransition(c, "new", "running", "dispatched")
 	s.AppendTransition(c, "running", "done", "ran")
+
+	// Also leave a stale in_flight row (simulating a crash mid-phase).
+	s.SetInFlight(a, "execute")
 
 	n, err := s.RequeueOrphanedRunning()
 	if err != nil {
@@ -117,6 +164,11 @@ func TestRequeueOrphanedRunning(t *testing.T) {
 	st, _ := statusByID(s, c)
 	if st != "done" {
 		t.Fatalf("done task c must stay done, got %q", st)
+	}
+
+	// Stale in_flight row must also be cleared.
+	if _, ok, _ := s.InFlight(); ok {
+		t.Fatal("orphan recovery must also clear stale in_flight row")
 	}
 }
 

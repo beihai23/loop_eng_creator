@@ -1,9 +1,11 @@
 package loop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -404,5 +406,200 @@ func TestSubLoopDoneCommitsWorktree(t *testing.T) {
 	got, _ := os.ReadFile(filepath.Join(out.Worktree, "landed.txt"))
 	if string(got) != "done work" {
 		t.Fatalf("worktree file content = %q, want %q", string(got), "done work")
+	}
+}
+
+// ---- observability tests (spec §8.7) ----
+
+// TestSubLoopPhaseLogsAsserts asserts that each phase (plan/execute/verify)
+// emits a [subloop] log line at start and done with the task short ID and phase
+// name. Uses an injected logger backed by a bytes.Buffer so assertions are
+// against structured output, not stderr scraping.
+func TestSubLoopPhaseLogsAsserts(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	var buf bytes.Buffer
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:  fake,
+		Plan:     mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:   channel.NewLocal(t.TempDir()),
+		Log:       log.New(&buf, "", log.Lmsgprefix),
+	}
+
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "30", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+
+	logs := buf.String()
+	t.Logf("SubLoop logs:\n%s", logs)
+
+	// Each phase must have a start and a done log line.
+	for _, phase := range []string{"plan", "execute", "verify"} {
+		wantStart := "phase=" + phase + " start"
+		if !strings.Contains(logs, wantStart) {
+			t.Errorf("phase %q: missing start log (want %q in logs)", phase, wantStart)
+		}
+		wantDone := "phase=" + phase + " done"
+		if !strings.Contains(logs, wantDone) {
+			t.Errorf("phase %q: missing done log (want %q in logs)", phase, wantDone)
+		}
+	}
+}
+
+// TestSubLoopRetryLogs asserts retry logs with attempt number, reason, and
+// backoff when verify repeatedly fails. The fake verify always rejects; after
+// max retries the task blocks.
+func TestSubLoopRetryLogs(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "reject reason here"}),
+	})
+	var buf bytes.Buffer
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:  fake,
+		Plan:     mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:   channel.NewLocal(t.TempDir()),
+		Log:       log.New(&buf, "", log.Lmsgprefix),
+	}
+
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "31", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("want blocked, got %s", out.Status)
+	}
+
+	logs := buf.String()
+	t.Logf("Retry logs:\n%s", logs)
+
+	// Must have retry log lines with attempt, reason, backoff.
+	if !strings.Contains(logs, "retry") {
+		t.Error("expected retry log lines, got none")
+	}
+	if !strings.Contains(logs, "attempt=") {
+		t.Error("retry log missing attempt number")
+	}
+	if !strings.Contains(logs, "reason=") {
+		t.Error("retry log missing reason")
+	}
+	if !strings.Contains(logs, "backoff=") {
+		t.Error("retry log missing backoff")
+	}
+}
+
+// TestSubLoopInFlightClearedOnDone verifies InFlight is cleared after a done
+// outcome (terminal path). The Store's in_flight table must be empty after
+// SubLoop.Run returns done.
+func TestSubLoopInFlightClearedOnDone(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "32", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s", out.Status)
+	}
+
+	// InFlight must be empty after terminal outcome.
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after SubLoop.Run returns done")
+	}
+}
+
+// TestSubLoopInFlightClearedOnBlocked verifies InFlight is cleared after a
+// blocked outcome (retries exhausted).
+func TestSubLoopInFlightClearedOnBlocked(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope"}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "33", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("want blocked, got %s", out.Status)
+	}
+
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after SubLoop.Run returns blocked")
+	}
+}
+
+// TestSubLoopInFlightClearedOnNeedsReview verifies InFlight is cleared after a
+// needs-review outcome (tier-3 human review park).
+func TestSubLoopInFlightClearedOnNeedsReview(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		HumanTier:  needsHumanTier{},
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "34", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "needs-review" {
+		t.Fatalf("want needs-review, got %s", out.Status)
+	}
+
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after SubLoop.Run returns needs-review")
 	}
 }

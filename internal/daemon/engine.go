@@ -14,6 +14,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -46,11 +47,25 @@ type Engine struct {
 	Cooldown time.Duration // on a transient-infra block (upstream 529/congestion), skip dispatch this long
 	RunTask  RunTaskFunc   // injected task-runner; nil → dispatch is a no-op until wired
 
+	// Log is the observability sink for daemon tick events (ingest, dispatch,
+	// park, resume). When nil, defaults to os.Stderr with a "[daemon]" prefix.
+	// Tests inject a logger backed by bytes.Buffer to assert on output.
+	Log *log.Logger
+
 	// coolUntil is the in-memory cooldown deadline after a transient-infra block.
 	// Transient runtime state, NOT task lifecycle: a daemon restart resets it (a
 	// fresh daemon should retry, not inherit a stale backoff — principle 4 covers
 	// task state, not ephemeral backoff).
 	coolUntil time.Time
+}
+
+// logf writes a formatted line to the daemon log (or stderr if Log is nil).
+func (e *Engine) logf(format string, args ...interface{}) {
+	if e.Log != nil {
+		e.Log.Printf(format, args...)
+	} else {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
 }
 
 // Run is the resident entry point. It ticks once immediately (a fresh daemon
@@ -109,6 +124,8 @@ func (e *Engine) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// ---- step 1: ingest new tasks (spec §7.1) ----
+	var ingested int
 	for _, t := range tasks {
 		if seen[t.Ref] {
 			continue
@@ -124,14 +141,46 @@ func (e *Engine) tick(ctx context.Context) error {
 		}
 		// Fold into seen so a duplicate within the same batch is skipped too.
 		seen[t.Ref] = true
+		ingested++
+	}
+	if ingested > 0 {
+		e.logf("[daemon] tick ingest: %d new task(s)", ingested)
 	}
 
 	// ---- step 2: resume parked tasks whose human has replied (spec §7.1) ----
 	// Runs before dispatch: a resumed task (needs-review→new) re-enters the FIFO
 	// and may be the very task dispatched this same tick. Parked tasks with no
 	// reply stay parked — the daemon never blocks here (principle 7).
-	if err := e.pollReplies(ctx); err != nil {
+	var resumed int
+	parked, err := e.Store.ParkedTasks()
+	if err != nil {
 		return err
+	}
+	if len(parked) > 0 {
+		refs := make([]string, len(parked))
+		for i, p := range parked {
+			refs[i] = p.IssueRef
+		}
+		replies, err := e.Channel.ListReplies(ctx, refs)
+		if err != nil {
+			return err
+		}
+		for _, p := range parked {
+			rs := replies[p.IssueRef]
+			if len(rs) == 0 {
+				continue // still waiting on a human
+			}
+			// 人回了 → 带反馈恢复：标回 new（重新入 FIFO），反馈落盘进 transition reason。
+			if err := e.Store.AppendTransition(p.ID, "needs-review", "new",
+				"resumed: "+joinReplies(rs)); err != nil {
+				return err
+			}
+			resumed++
+			e.logf("[daemon] tick resume: task %s (%s) got human reply → re-queued", shortTaskID(p.ID), p.IssueRef)
+		}
+	}
+	if resumed > 0 {
+		e.logf("[daemon] tick resume: %d task(s) re-queued", resumed)
 	}
 
 	// ---- dispatch (spec §7.1 step 3) ----
@@ -145,8 +194,7 @@ func (e *Engine) tick(ctx context.Context) error {
 	// would hit the same wall and block it too, so the daemon waits out the
 	// congestion instead of churning the whole FIFO to blocked one tick at a time.
 	if now := time.Now(); now.Before(e.coolUntil) {
-		fmt.Fprintf(os.Stderr, "[daemon] cooling down until %s (transient infra); skip dispatch\n",
-			e.coolUntil.Format(time.TimeOnly))
+		e.logf("[daemon] tick dispatch: skip (cooldown until %s)", e.coolUntil.Format(time.TimeOnly))
 		return nil
 	}
 	ready, ok, err := e.Store.NextReadyTask()
@@ -160,6 +208,7 @@ func (e *Engine) tick(ctx context.Context) error {
 	if err := e.Store.AppendTransition(ready.ID, "new", "running", "dispatched"); err != nil {
 		return err
 	}
+	e.logf("[daemon] tick dispatch: task %s (%s) → running", shortTaskID(ready.ID), ready.IssueRef)
 	// Run to completion synchronously (single-active by construction, spec §12),
 	// then reap: the returned status is the terminal lifecycle state. A
 	// "needs-review" return parks the task — the AppendTransition below moves it
@@ -177,11 +226,24 @@ func (e *Engine) tick(ctx context.Context) error {
 	// no manual reset. A real block (verify rejected, fatal auth) stays blocked.
 	if status == "blocked" && isTransientInfra(detail) {
 		e.coolUntil = time.Now().Add(e.cooldown())
-		fmt.Fprintf(os.Stderr, "[daemon] transient-infra block on %s → cooldown until %s, re-queue task: %s\n",
-			ready.ID, e.coolUntil.Format(time.TimeOnly), truncate(detail, 120))
+		e.logf("[daemon] tick park: task %s transient-infra block → cooldown until %s, re-queue",
+			shortTaskID(ready.ID), e.coolUntil.Format(time.TimeOnly))
 		return e.Store.AppendTransition(ready.ID, "running", "new", "transient infra; re-queued")
 	}
+	if status == "needs-review" {
+		e.logf("[daemon] tick park: task %s parked on tier-3 human review", shortTaskID(ready.ID))
+	} else {
+		e.logf("[daemon] tick done: task %s → %s", shortTaskID(ready.ID), status)
+	}
 	return e.Store.AppendTransition(ready.ID, "running", status, "ran")
+}
+
+// shortTaskID returns a truncated task ID for log lines (first 12 chars).
+func shortTaskID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // cooldown returns the configured transient-infra cooldown, defaulting to 5
