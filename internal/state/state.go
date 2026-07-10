@@ -275,6 +275,36 @@ func (s *Store) AppendTransition(taskID, from, to, reason string) error {
 	return err
 }
 
+// RequeueOrphanedRunning resets every task stuck in status="running" back to
+// "new" (with a running→new transition recording why) and returns how many it
+// reset. The daemon calls this at startup: a task is "running" only while the
+// daemon is mid-dispatch, so any "running" row left at startup is an orphan from
+// a crashed/killed previous run (spec principle 4 — recover from disk). Without
+// this, a daemon killed mid-task leaves that task wedged in "running" forever
+// (NextReadyTask only returns "new" tasks, so it would never be re-dispatched).
+func (s *Store) RequeueOrphanedRunning() (int, error) {
+	rows, err := s.db.Query(`SELECT task_id FROM task_status WHERE status='running'`)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	for _, id := range ids {
+		if err := s.AppendTransition(id, "running", "new", "orphaned by daemon restart; re-queued"); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
 // TransitionRow is one lifecycle transition in the append-only transitions
 // trace (spec §10: which task is active / parked / pending-resume is rebuildable
 // from task_status + transitions).

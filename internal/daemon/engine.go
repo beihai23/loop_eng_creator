@@ -59,6 +59,15 @@ type Engine struct {
 // is logged to stderr but does NOT halt the loop — a transient channel failure
 // skips this tick and retries next, losing no persisted state (spec §11).
 func (e *Engine) Run(ctx context.Context) error {
+	// Recover orphans: a task is "running" only while a previous daemon was
+	// mid-dispatch, so any "running" row at startup is from a crashed/killed run.
+	// Re-queue them before the first tick so they re-enter the FIFO instead of
+	// wedging forever (spec principle 4 — recover from disk).
+	if n, err := e.Store.RequeueOrphanedRunning(); err != nil {
+		fmt.Fprintf(os.Stderr, "[daemon] orphan recovery failed: %v\n", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "[daemon] recovered %d orphaned running task(s) → new\n", n)
+	}
 	if err := e.tick(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "daemon tick error: %v\n", err)
 	}

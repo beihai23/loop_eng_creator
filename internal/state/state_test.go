@@ -82,6 +82,58 @@ func TestInFlight(t *testing.T) {
 	}
 }
 
+// TestRequeueOrphanedRunning guards daemon restart recovery (spec principle 4):
+// tasks wedged in "running" (from a crashed/killed previous daemon) must reset
+// to "new" on the next startup so they re-enter the FIFO instead of hanging.
+func TestRequeueOrphanedRunning(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+
+	// Two tasks orphaned mid-flight (running), one already done (untouched).
+	a, _ := s.InsertTask(TaskRow{Description: "a", TaskType: "t"})
+	b, _ := s.InsertTask(TaskRow{Description: "b", TaskType: "t"})
+	c, _ := s.InsertTask(TaskRow{Description: "c", TaskType: "t"})
+	s.AppendTransition(a, "new", "running", "dispatched")
+	s.AppendTransition(b, "new", "running", "dispatched")
+	s.AppendTransition(c, "new", "running", "dispatched")
+	s.AppendTransition(c, "running", "done", "ran")
+
+	n, err := s.RequeueOrphanedRunning()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 orphaned running reset, got %d", n)
+	}
+	// a, b are new again; c stays done.
+	for _, id := range []string{a, b} {
+		got, _ := s.GetTask(id)
+		_ = got
+		st, _ := statusByID(s, id)
+		if st != "new" {
+			t.Fatalf("orphan %s must be new, got %q", id, st)
+		}
+	}
+	st, _ := statusByID(s, c)
+	if st != "done" {
+		t.Fatalf("done task c must stay done, got %q", st)
+	}
+}
+
+// statusByID reads one task's current status via ListStatuses.
+func statusByID(s *Store, id string) (string, error) {
+	rows, err := s.ListStatuses()
+	if err != nil {
+		return "", err
+	}
+	for _, r := range rows {
+		if r.ID == id {
+			return r.Status, nil
+		}
+	}
+	return "", nil
+}
+
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir() + "/state.db"
 	if _, err := Open(dir); err != nil {
