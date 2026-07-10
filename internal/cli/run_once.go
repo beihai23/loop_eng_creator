@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -73,6 +74,16 @@ func NewRunOnceCmd() *cobra.Command {
 				Channel:             ch,
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
+			// Land done work on main (same as the daemon): SubLoop committed the
+			// execute output on the worktree's branch; FF-merge + clean up here.
+			if err == nil && out.Status == "done" && out.Branch != "" {
+				if lerr := land(repo, out.Worktree, out.Branch); lerr != nil {
+					fmt.Fprintf(os.Stderr, "land failed (work safe on branch %s): %v\n", out.Branch, lerr)
+					out.Detail += " [land failed: " + lerr.Error() + "]"
+				} else {
+					fmt.Printf("landed on main (branch %s)\n", out.Branch)
+				}
+			}
 			fmt.Printf("outcome: %s — %s\n", out.Status, out.Detail)
 			return err
 		},

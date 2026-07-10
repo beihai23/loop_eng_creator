@@ -79,6 +79,17 @@ func NewDaemonCmd() *cobra.Command {
 					fmt.Fprintf(os.Stderr, "[daemon] task %s error: %v\n", task.ID, err)
 					return "error", err
 				}
+				// Land done work on main: SubLoop committed the execute output on the
+				// worktree's branch; FF-merge it here + clean up the worktree. A land
+				// failure (non-FF) leaves the branch intact — the work is safe, only
+				// the integration is deferred. Never flips the done outcome.
+				if out.Status == "done" && out.Branch != "" {
+					if lerr := land(repo, out.Worktree, out.Branch); lerr != nil {
+						fmt.Fprintf(os.Stderr, "[daemon] task %s land failed (work safe on branch %s): %v\n", task.ID, out.Branch, lerr)
+					} else {
+						fmt.Printf("[daemon] task %s landed on main\n", task.ID)
+					}
+				}
 				fmt.Printf("[daemon] task %s → %s\n", task.ID, out.Status)
 				return out.Status, nil
 			}

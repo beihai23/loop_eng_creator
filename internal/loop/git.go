@@ -1,7 +1,10 @@
 package loop
 
 import (
+	"fmt"
 	"os/exec"
+	"strconv"
+	"strings"
 )
 
 func execGit(repo string, args ...string) (string, error) {
@@ -46,4 +49,45 @@ func worktreeDiff(repo, wt string) string {
 		return ""
 	}
 	return out
+}
+
+// branchName is the worktree branch isolation.Create makes for a given task
+// attempt: runID = taskID+"-r"+attempt → branch "loop/"+runID. Mirrored here so
+// the done-path commit and the caller's land agree on the name without
+// isolation having to expose it.
+func branchName(taskID string, attempt int) string {
+	return "loop/" + taskID + "-r" + strconv.Itoa(attempt)
+}
+
+// commitWorktree captures a done task's execute output by committing all
+// worktree changes (incl. untracked — staged first via `git add -A`, same as
+// worktreeDiff) on the worktree's branch. The execute prompt forbids the model
+// from committing, so loop-eng commits the work itself; the caller then
+// FF-merges this branch to main + cleans up. This closes the done-worktree-
+// never-landed gap that lost bootstrap work (#12, #14): a Passed verify used to
+// leave the worktree uncommitted, so its diff vanished when the worktree went
+// stale.
+//
+// Identity is pinned via `-c` so landing works in any environment (the daemon
+// may run where no git identity is configured) and bot-landed commits are
+// clearly attributed. An empty diff (execute produced no changes) is a no-op
+// success — the branch stays at main HEAD and the caller's land is a clean
+// no-op merge + worktree cleanup.
+func commitWorktree(wt, branch, message string) error {
+	_ = branch
+	if _, err := execGit(wt, "add", "-A"); err != nil {
+		return fmt.Errorf("git add -A: %w", err)
+	}
+	out, err := execGit(wt,
+		"-c", "user.name=loop-eng",
+		"-c", "user.email=loop-eng@local",
+		"commit", "-m", message)
+	if err != nil {
+		// nothing staged → execute made no changes; nothing to land, not an error.
+		if strings.Contains(out, "nothing to commit") || strings.Contains(out, "no changes") {
+			return nil
+		}
+		return fmt.Errorf("git commit: %s: %w", out, err)
+	}
+	return nil
 }

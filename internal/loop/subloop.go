@@ -21,10 +21,15 @@ import (
 
 // Outcome is the terminal result of a SubLoop.Run. Status is one of
 // done | blocked | needs-info | needs-review (M1 only produces done/blocked;
-// needs-review is M3 machinery).
+// needs-review is M3 machinery). On done, Worktree+Branch identify where the
+// committed work lives so the caller can land it on main (the execute model is
+// forbidden from committing, so SubLoop captures the diff on the worktree's
+// branch and hands the branch off).
 type Outcome struct {
-	Status string // done | blocked | needs-info | needs-review
-	Detail string
+	Status   string // done | blocked | needs-info | needs-review
+	Detail   string
+	Worktree string // done only: absolute path to the worktree holding the committed work
+	Branch   string // done only: branch holding that commit; caller FF-merges to main then cleans up
 }
 
 // SubLoop drives a single task through plan→execute→verify→writeback, retrying
@@ -173,7 +178,24 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			return sl.report(ctx, taskID, task, "needs-review", res.Detail), nil
 		}
 		if res.Passed {
-			return sl.report(ctx, taskID, task, "done", res.Detail), nil
+			// Capture the execute output on the worktree's branch, then hand the
+			// branch to the caller for landing. The execute prompt forbids the
+			// model from committing, so loop-eng commits the work itself; the
+			// caller (daemon/run-once) FF-merges this branch to main + cleans up.
+			// Closes the done-worktree-never-landed gap (lost #12/#14): a Passed
+			// verify used to leave the worktree uncommitted → diff vanished.
+			branch := branchName(taskID, attempt)
+			if cerr := commitWorktree(wt, branch, landCommitMessage(task, taskID)); cerr != nil {
+				// commit failed — verify still passed, so this stays done; but landing
+				// is now manual. Leave the worktree (uncommitted changes survive on
+				// disk) and surface in Detail so the operator can salvage by hand.
+				return sl.report(ctx, taskID, task, "done", res.Detail+
+					" [land: worktree commit failed: "+cerr.Error()+"; worktree preserved at "+wt+"]"), nil
+			}
+			out := sl.report(ctx, taskID, task, "done", res.Detail)
+			out.Worktree = wt
+			out.Branch = branch
+			return out, nil
 		}
 		// 不过 → 反馈，下一轮重试
 		priorFailure = res.Detail
@@ -193,6 +215,22 @@ func criteriaBlock(c []string) string {
 		b += "- " + line + "\n"
 	}
 	return b
+}
+
+// landCommitMessage builds the commit subject for a done task's auto-land: the
+// issue ref + the first (truncated) line of the description. The execute model
+// writes no commit message (it's forbidden from committing), so loop-eng
+// synthesizes one that identifies the task in `git log`.
+func landCommitMessage(task channel.Task, taskID string) string {
+	_ = taskID
+	subject := task.Description
+	if i := strings.IndexByte(subject, '\n'); i >= 0 {
+		subject = subject[:i]
+	}
+	if len(subject) > 72 {
+		subject = subject[:72]
+	}
+	return "loop-eng auto-land #" + task.Ref + ": " + subject
 }
 
 // report writes the terminal state transition + channel battle report for a

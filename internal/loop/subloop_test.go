@@ -347,3 +347,62 @@ func mkSkill[I any, O any](prefix string, m model.Client) skill.Skill[I, O] {
 		Model: m,
 	}
 }
+
+// fileWriteExec is a test Executer that writes a file into the worktree, so the
+// done path has a non-empty diff to commit (the default FakeClient returns "ok"
+// with no file changes → empty diff). Drives TestSubLoopDoneCommitsWorktree.
+type fileWriteExec struct{}
+
+func (fileWriteExec) Exec(_ context.Context, dir, _ string) (string, model.Usage, error) {
+	if err := os.WriteFile(filepath.Join(dir, "landed.txt"), []byte("done work"), 0644); err != nil {
+		return "", model.Usage{}, err
+	}
+	return "ok", model.Usage{}, nil
+}
+
+// TestSubLoopDoneCommitsWorktree guards the done-land fix: on Passed, SubLoop
+// must commit the worktree's changes on its branch and expose Worktree+Branch
+// in the Outcome so the caller can FF-merge to main. Previously the done path
+// left the worktree uncommitted (lost #12/#14). The commit lands on the worktree
+// branch only — main must NOT yet see the change (landing is the caller's job).
+func TestSubLoopDoneCommitsWorktree(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":   mustJSON(skill.PlanOutput{}),
+		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:   fileWriteExec{},
+		Plan:      mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "20", Description: "land me", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	if out.Branch == "" || out.Worktree == "" {
+		t.Fatalf("done must expose Branch+Worktree for landing, got %+v", out)
+	}
+	// the worktree's branch holds the auto-land commit
+	logOut, _ := execGit(repo, "--no-pager", "log", "--oneline", out.Branch)
+	if !strings.Contains(logOut, "loop-eng auto-land") {
+		t.Fatalf("branch %s missing auto-land commit: %s", out.Branch, logOut)
+	}
+	// main must NOT yet contain the new file (landing is the caller's job)
+	if _, err := os.Stat(filepath.Join(repo, "landed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("main must not see landed.txt before caller lands: %v", err)
+	}
+	// the committed file is in the worktree
+	got, _ := os.ReadFile(filepath.Join(out.Worktree, "landed.txt"))
+	if string(got) != "done work" {
+		t.Fatalf("worktree file content = %q, want %q", string(got), "done work")
+	}
+}
