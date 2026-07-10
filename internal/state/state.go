@@ -104,6 +104,44 @@ type StatusRow struct {
 	ID, Status string
 }
 
+// InFlight is the live view of the single active sub-loop (spec §8.7
+// observability data layer + §8.3 single-active). TaskID is the task currently
+// occupying the active slot; Phase is that task's most recent sub-loop step
+// role (triage|plan|execute|verify). Single-active by construction (spec §12)
+// means at most one running task, so at most one InFlight — there is no list.
+type InFlight struct {
+	TaskID string
+	Phase  string
+}
+
+// InFlight returns the currently active sub-loop: the single task in
+// task_status with status="running" (spec §8.7: only running occupies the
+// active slot; FIFO ingest order is irrelevant once a task is dispatched) plus
+// its latest phase. ok is false when the active slot is empty. Phase is the
+// most recent steps.role for that task — the sub-loop writes steps keyed by
+// task id (RunID = task id, see subloop.go), so run_id IS the task id here and
+// no runs-table join is needed; Phase is "" before the first step lands. This
+// is the read side of the single-active invariant and the `loop-eng status
+// --watch` live view.
+func (s *Store) InFlight() (InFlight, bool, error) {
+	var taskID string
+	err := s.db.QueryRow(
+		`SELECT task_id FROM task_status WHERE status='running' LIMIT 1`).Scan(&taskID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return InFlight{}, false, nil
+		}
+		return InFlight{}, false, err
+	}
+	// Phase = newest step role for this task. Steps are append-only; ordering by
+	// at (RFC3339Nano → lexical = chronological) with rowid tiebreak is
+	// deterministic even when two steps share a timestamp.
+	var phase sql.NullString
+	_ = s.db.QueryRow(
+		`SELECT role FROM steps WHERE run_id=? ORDER BY at DESC, rowid DESC LIMIT 1`, taskID).Scan(&phase)
+	return InFlight{TaskID: taskID, Phase: phase.String}, true, nil
+}
+
 // ListStatuses returns every task_status row (id + status). Ordered by
 // updated_at so the most recently touched tasks surface first.
 func (s *Store) ListStatuses() ([]StatusRow, error) {

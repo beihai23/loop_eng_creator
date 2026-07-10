@@ -43,6 +43,45 @@ func TestAppendStepAndReplay(t *testing.T) {
 	}
 }
 
+// TestInFlight covers the single-active live view (spec §8.7/§8.3): a running
+// task surfaces with its latest step role as Phase, an empty active slot yields
+// ok=false, and only the newest step's role wins.
+func TestInFlight(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+
+	// No running task yet → slot empty.
+	if _, ok, err := s.InFlight(); err != nil || ok {
+		t.Fatalf("empty slot: ok=%v err=%v", ok, err)
+	}
+
+	tid, _ := s.InsertTask(TaskRow{Description: "x", TaskType: "t"})
+	s.AppendTransition(tid, "new", "running", "dispatched")
+	// steps.run_id IS the task id (subloop.go writes RunID = task id).
+	s.AppendStep(StepRow{RunID: tid, Seq: 1, Role: "plan", Status: "ok"})
+	s.AppendStep(StepRow{RunID: tid, Seq: 2, Role: "execute", Status: "ok"})
+
+	got, ok, err := s.InFlight()
+	if err != nil || !ok {
+		t.Fatalf("InFlight: ok=%v err=%v", ok, err)
+	}
+	if got.TaskID != tid {
+		t.Fatalf("TaskID = %q want %q", got.TaskID, tid)
+	}
+	if got.Phase != "execute" {
+		t.Fatalf("Phase = %q want execute (latest step)", got.Phase)
+	}
+
+	// A second running task should never happen (single-active, spec §12), but
+	// InFlight is defined to return one row regardless — sanity-check it stays
+	// scoped to a single task and does not panic on the LIMIT 1 query.
+	tid2, _ := s.InsertTask(TaskRow{Description: "y", TaskType: "t"})
+	s.AppendTransition(tid2, "new", "running", "dispatched")
+	if _, ok, err := s.InFlight(); err != nil || !ok {
+		t.Fatalf("InFlight after 2 running: ok=%v err=%v", ok, err)
+	}
+}
+
 func TestOpenIsIdempotent(t *testing.T) {
 	dir := t.TempDir() + "/state.db"
 	if _, err := Open(dir); err != nil {
