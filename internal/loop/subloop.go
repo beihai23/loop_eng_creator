@@ -5,6 +5,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -158,10 +159,18 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		// ---- verify (Chain of tiers; independent judgment) ----
 		res, err := verify.Chain(ctx, sl.tiersFor(wt), diff, task.AcceptanceCriteria, priorFailure)
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
+		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
+		// 且 failing_criteria 随行落库——修 #10 黑箱（旧 trace 只剩空的 detail=）。
+		vt, _ := json.Marshal(verifyTrace{
+			Passed:          res.Passed,
+			NeedsHuman:      res.NeedsHuman,
+			Detail:          res.Detail,
+			FailingCriteria: res.FailingCriteria,
+		})
 		sl.Store.AppendStep(state.StepRow{
 			RunID: taskID, Seq: attempt*10 + 3, Role: "verify",
 			Status:     statusOf2(res.Passed),
-			OutputJSON: fmt.Sprintf("passed=%v needs_human=%v detail=%s", res.Passed, res.NeedsHuman, res.Detail),
+			OutputJSON: string(vt),
 		})
 		if err != nil {
 			// verify 基础设施错误：致命（auth）→ 立刻中断；可重试 flake → 当作可重试失败。
@@ -215,6 +224,20 @@ func criteriaBlock(c []string) string {
 		b += "- " + line + "\n"
 	}
 	return b
+}
+
+// verifyTrace is the structured record SubLoop writes to the verify step's
+// OutputJSON (state.steps.output_json). Structured JSON — not a free-form
+// "k=v" line — so the trace is greppable and the failing_criteria list survives
+// intact. This closes the #10 observability hole: a bare "detail=" was empty
+// whenever the LLM left its reason blank, making rejections a black box. Detail
+// is now never empty on rejection (verify.detailFor), and failing_criteria is
+// carried alongside so every rejection is explainable and feeds the next retry.
+type verifyTrace struct {
+	Passed          bool     `json:"passed"`
+	NeedsHuman      bool     `json:"needs_human"`
+	Detail          string   `json:"detail"`
+	FailingCriteria []string `json:"failing_criteria,omitempty"`
 }
 
 // landCommitMessage builds the commit subject for a done task's auto-land: the
