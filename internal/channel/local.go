@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Local struct{ Root string }
@@ -52,8 +53,8 @@ func parseLocalTask(raw string) Task {
 	return t
 }
 
-func (l *Local) ListReplies(_ context.Context, _ []string) (map[string][]Reply, error) {
-	return nil, nil // M1 不需要回复（无 daemon）；M2/M3 实现
+func (l *Local) ListReplies(_ context.Context, _ []string, _ time.Time) (map[string][]Reply, error) {
+	return nil, nil
 }
 
 func (l *Local) PostComment(_ context.Context, ref, body string) error {
@@ -77,3 +78,7 @@ func (l *Local) UpdateStatus(_ context.Context, ref, status string) error {
 	}
 	return os.WriteFile(filepath.Join(dir, ref), []byte(status), 0644)
 }
+
+func (l *Local) CloseIssue(_ context.Context, _ string) error { return nil }
+
+func (l *Local) GetTaskStates(_ context.Context, _ []string) (map[string]TaskState, error) { return nil, nil }

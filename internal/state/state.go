@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -55,6 +56,10 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
 	}
+	// Best-effort migration: add last_comment_at to task_status for the
+	// bidirectional sync (reconcile + poll-signals-on-blocked). Ignored if the
+	// column already exists in a DB created by an earlier version.
+	db.Exec(`ALTER TABLE task_status ADD COLUMN last_comment_at TEXT`)
 	return &Store{db: db}, nil
 }
 
@@ -248,16 +253,49 @@ func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 // spec §10 (needs-info/needs-human-decision/blocked) wait on different human
 // inputs and land with the triage/gate/help-skills issues.
 func (s *Store) ParkedTasks() ([]TaskRow, error) {
+	return s.listTasksByStatus("needs-review")
+}
+
+// BlockedTasks returns every task whose status is "blocked" (retries exhausted,
+// verify rejection, etc.), oldest first. The daemon polls these alongside
+// needs-review tasks for new human replies — a reply on a blocked task signals
+// "I've addressed the block; retry this task."
+func (s *Store) BlockedTasks() ([]TaskRow, error) {
+	return s.listTasksByStatus("blocked")
+}
+
+// TerminalTasks returns every task whose status is "done" or "blocked" — the
+// terminal states that the daemon's reconcile step checks against the channel
+// side for human-driven reversals (reopen, un-label).
+func (s *Store) TerminalTasks() ([]TaskRow, error) {
 	rows, err := s.db.Query(
 		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
-		 WHERE ts.status = 'needs-review'
+		 WHERE ts.status IN ('done', 'blocked')
 		 ORDER BY t.created_at ASC, t.rowid ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanTaskRows(rows)
+}
+
+func (s *Store) listTasksByStatus(status string) ([]TaskRow, error) {
+	rows, err := s.db.Query(
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		 FROM tasks t
+		 JOIN task_status ts ON ts.task_id = t.id
+		 WHERE ts.status = ?
+		 ORDER BY t.created_at ASC, t.rowid ASC`, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTaskRows(rows)
+}
+
+func scanTaskRows(rows *sql.Rows) ([]TaskRow, error) {
 	var out []TaskRow
 	for rows.Next() {
 		var t TaskRow
@@ -336,6 +374,61 @@ func (s *Store) RequeueOrphanedRunning() (int, error) {
 	// the restart — the watch view shows no active task until the next dispatch.
 	_ = s.ClearInFlight()
 	return len(ids), nil
+}
+
+// LastCommentAt returns the last time the daemon posted a comment for this
+// task (stored in task_status.last_comment_at). A zero time means the daemon
+// has not posted any comment yet. The daemon's pollSignals step uses this to
+// filter for human replies that arrived after the daemon's last interaction.
+func (s *Store) LastCommentAt(taskID string) (time.Time, error) {
+	var t sql.NullString
+	err := s.db.QueryRow(`SELECT last_comment_at FROM task_status WHERE task_id=?`, taskID).Scan(&t)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	if !t.Valid || t.String == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, t.String)
+}
+
+// SetLastCommentAt records the timestamp of the daemon's most recent comment on
+// this task. Called from the SubLoop's report() after a successful PostComment,
+// so the daemon's pollSignals step knows which human replies are new.
+func (s *Store) SetLastCommentAt(taskID string, t time.Time) error {
+	_, err := s.db.Exec(`UPDATE task_status SET last_comment_at=? WHERE task_id=?`,
+		t.Format(time.RFC3339Nano), taskID)
+	return err
+}
+
+// SetResumeFeedback stores the human feedback that triggered a resume (parked →
+// new re-queue) in the task_status.parked_detail column, so the SubLoop's next
+// Run can read it as the initial priorFailure for the Plan skill's BattleReport.
+func (s *Store) SetResumeFeedback(taskID, feedback string) error {
+	_, err := s.db.Exec(`UPDATE task_status SET parked_detail=? WHERE task_id=?`, feedback, taskID)
+	return err
+}
+
+// PopResumeFeedback reads and clears the resume feedback for a task. Returns ""
+// if no feedback was set. Called by SubLoop at the start of each Run so the
+// human's reply from the previous parked round feeds into the Plan skill.
+func (s *Store) PopResumeFeedback(taskID string) (string, error) {
+	var fb sql.NullString
+	err := s.db.QueryRow(`SELECT parked_detail FROM task_status WHERE task_id=?`, taskID).Scan(&fb)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	s.db.Exec(`UPDATE task_status SET parked_detail='' WHERE task_id=?`, taskID)
+	if !fb.Valid {
+		return "", nil
+	}
+	return fb.String, nil
 }
 
 // TransitionRow is one lifecycle transition in the append-only transitions

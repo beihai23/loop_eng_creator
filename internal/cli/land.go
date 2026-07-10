@@ -4,6 +4,7 @@ package cli
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"loop-eng/internal/isolation"
 )
@@ -26,6 +27,27 @@ func land(repo, wt, branch string) error {
 		return fmt.Errorf("discard worktree: %w", err)
 	}
 	return nil
+}
+
+// createPR pushes the committed worktree branch to origin, creates a GitHub PR,
+// and cleans up the worktree. Returns the PR URL on success. On failure the
+// caller falls back to land() (FF-merge to local main).
+func createPR(repo, ghRepo, branch, wt, title, body string) (string, error) {
+	if err := runGit(repo, "push", "-u", "origin", branch); err != nil {
+		return "", fmt.Errorf("git push origin: %w", err)
+	}
+	args := []string{"pr", "create", "--repo", ghRepo, "--base", "main",
+		"--head", branch, "--title", title, "--body", body}
+	cmd := exec.Command("gh", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr create: %s: %w", string(out), err)
+	}
+	prURL := strings.TrimSpace(string(out))
+	if err := isolation.Discard(repo, wt); err != nil {
+		return prURL, fmt.Errorf("discard worktree: %w (PR created: %s)", err, prURL)
+	}
+	return prURL, nil
 }
 
 // runGit runs `git -C repo <args...>` and returns the combined output + error.

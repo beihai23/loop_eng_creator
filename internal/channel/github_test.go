@@ -1,6 +1,9 @@
 package channel
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseIssueJSONAndBody(t *testing.T) {
 	raw := `[{"number":42,"title":"add X","body":"## 任务\nadd X\ntype: feature\n## 验收标准\n- [ ] it works"}]`
@@ -31,7 +34,7 @@ func TestParseIssueCommentsJSON(t *testing.T) {
 		`{"author":{"login":"carol"},"body":""}` +
 		`]}`
 
-	replies, err := parseIssueCommentsJSON([]byte(raw))
+	replies, err := parseIssueCommentsJSON([]byte(raw), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +58,7 @@ func TestParseIssueCommentsJSON(t *testing.T) {
 // TestParseIssueCommentsJSONEmpty covers the zero-comments case (a parked
 // task with no human reply yet): the ref still maps to an empty slice.
 func TestParseIssueCommentsJSONEmpty(t *testing.T) {
-	replies, err := parseIssueCommentsJSON([]byte(`{"comments":[]}`))
+	replies, err := parseIssueCommentsJSON([]byte(`{"comments":[]}`), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +70,7 @@ func TestParseIssueCommentsJSONEmpty(t *testing.T) {
 // TestParseIssueCommentsJSONBad asserts malformed JSON surfaces an error
 // rather than silently returning an empty result.
 func TestParseIssueCommentsJSONBad(t *testing.T) {
-	if _, err := parseIssueCommentsJSON([]byte(`{not-json`)); err == nil {
+	if _, err := parseIssueCommentsJSON([]byte(`{not-json`), time.Time{}); err == nil {
 		t.Fatal("want error for malformed comments JSON, got nil")
 	}
 }

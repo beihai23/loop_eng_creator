@@ -33,7 +33,7 @@ func (f *scriptedChannel) ListNewTasks(ctx context.Context) ([]channel.Task, err
 // ListReplies returns the scripted human replies for the parked refs the daemon
 // asks about. The daemon only calls this with parked (needs-review) refs, so a
 // test simulates "human answered" by setting replies[<ref>] before the tick.
-func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string) (map[string][]channel.Reply, error) {
+func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
 	out := make(map[string][]channel.Reply)
 	for _, r := range refs {
 		if rs, ok := f.replies[r]; ok {
@@ -44,6 +44,10 @@ func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string) (map[s
 }
 func (f *scriptedChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
 func (f *scriptedChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
+func (f *scriptedChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
+func (f *scriptedChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
 
 // cancelChannel returns no tasks but cancels its context on the Nth
 // ListNewTasks call, letting TestRunLoopsUntilCancelled stop the resident loop
@@ -62,11 +66,15 @@ func (f *cancelChannel) ListNewTasks(ctx context.Context) ([]channel.Task, error
 	return nil, nil
 }
 
-func (f *cancelChannel) ListReplies(ctx context.Context, refs []string) (map[string][]channel.Reply, error) {
+func (f *cancelChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
 	return nil, nil
 }
 func (f *cancelChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
 func (f *cancelChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
+func (f *cancelChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
+func (f *cancelChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
 
 func newTestStore(t *testing.T) *state.Store {
 	t.Helper()

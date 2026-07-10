@@ -135,6 +135,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 	sid := shortID(taskID)
 
 	priorFailure := ""
+	if fb, err := sl.Store.PopResumeFeedback(taskID); err == nil && fb != "" {
+		priorFailure = fb
+	}
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
 		// 预算刹车·重试：每轮入口记一行（spec §8.8）
 		sl.Store.AppendBudget(taskID, "task", "retry", attempt, sl.Budget.MaxRetries)
@@ -357,6 +360,9 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 	if err := sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: PostComment failed: %v\n", err)
 		detail += " [writeback partial: comment: " + err.Error() + "]"
+	} else if err := sl.Store.SetLastCommentAt(taskID, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "writeback error: SetLastCommentAt failed: %v\n", err)
+		detail += " [writeback partial: last_comment_at: " + err.Error() + "]"
 	}
 	// Mark the ticket's status: Local writes status/<ref>; GitHub adds a
 	// loop:<status> label. Same error contract as PostComment — surface to
@@ -364,6 +370,12 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 	if err := sl.Channel.UpdateStatus(ctx, task.Ref, status); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: UpdateStatus failed: %v\n", err)
 		detail += " [writeback partial: status: " + err.Error() + "]"
+	}
+	if status == "done" {
+		if err := sl.Channel.CloseIssue(ctx, task.Ref); err != nil {
+			fmt.Fprintf(os.Stderr, "writeback error: CloseIssue failed: %v\n", err)
+			detail += " [writeback partial: close: " + err.Error() + "]"
+		}
 	}
 	return Outcome{Status: status, Detail: detail}
 }

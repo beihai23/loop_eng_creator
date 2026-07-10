@@ -3,12 +3,6 @@
 // durable FIFO, and drives a single active SubLoop to completion. The daemon
 // never blocks on a human (spec principle 7): tier-3 human review parks the
 // task, freeing the active slot, and is resumed on a later tick.
-//
-// This cut implements the tick loop + §7.1 step 1 (ingest with dedup), step 2
-// (poll parked tasks for human replies → resume with feedback), and step 3
-// (dispatch the FIFO head; reap collapses into "RunTask returned", and a
-// needs-review return parks the task). Gate (step 5) and the SubLoop wiring
-// land in subsequent issues.
 package daemon
 
 import (
@@ -39,23 +33,19 @@ type RunTaskFunc func(ctx context.Context, task state.TaskRow) (status, detail s
 // construction — one synchronous RunTask per tick, spec §12) and the parked set
 // is the durable query Store.ParkedTasks() (status=needs-review), so the Engine
 // holds no task-lifecycle state of its own — it is all rebuildable from disk
-// (principle 4). The SubLoop wiring (RunTask → real SubLoop.Run) lands later.
+// (principle 4).
 type Engine struct {
 	Channel  channel.Channel
 	Store    *state.Store
-	Interval time.Duration // poll_interval (spec §8.2): cadence between ticks
-	Cooldown time.Duration // on a transient-infra block (upstream 529/congestion), skip dispatch this long
-	RunTask  RunTaskFunc   // injected task-runner; nil → dispatch is a no-op until wired
+	Interval time.Duration
+	Cooldown time.Duration
+	RunTask  RunTaskFunc
 
 	// Log is the observability sink for daemon tick events (ingest, dispatch,
 	// park, resume). When nil, defaults to os.Stderr with a "[daemon]" prefix.
 	// Tests inject a logger backed by bytes.Buffer to assert on output.
 	Log *log.Logger
 
-	// coolUntil is the in-memory cooldown deadline after a transient-infra block.
-	// Transient runtime state, NOT task lifecycle: a daemon restart resets it (a
-	// fresh daemon should retry, not inherit a stale backoff — principle 4 covers
-	// task state, not ephemeral backoff).
 	coolUntil time.Time
 }
 
@@ -74,17 +64,13 @@ func (e *Engine) logf(format string, args ...interface{}) {
 // is logged to stderr but does NOT halt the loop — a transient channel failure
 // skips this tick and retries next, losing no persisted state (spec §11).
 func (e *Engine) Run(ctx context.Context) error {
-	// Recover orphans: a task is "running" only while a previous daemon was
-	// mid-dispatch, so any "running" row at startup is from a crashed/killed run.
-	// Re-queue them before the first tick so they re-enter the FIFO instead of
-	// wedging forever (spec principle 4 — recover from disk).
 	if n, err := e.Store.RequeueOrphanedRunning(); err != nil {
-		fmt.Fprintf(os.Stderr, "[daemon] orphan recovery failed: %v\n", err)
+		e.logf("[daemon] orphan recovery failed: %v", err)
 	} else if n > 0 {
-		fmt.Fprintf(os.Stderr, "[daemon] recovered %d orphaned running task(s) → new\n", n)
+		e.logf("[daemon] recovered %d orphaned running task(s) → new", n)
 	}
 	if err := e.tick(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "daemon tick error: %v\n", err)
+		e.logf("daemon tick error: %v", err)
 	}
 	t := time.NewTicker(e.Interval)
 	defer t.Stop()
@@ -94,27 +80,20 @@ func (e *Engine) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-t.C:
 			if err := e.tick(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "daemon tick error: %v\n", err)
+				e.logf("daemon tick error: %v", err)
 			}
 		}
 	}
 }
 
-// tick is one daemon pass (spec §7.1). This cut implements step 1 (ingest with
-// dedup), step 2 (resume parked tasks whose human has replied), and step 3
-// (dispatch the FIFO head; a needs-review return parks the task). Gate (step 5)
-// and the SubLoop wiring arrive in later issues.
-//
-// Dispatch is synchronous: M3 runs a single active sub-loop with no
-// concurrency (spec §12), so running the task to completion inside this tick
-// is what makes single-active structural — a second task cannot start until
-// the first finishes. Reap (step 4) collapses into "RunTask returned": the
-// terminal status is written back here, and needs-review means park (the task
-// leaves running for needs-review, freeing the active slot — spec §7.2c/§10).
-//
-// Dedup is durable: it consults the persisted tasks table, not an in-memory
-// set, so a daemon restart does not re-ingest tasks the channel still lists as
-// new (spec principle 4 — recover from disk).
+// tick is one daemon pass (spec §7.1). Steps:
+// 1. Ingest new tasks from the channel (dedup against persisted tasks).
+// 2. Reconcile: read channel-side state for terminal tasks (done/blocked) and
+//    detect human-driven reversals — done issue reopened → re-queue as new;
+//    blocked issue had its label removed → re-queue as new.
+// 3. Poll signals: check needs-review + blocked tasks for new human replies
+//    since the daemon's last comment; re-queue any that got a reply.
+// 4. Dispatch the FIFO head (single-active synchronous, spec §12).
 func (e *Engine) tick(ctx context.Context) error {
 	tasks, err := e.Channel.ListNewTasks(ctx)
 	if err != nil {
@@ -124,6 +103,7 @@ func (e *Engine) tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
 	// ---- step 1: ingest new tasks (spec §7.1) ----
 	var ingested int
 	for _, t := range tasks {
@@ -139,7 +119,6 @@ func (e *Engine) tick(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
-		// Fold into seen so a duplicate within the same batch is skipped too.
 		seen[t.Ref] = true
 		ingested++
 	}
@@ -147,52 +126,20 @@ func (e *Engine) tick(ctx context.Context) error {
 		e.logf("[daemon] tick ingest: %d new task(s)", ingested)
 	}
 
-	// ---- step 2: resume parked tasks whose human has replied (spec §7.1) ----
-	// Runs before dispatch: a resumed task (needs-review→new) re-enters the FIFO
-	// and may be the very task dispatched this same tick. Parked tasks with no
-	// reply stay parked — the daemon never blocks here (principle 7).
-	var resumed int
-	parked, err := e.Store.ParkedTasks()
-	if err != nil {
-		return err
-	}
-	if len(parked) > 0 {
-		refs := make([]string, len(parked))
-		for i, p := range parked {
-			refs[i] = p.IssueRef
-		}
-		replies, err := e.Channel.ListReplies(ctx, refs)
-		if err != nil {
-			return err
-		}
-		for _, p := range parked {
-			rs := replies[p.IssueRef]
-			if len(rs) == 0 {
-				continue // still waiting on a human
-			}
-			// 人回了 → 带反馈恢复：标回 new（重新入 FIFO），反馈落盘进 transition reason。
-			if err := e.Store.AppendTransition(p.ID, "needs-review", "new",
-				"resumed: "+joinReplies(rs)); err != nil {
-				return err
-			}
-			resumed++
-			e.logf("[daemon] tick resume: task %s (%s) got human reply → re-queued", shortTaskID(p.ID), p.IssueRef)
-		}
-	}
-	if resumed > 0 {
-		e.logf("[daemon] tick resume: %d task(s) re-queued", resumed)
+	// ---- step 2: reconcile terminal tasks against channel-side state ----
+	if err := e.reconcile(ctx); err != nil {
+		e.logf("[daemon] reconcile error: %v", err)
 	}
 
-	// ---- dispatch (spec §7.1 step 3) ----
-	// No task-runner wired yet → dispatch is a no-op (the SubLoop wiring lands in
-	// a later issue). This also keeps the ingest-only daemon usable.
+	// ---- step 3: poll new human replies on parked + blocked tasks ----
+	if err := e.pollSignals(ctx); err != nil {
+		e.logf("[daemon] poll signals error: %v", err)
+	}
+
+	// ---- step 4: dispatch (spec §7.1 step 3) ----
 	if e.RunTask == nil {
 		return nil
 	}
-	// Cooldown gate: a previous task blocked on transient upstream infra (e.g.
-	// the model gateway 529 "该模型当前访问量过大"). Dispatching the next task
-	// would hit the same wall and block it too, so the daemon waits out the
-	// congestion instead of churning the whole FIFO to blocked one tick at a time.
 	if now := time.Now(); now.Before(e.coolUntil) {
 		e.logf("[daemon] tick dispatch: skip (cooldown until %s)", e.coolUntil.Format(time.TimeOnly))
 		return nil
@@ -202,28 +149,17 @@ func (e *Engine) tick(ctx context.Context) error {
 		return err
 	}
 	if !ok {
-		return nil // FIFO empty this tick
+		return nil
 	}
-	// Occupy the active slot (status=running, spec §8.3 step 3) before running.
 	if err := e.Store.AppendTransition(ready.ID, "new", "running", "dispatched"); err != nil {
 		return err
 	}
 	e.logf("[daemon] tick dispatch: task %s (%s) → running", shortTaskID(ready.ID), ready.IssueRef)
-	// Run to completion synchronously (single-active by construction, spec §12),
-	// then reap: the returned status is the terminal lifecycle state. A
-	// "needs-review" return parks the task — the AppendTransition below moves it
-	// running→needs-review, and since RunTask already returned, the active slot
-	// is free; a later tick's pollReplies resumes it on a human reply.
 	status, detail, err := e.RunTask(ctx, ready)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch: task %s (%s) failed: %v\n", ready.ID, ready.IssueRef, err)
+		e.logf("dispatch: task %s (%s) failed: %v", ready.ID, ready.IssueRef, err)
 		status = "error"
 	}
-	// A transient-infra block trips the cooldown so the next tick skips dispatch
-	// (gate above) AND re-queues this task (running→new) instead of marking it
-	// permanently blocked: the failure was upstream congestion, not the task
-	// itself, so after cooldown the daemon retries the SAME task — self-healing,
-	// no manual reset. A real block (verify rejected, fatal auth) stays blocked.
 	if status == "blocked" && isTransientInfra(detail) {
 		e.coolUntil = time.Now().Add(e.cooldown())
 		e.logf("[daemon] tick park: task %s transient-infra block → cooldown until %s, re-queue",
@@ -284,45 +220,139 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// pollReplies is spec §7.1 step 2: for every task parked on tier-3 human review,
-// ask the channel for new human replies; a task that has been replied to is
-// resumed — transitioned needs-review→new with the human feedback recorded in
-// the transition reason — so the next dispatch (this tick's step 3, or a later
-// tick if the active slot is busy) re-runs it. Parked tasks with no reply stay
-// parked. The daemon never blocks here: ListReplies is a non-blocking poll, and
-// a transient channel error returns from the tick and retries next (spec §10/§11,
-// losing no persisted state).
+// reconcile reads the channel-side state of every terminal task (done /
+// blocked) and detects human-driven reversals:
+//   - done + channel shows issue OPEN (reopened) → done → new
+//   - blocked + channel shows no "loop:blocked" label → blocked → new
 //
-// The feedback is durable in the transition trace (principle 4): the SubLoop
-// that re-runs the task reads it back as next round's prior-failure input. That
-// wiring (the SubLoop reading the resume reason) lands with the daemon↔SubLoop
-// glue; this method's contract is "attach the feedback + re-queue the task".
-func (e *Engine) pollReplies(ctx context.Context) error {
-	parked, err := e.Store.ParkedTasks()
+// This is the bidirectional sync: when a human acts on the channel (reopen,
+// remove label), the daemon notices on the next tick and re-queues the task
+// without a restart or DB poke.
+func (e *Engine) reconcile(ctx context.Context) error {
+	terms, err := e.Store.TerminalTasks()
 	if err != nil {
 		return err
 	}
-	if len(parked) == 0 {
+	if len(terms) == 0 {
 		return nil
 	}
-	refs := make([]string, len(parked))
-	for i, p := range parked {
-		refs[i] = p.IssueRef
+	refs := make([]string, len(terms))
+	byRef := make(map[string]state.TaskRow, len(terms))
+	for i, t := range terms {
+		refs[i] = t.IssueRef
+		byRef[t.IssueRef] = t
 	}
-	replies, err := e.Channel.ListReplies(ctx, refs)
+	states, err := e.Channel.GetTaskStates(ctx, refs)
 	if err != nil {
 		return err
 	}
-	for _, p := range parked {
-		rs := replies[p.IssueRef]
-		if len(rs) == 0 {
-			continue // still waiting on a human
+	for ref, s := range states {
+		task, ok := byRef[ref]
+		if !ok {
+			continue
 		}
-		// 人回了 → 带反馈恢复：标回 new（重新入 FIFO），反馈落盘进 transition reason。
-		if err := e.Store.AppendTransition(p.ID, "needs-review", "new",
-			"resumed: "+joinReplies(rs)); err != nil {
+		cur, _ := e.statusOf(task.ID)
+		switch cur {
+		case "done":
+			if s.IsOpen {
+				e.logf("[daemon] reconcile: done task %s (#%s) reopened on channel → re-queue", task.ID, ref)
+				if err := e.Store.AppendTransition(task.ID, "done", "new", "reconcile: channel reopened"); err != nil {
+					return err
+				}
+			}
+		case "blocked":
+			blockLabel := "loop:blocked"
+			hasBlockLabel := false
+			for _, l := range s.Labels {
+				if l == blockLabel {
+					hasBlockLabel = true
+					break
+				}
+			}
+			if !hasBlockLabel {
+				if s.IsOpen {
+					e.logf("[daemon] reconcile: blocked task %s (#%s) label removed on channel → re-queue", task.ID, ref)
+					if err := e.Store.AppendTransition(task.ID, "blocked", "new", "reconcile: channel label removed"); err != nil {
+						return err
+					}
+				} else {
+					e.logf("[daemon] reconcile: blocked task %s (#%s) manually closed on channel → resolved", task.ID, ref)
+					if err := e.Store.AppendTransition(task.ID, "blocked", "done", "reconcile: channel closed"); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (e *Engine) statusOf(taskID string) (string, bool) {
+	rows, err := e.Store.ListStatuses()
+	if err != nil {
+		return "", false
+	}
+	for _, r := range rows {
+		if r.ID == taskID {
+			return r.Status, true
+		}
+	}
+	return "", false
+}
+
+// pollSignals checks every parked (needs-review) and blocked task for new human
+// replies since the daemon's last comment. A task that has been replied to is
+// re-queued (→ new) with the human feedback recorded in the transition reason.
+// The daemon never blocks here: ListReplies is a non-blocking poll, and a
+// transient channel error is logged but does not halt the tick (spec §10/§11).
+func (e *Engine) pollSignals(ctx context.Context) error {
+	if err := e.pollTaskReplies(ctx, e.Store.ParkedTasks, "needs-review"); err != nil {
+		e.logf("poll signals (needs-review): %v", err)
+	}
+	if err := e.pollTaskReplies(ctx, e.Store.BlockedTasks, "blocked"); err != nil {
+		e.logf("poll signals (blocked): %v", err)
+	}
+	return nil
+}
+
+// pollTaskReplies polls one class of task (needs-review or blocked) for new
+// human reply comments. Only comments posted after the daemon's last comment
+// (last_comment_at) are surfaced so the same reply doesn't re-queue the task
+// on every tick.
+func (e *Engine) pollTaskReplies(
+	ctx context.Context,
+	fetch func() ([]state.TaskRow, error),
+	currentStatus string,
+) error {
+	tasks, err := fetch()
+	if err != nil {
+		return err
+	}
+	var resumed int
+	for _, t := range tasks {
+		since, _ := e.Store.LastCommentAt(t.ID)
+		replies, err := e.Channel.ListReplies(ctx, []string{t.IssueRef}, since)
+		if err != nil {
+			e.logf("[daemon] pollTaskReplies for %s: %v", t.ID, err)
+			continue
+		}
+		rs := replies[t.IssueRef]
+		if len(rs) == 0 {
+			continue
+		}
+		e.logf("[daemon] tick resume: task %s (%s=%s) has new human reply → re-queue",
+			shortTaskID(t.ID), currentStatus, t.IssueRef)
+		reason := "resumed: " + joinReplies(rs)
+		if err := e.Store.AppendTransition(t.ID, currentStatus, "new", reason); err != nil {
 			return err
 		}
+		if err := e.Store.SetResumeFeedback(t.ID, joinReplies(rs)); err != nil {
+			e.logf("[daemon] task %s SetResumeFeedback failed: %v", t.ID, err)
+		}
+		resumed++
+	}
+	if resumed > 0 {
+		e.logf("[daemon] tick resume: %d task(s) re-queued", resumed)
 	}
 	return nil
 }
