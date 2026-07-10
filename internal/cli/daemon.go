@@ -25,7 +25,7 @@ import (
 // (spec principle 7): tier-3 parks → releases the active slot → polls replies → resumes.
 func NewDaemonCmd() *cobra.Command {
 	var repo, channelFlag, models string
-	var pollInterval time.Duration
+	var pollInterval, cooldown time.Duration
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "常驻 loop 引擎（轮询工单 + 单活跃子 loop + park/resume）",
@@ -46,7 +46,7 @@ func NewDaemonCmd() *cobra.Command {
 			// SubLoop does the full plan→execute→verify→writeback (incl. channel
 			// comment + status mark via report()). PreinsertedTaskID = the daemon's
 			// already-ingested task ID (avoids duplicate InsertTask).
-			runTask := func(ctx context.Context, task state.TaskRow) (string, error) {
+			runTask := func(ctx context.Context, task state.TaskRow) (string, string, error) {
 				bz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
 				exec, plan, verifySkill, _ := buildModels(cfg, models, bz)
 
@@ -77,7 +77,7 @@ func NewDaemonCmd() *cobra.Command {
 				out, err := sl.Run(ctx, ct)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "[daemon] task %s error: %v\n", task.ID, err)
-					return "error", err
+					return "error", "", err
 				}
 				// Land done work on main: SubLoop committed the execute output on the
 				// worktree's branch; FF-merge it here + clean up the worktree. A land
@@ -91,7 +91,7 @@ func NewDaemonCmd() *cobra.Command {
 					}
 				}
 				fmt.Printf("[daemon] task %s → %s\n", task.ID, out.Status)
-				return out.Status, nil
+				return out.Status, out.Detail, nil
 			}
 
 			interval := pollInterval
@@ -102,6 +102,7 @@ func NewDaemonCmd() *cobra.Command {
 				Channel:  ch,
 				Store:    st,
 				Interval: interval,
+				Cooldown: cooldown,
 				RunTask:  runTask,
 			}
 
@@ -123,5 +124,6 @@ func NewDaemonCmd() *cobra.Command {
 	cmd.Flags().StringVar(&channelFlag, "channel", "", "local | github（空=用 cfg.Channel.Provider）")
 	cmd.Flags().StringVar(&models, "models", "real", "real | fake")
 	cmd.Flags().DurationVar(&pollInterval, "poll-interval", 60*time.Second, "轮询间隔")
+	cmd.Flags().DurationVar(&cooldown, "cooldown", 5*time.Minute, "瞬时基础设施阻塞（如上游 529 限流）后的派发冷却时长")
 	return cmd
 }

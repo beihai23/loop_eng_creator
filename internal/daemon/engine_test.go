@@ -158,9 +158,9 @@ func TestTickDispatchesReadyTask(t *testing.T) {
 	var got state.TaskRow
 	eng := &Engine{
 		Channel: ch, Store: st, Interval: time.Second,
-		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
 			got = task
-			return "done", nil
+			return "done", "", nil
 		},
 	}
 
@@ -190,9 +190,9 @@ func TestTickNoReadyTaskIsNoOp(t *testing.T) {
 	called := false
 	eng := &Engine{
 		Channel: ch, Store: st, Interval: time.Second,
-		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
 			called = true
-			return "done", nil
+			return "done", "", nil
 		},
 	}
 
@@ -218,9 +218,9 @@ func TestTickDispatchesOldestFirst(t *testing.T) {
 	var dispatched string
 	eng := &Engine{
 		Channel: ch, Store: st, Interval: time.Second,
-		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
 			dispatched = task.IssueRef
-			return "done", nil
+			return "done", "", nil
 		},
 	}
 
@@ -268,13 +268,13 @@ func TestTickParksAndResumes(t *testing.T) {
 	var taskID string
 	eng := &Engine{
 		Channel: ch, Store: st, Interval: time.Second,
-		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
 			runCalls++
 			taskID = task.ID
 			if runCalls == 1 {
-				return "needs-review", nil // tier-3 human review → park
+				return "needs-review", "", nil // tier-3 human review → park
 			}
-			return "done", nil // resumed re-run passes
+			return "done", "", nil // resumed re-run passes
 		},
 	}
 
@@ -336,13 +336,13 @@ func TestTickParksThenRunsAnother(t *testing.T) {
 	var idsByRef = map[string]string{}
 	eng := &Engine{
 		Channel: ch, Store: st, Interval: time.Second,
-		RunTask: func(ctx context.Context, task state.TaskRow) (string, error) {
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
 			dispatched = append(dispatched, task.IssueRef)
 			idsByRef[task.IssueRef] = task.ID
 			if task.IssueRef == "A" {
-				return "needs-review", nil // A parks
+				return "needs-review", "", nil // A parks
 			}
-			return "done", nil // B passes
+			return "done", "", nil // B passes
 		},
 	}
 
@@ -362,5 +362,100 @@ func TestTickParksThenRunsAnother(t *testing.T) {
 	}
 	if s := statusOf(t, st, idsByRef["B"]); s != "done" {
 		t.Fatalf("B must be done, got %q", s)
+	}
+}
+
+// TestEngineCooldownOnTransientInfra: when a task blocks on transient upstream
+// infra (GLM 529 "该模型当前访问量过大"), the daemon enters cooldown and the next
+// tick skips dispatch — it must NOT churn the next ready task (B) into the same
+// 529 wall. Guards the recurring GLM-congestion failure mode.
+func TestEngineCooldownOnTransientInfra(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{{Ref: "A", Description: "task A", TaskType: "feat"}}, // tick 1: ingest + dispatch A
+		{{Ref: "B", Description: "task B", TaskType: "feat"}}, // tick 2: ingest B (should NOT dispatch)
+	}}
+	var runCalls int
+	var dispatched []string
+	var taskAID string
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second, Cooldown: 1 * time.Hour,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
+			runCalls++
+			dispatched = append(dispatched, task.IssueRef)
+			taskAID = task.ID
+			return "blocked", "retries exhausted: plan error: API Error: 529 [1305][该模型当前访问量过大]", nil
+		},
+	}
+
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("tick 1 must dispatch A once, got %d", runCalls)
+	}
+	if eng.coolUntil.IsZero() {
+		t.Fatal("transient-infra block must trip cooldown (coolUntil set)")
+	}
+	// transient infra re-queues the task (running→new), NOT permanent blocked —
+	// after cooldown the daemon retries the SAME task (self-healing).
+	if s := statusOf(t, st, taskAID); s != "new" {
+		t.Fatalf("transient-infra block must re-queue A as new, got %q", s)
+	}
+
+	// tick 2: cooldown active → B is ingested but NOT dispatched.
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("cooldown must skip dispatch on tick 2 (B not run); RunTask calls = %d, dispatched %v", runCalls, dispatched)
+	}
+}
+
+// TestEngineNoCooldownOnRealBlock: a real block (verify rejection, not infra)
+// must NOT trip cooldown — the next ready task dispatches normally next tick.
+func TestEngineNoCooldownOnRealBlock(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{{Ref: "A", Description: "task A", TaskType: "feat"}},
+		{{Ref: "B", Description: "task B", TaskType: "feat"}},
+	}}
+	var runCalls int
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second, Cooldown: 1 * time.Hour,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
+			runCalls++
+			return "blocked", "verify rejected: acceptance criterion #2 not met in diff", nil
+		},
+	}
+
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if !eng.coolUntil.IsZero() {
+		t.Fatal("real (non-transient) block must NOT trip cooldown")
+	}
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if runCalls != 2 {
+		t.Fatalf("no cooldown → B must dispatch on tick 2; RunTask calls = %d", runCalls)
+	}
+}
+
+func TestIsTransientInfra(t *testing.T) {
+	cases := map[string]bool{
+		"retries exhausted: plan error: API Error: 529 [1305][该模型当前访问量过大]": true,
+		"API Error: 529":                true,
+		"upstream rate limit exceeded":  true,
+		"503 service unavailable":       true,
+		"verify rejected: missing test": false,
+		"retries exhausted: plan error: claude -p: context canceled": false,
+		"": false,
+	}
+	for detail, want := range cases {
+		if got := isTransientInfra(detail); got != want {
+			t.Errorf("isTransientInfra(%q) = %v, want %v", detail, got, want)
+		}
 	}
 }

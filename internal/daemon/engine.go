@@ -23,12 +23,13 @@ import (
 )
 
 // RunTaskFunc runs one task to completion and returns its terminal status
-// (e.g. "done", "blocked"). It is injected so the daemon stays decoupled from
-// the concrete SubLoop wiring, which lands in a later issue. The daemon owns
-// the task lifecycle bookkeeping (status transitions, spec §8.3 step 3/4);
-// RunTask just does the work and reports the outcome — it must NOT mutate
-// task_status itself, so the daemon is the single writer of the lifecycle.
-type RunTaskFunc func(ctx context.Context, task state.TaskRow) (status string, err error)
+// (e.g. "done", "blocked") plus the outcome Detail (the failure reason on a
+// block — used by the engine to classify transient-infra blocks for cooldown).
+// It is injected so the daemon stays decoupled from the concrete SubLoop wiring.
+// The daemon owns the task lifecycle bookkeeping (status transitions, spec §8.3
+// step 3/4); RunTask just does the work and reports the outcome — it must NOT
+// mutate task_status itself, so the daemon is the single writer of the lifecycle.
+type RunTaskFunc func(ctx context.Context, task state.TaskRow) (status, detail string, err error)
 
 // Engine is the resident M3 daemon. It polls Channel every Interval, ingesting
 // new tasks into Store (the durable FIFO) deduped by issue_ref, resuming parked
@@ -42,7 +43,14 @@ type Engine struct {
 	Channel  channel.Channel
 	Store    *state.Store
 	Interval time.Duration // poll_interval (spec §8.2): cadence between ticks
+	Cooldown time.Duration // on a transient-infra block (upstream 529/congestion), skip dispatch this long
 	RunTask  RunTaskFunc   // injected task-runner; nil → dispatch is a no-op until wired
+
+	// coolUntil is the in-memory cooldown deadline after a transient-infra block.
+	// Transient runtime state, NOT task lifecycle: a daemon restart resets it (a
+	// fresh daemon should retry, not inherit a stale backoff — principle 4 covers
+	// task state, not ephemeral backoff).
+	coolUntil time.Time
 }
 
 // Run is the resident entry point. It ticks once immediately (a fresh daemon
@@ -123,6 +131,15 @@ func (e *Engine) tick(ctx context.Context) error {
 	if e.RunTask == nil {
 		return nil
 	}
+	// Cooldown gate: a previous task blocked on transient upstream infra (e.g.
+	// the model gateway 529 "该模型当前访问量过大"). Dispatching the next task
+	// would hit the same wall and block it too, so the daemon waits out the
+	// congestion instead of churning the whole FIFO to blocked one tick at a time.
+	if now := time.Now(); now.Before(e.coolUntil) {
+		fmt.Fprintf(os.Stderr, "[daemon] cooling down until %s (transient infra); skip dispatch\n",
+			e.coolUntil.Format(time.TimeOnly))
+		return nil
+	}
 	ready, ok, err := e.Store.NextReadyTask()
 	if err != nil {
 		return err
@@ -139,12 +156,61 @@ func (e *Engine) tick(ctx context.Context) error {
 	// "needs-review" return parks the task — the AppendTransition below moves it
 	// running→needs-review, and since RunTask already returned, the active slot
 	// is free; a later tick's pollReplies resumes it on a human reply.
-	status, err := e.RunTask(ctx, ready)
+	status, detail, err := e.RunTask(ctx, ready)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch: task %s (%s) failed: %v\n", ready.ID, ready.IssueRef, err)
 		status = "error"
 	}
+	// A transient-infra block trips the cooldown so the next tick skips dispatch
+	// (gate above) AND re-queues this task (running→new) instead of marking it
+	// permanently blocked: the failure was upstream congestion, not the task
+	// itself, so after cooldown the daemon retries the SAME task — self-healing,
+	// no manual reset. A real block (verify rejected, fatal auth) stays blocked.
+	if status == "blocked" && isTransientInfra(detail) {
+		e.coolUntil = time.Now().Add(e.cooldown())
+		fmt.Fprintf(os.Stderr, "[daemon] transient-infra block on %s → cooldown until %s, re-queue task: %s\n",
+			ready.ID, e.coolUntil.Format(time.TimeOnly), truncate(detail, 120))
+		return e.Store.AppendTransition(ready.ID, "running", "new", "transient infra; re-queued")
+	}
 	return e.Store.AppendTransition(ready.ID, "running", status, "ran")
+}
+
+// cooldown returns the configured transient-infra cooldown, defaulting to 5
+// minutes (spec §10/§11 resilience: wait out upstream congestion rather than
+// burn the FIFO one blocked task per tick).
+func (e *Engine) cooldown() time.Duration {
+	if e.Cooldown > 0 {
+		return e.Cooldown
+	}
+	return 5 * time.Minute
+}
+
+// isTransientInfra reports whether a blocked task's detail smells like transient
+// upstream infrastructure failure (model-gateway congestion / rate limiting) — as
+// opposed to a real verify rejection. Such blocks trip the daemon cooldown so the
+// whole queue isn't burned one task per tick. Substring match (case-insensitive
+// for ASCII) on the signals seen in the wild: GLM 529 "该模型当前访问量过大",
+// generic 503 / rate-limit / overloaded. "context canceled" is NOT transient infra
+// (that's a shutdown/timeout, not congestion).
+func isTransientInfra(detail string) bool {
+	d := strings.ToLower(detail)
+	for _, sig := range []string{
+		"529", "该模型当前", "访问量过大", "rate limit", "rate-limit",
+		"overloaded", "too many requests", "service unavailable", "503",
+	} {
+		if strings.Contains(d, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// truncate returns s cut to at most n bytes with a "..." marker, for log lines.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 // pollReplies is spec §7.1 step 2: for every task parked on tier-3 human review,
