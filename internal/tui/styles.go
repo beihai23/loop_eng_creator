@@ -43,6 +43,17 @@ func statusStyle(status string) lipgloss.Style {
 	}
 }
 
-// brightnessStyle 在 B4 之前用稳态（phase 不影响），B4 替换为真实明度插值。
-// 占位：直接返回 base，使进行中任务先以稳态亮绿渲染。
-func brightnessStyle(base lipgloss.Style, phase float64) lipgloss.Style { return base }
+// brightnessStyle 按呼吸相位在亮绿与暗绿之间插值（spec §6 呼吸灯）。
+func brightnessStyle(base lipgloss.Style, phase float64) lipgloss.Style {
+	b := breathBrightness(phase)
+	// 在暗绿(22)与亮绿(10)之间按 b 取色
+	var c lipgloss.Color
+	if b > 0.66 {
+		c = lipgloss.Color("10") // 亮绿
+	} else if b > 0.33 {
+		c = lipgloss.Color("2")  // 中绿
+	} else {
+		c = lipgloss.Color("22") // 暗绿
+	}
+	return base.Foreground(c)
+}
