@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -29,5 +30,43 @@ func TestKeySwitchAndCancel(t *testing.T) {
 	pending, _ := st.PendingCommands()
 	if len(pending) != 1 || pending[0].Verb != "cancel" {
 		t.Fatalf("cancel command not written: %+v", pending)
+	}
+}
+
+func TestQuitOnQAndCtrlC(t *testing.T) {
+	msgs := []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("q")},
+		{Type: tea.KeyCtrlC},
+	}
+	for i, msg := range msgs {
+		m := New(nil, nil)
+		m2, cmd := m.Update(msg)
+		mm, ok := m2.(Model)
+		if !ok || !mm.quit {
+			t.Fatalf("msg %d (%s): quit not set", i, msg.String())
+		}
+		if cmd == nil {
+			t.Fatalf("msg %d (%s): cmd nil, want tea.Quit", i, msg.String())
+		}
+		if _, ok := cmd().(tea.QuitMsg); !ok {
+			t.Fatalf("msg %d (%s): cmd() not tea.QuitMsg", i, msg.String())
+		}
+	}
+}
+
+func TestViewDispatchesOverview(t *testing.T) {
+	st, err := state.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	// one new task so the snapshot is non-empty
+	st.InsertTask(state.TaskRow{IssueRef: "#1", Description: "smoke"})
+
+	m := New(st, nil)
+	out := m.View()
+	// overview renders the title + counts bar
+	if !strings.Contains(out, "loop-eng dashboard") || !strings.Contains(out, "待处理") {
+		t.Fatalf("overview dispatch output missing title/counts:\n%s", out)
 	}
 }
