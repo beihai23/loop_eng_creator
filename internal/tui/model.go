@@ -4,10 +4,9 @@
 package tui
 
 import (
-	"fmt"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"loop-eng/internal/config"
 	"loop-eng/internal/state"
 )
@@ -21,13 +20,17 @@ const (
 	tabTrace
 )
 
-// Model 是 dashboard 的 bubbletea Model。B1 只放骨架字段；B7 会加 selIdx/selTask/snap/animPhase。
+// Model 是 dashboard 的 bubbletea Model。B1 只放骨架字段；B7 加 selIdx/selTask/snap/animPhase。
 type Model struct {
 	store         *state.Store
 	cfg           *config.Config
 	tab           tab
 	width, height int
 	quit          bool
+	selIdx        int       // 总览列表选中索引
+	selTask       string    // 当前选中的 task id（详情/轨迹用）
+	snap          *Snapshot // 数据 tick 刷新
+	animPhase     float64   // 动画相位（动画 tick 推进）
 }
 
 // New 构造 Model。store 由 dashboard 命令开好（读写在同一条连接：读快照 + 写
@@ -36,30 +39,110 @@ func New(st *state.Store, cfg *config.Config) Model {
 	return Model{store: st, cfg: cfg, tab: tabOverview}
 }
 
-// Init 启动命令；B1 无定时器，B7 加 data/anim tick。
-func (m Model) Init() tea.Cmd { return nil }
+// 两个 tick 的消息：dataTick 重读快照，animTick 推进呼吸灯相位。
+type dataTickMsg struct{}
+type animTickMsg struct{}
 
-// Update 处理按键 / 窗口尺寸。B1 仅 q / ctrl+c 退出 + 记录终端尺寸。
+const (
+	dataTickInterval = 2 * time.Second       // 数据 tick：~2s 重读 SQLite
+	animTickInterval = 60 * time.Millisecond // 动画 tick：~60ms 重绘呼吸灯
+)
+
+// dataTick 产生一次数据 tick 命令（到期后返回 dataTickMsg）。
+func dataTick() tea.Cmd {
+	return tea.Tick(dataTickInterval, func(time.Time) tea.Msg { return dataTickMsg{} })
+}
+
+// animTick 产生一次动画 tick 命令（到期后返回 animTickMsg）。
+func animTick() tea.Cmd {
+	return tea.Tick(animTickInterval, func(time.Time) tea.Msg { return animTickMsg{} })
+}
+
+// Init 启动双 tick（数据 + 动画）。
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(dataTick(), animTick())
+}
+
+// Update 处理双 tick / 按键 / 窗口尺寸 / 鼠标。
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+
+	case dataTickMsg:
+		snap, _ := ReadSnapshot(m.store, m.cfg)
+		m.snap = snap
+		return m, dataTick() // 继续
+
+	case animTickMsg:
+		m.animPhase += 0.15
+		return m, animTick()
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quit = true
 			return m, tea.Quit
+		case "1":
+			m.tab = tabOverview
+		case "2":
+			m.tab = tabDetail
+		case "3", "t":
+			m.tab = tabTrace
+		case "esc":
+			m.tab = tabOverview
+		case "up", "k":
+			if m.selIdx > 0 {
+				m.selIdx--
+			}
+		case "down", "j":
+			if m.snap != nil && m.selIdx < len(m.snap.Tasks)-1 {
+				m.selIdx++
+			}
+		case "enter":
+			if m.snap != nil && m.selIdx < len(m.snap.Tasks) {
+				m.selTask = m.snap.Tasks[m.selIdx].ID
+				m.tab = tabDetail
+			}
+		case "r":
+			if m.selTask != "" {
+				_ = issueResume(m.store, m.selTask, "")
+			}
+		case "x":
+			if m.selTask != "" {
+				_ = issueCancel(m.store, m.selTask)
+			}
 		}
-	case tea.WindowSizeMsg:
-		m.width, m.height = msg.Width, msg.Height
+
+	case tea.MouseMsg:
+		// v1：鼠标点击总览行 = 选中（简化：用 Y 坐标粗映射 selIdx）
+		// 完整鼠标 hit-test 留后续；此处至少不崩。
 	}
 	return m, nil
 }
 
-// View 渲染当前帧。B1 只渲染标题 + 退出提示；B2 起填三 Tab 内容。
+// View 按当前 tab 渲染一帧。首屏数据未到时先读一次。
 func (m Model) View() string {
 	if m.quit {
 		return ""
 	}
-	title := lipgloss.NewStyle().Bold(true).Render("loop-eng dashboard")
-	hint := lipgloss.NewStyle().Faint(true).Render("（骨架）q 退出")
-	return fmt.Sprintf("%s\n%s\n", title, hint)
+	// 首屏数据未到：先读一次
+	if m.snap == nil {
+		m.snap, _ = ReadSnapshot(m.store, m.cfg)
+	}
+	switch m.tab {
+	case tabOverview:
+		return RenderOverview(m.snap, m.selIdx, m.animPhase, m.width)
+	case tabDetail:
+		if m.selTask == "" {
+			return "（未选中任务）\n"
+		}
+		return RenderDetail(m.store, m.cfg, m.selTask)
+	case tabTrace:
+		if m.selTask == "" {
+			return "（未选中任务）\n"
+		}
+		return RenderTrace(m.store, m.selTask)
+	}
+	return ""
 }

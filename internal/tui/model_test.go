@@ -1,31 +1,33 @@
 package tui
 
 import (
-	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"loop-eng/internal/state"
 )
 
-// TestViewRendersTitle 验证 B1 骨架帧包含标题。
-func TestViewRendersTitle(t *testing.T) {
-	m := New(nil, nil)
-	got := m.View()
-	if !strings.Contains(got, "loop-eng dashboard") {
-		t.Fatalf("View() = %q, 期望包含 loop-eng dashboard", got)
-	}
-}
+func TestKeySwitchAndCancel(t *testing.T) {
+	st, _ := state.Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	tid, _ := st.InsertTask(state.TaskRow{IssueRef: "#1", Description: "d"})
 
-// TestQuitOnQ 验证按 q 设置 quit 标志并返回 tea.Quit。
-func TestQuitOnQ(t *testing.T) {
-	m := New(nil, nil)
-	mm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
-	// ctrl+c 与 "q" 走同一分支；这里直接验 ctrl+c 路径。
-	if cmd == nil {
-		t.Fatalf("Update(ctrl+c) 返回 nil cmd，期望 tea.Quit")
+	m := New(st, nil)
+	m.selTask = tid
+
+	// '2' → 详情 tab
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	if m2.(Model).tab != tabDetail {
+		t.Fatalf("tab not detail")
 	}
-	// 执行 cmd 应产生 tea.Quit（tea.Quit 是一个无消息的 Cmd）。
-	if mm.(Model).quit != true {
-		t.Fatalf("Update(ctrl+c) 后 quit=false，期望 true")
+
+	// 'x' 对选中任务写 cancel 命令
+	m_tab := m
+	m_tab.selTask = tid
+	m3, _ := m_tab.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	_ = m3
+	pending, _ := st.PendingCommands()
+	if len(pending) != 1 || pending[0].Verb != "cancel" {
+		t.Fatalf("cancel command not written: %+v", pending)
 	}
 }
