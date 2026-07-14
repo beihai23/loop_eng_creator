@@ -20,7 +20,7 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 		return fmt.Sprintf("（任务 %s 不存在）\n", taskID)
 	}
 	var b strings.Builder
-	b.WriteString(lipglossBold.Render(fmt.Sprintf("#%s %s", t.IssueRef, t.Description)))
+	b.WriteString(lipglossBold.Render(fmt.Sprintf("%s %s", t.IssueRef, t.Description)))
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("type: %s   状态: %s\n", t.TaskType, statusOfTask(st, taskID)))
 
@@ -135,8 +135,9 @@ func elapsedSince(iso string) string {
 }
 
 func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "…"
+	rs := []rune(s)
+	if len(rs) > n {
+		return string(rs[:n]) + "…"
 	}
 	return s
 }
