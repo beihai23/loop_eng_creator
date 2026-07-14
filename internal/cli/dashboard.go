@@ -1,8 +1,8 @@
 package cli
 
 import (
-	"github.com/spf13/cobra"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/spf13/cobra"
 	"loop-eng/internal/tui"
 )
 
@@ -17,7 +17,13 @@ func NewDashboardCmd() *cobra.Command {
 			cfg := mustLoad(repo)
 			st := mustOpenState(repo)
 			defer st.Close()
-			p := tea.NewProgram(tui.New(st, cfg), tea.WithAltScreen())
+			// 非 TTY（管道/重定向）不进 alt-screen，避免刷屏噪声；NO_COLOR/非 TTY
+			// 时 tui 包 init() 已把颜色降级为纯文本（spec §6）。
+			opts := []tea.ProgramOption{}
+			if tui.IsTTY() {
+				opts = append(opts, tea.WithAltScreen())
+			}
+			p := tea.NewProgram(tui.New(st, cfg), opts...)
 			_, err := p.Run()
 			return err
 		},
