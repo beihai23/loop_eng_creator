@@ -68,7 +68,7 @@ func Open(path string) (*Store, error) {
 	// bidirectional sync (reconcile + poll-signals-on-blocked). Ignored if the
 	// column already exists in a DB created by an earlier version.
 	db.Exec(`ALTER TABLE task_status ADD COLUMN last_comment_at TEXT`)
-	// Best-effort: add run_id to verifications for Task 6 跑步 grouping.
+	// Best-effort: add run_id to verifications for Task 6 的 per-run 分组。
 	db.Exec(`ALTER TABLE verifications ADD COLUMN run_id TEXT`)
 	return &Store{db: db}, nil
 }
