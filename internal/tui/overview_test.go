@@ -25,8 +25,23 @@ func TestRenderOverviewCountsAndSymbols(t *testing.T) {
 	if !strings.Contains(out, "●") {
 		t.Fatalf("running symbol missing: %q", out)
 	}
-	// 选中行带选中标记
-	if !strings.Contains(out, "▸") {
+	// 选中行带选中标记（实心三角 ▶）
+	if !strings.Contains(out, "▶") {
 		t.Fatalf("selection marker missing: %q", out)
+	}
+	// 列头存在（字段不再靠猜）
+	for _, h := range []string{"№", "状态", "任务"} {
+		if !strings.Contains(out, h) {
+			t.Fatalf("column header %q missing: %q", h, out)
+		}
+	}
+	// 分隔线存在（表格结构感）
+	if !strings.Contains(out, "─") {
+		t.Fatalf("separator line missing: %q", out)
+	}
+	// 未选中行不应带 ▶（只有光标行带）
+	// 第二行（selIdx=0 之外）用空格 marker，不含 ▶ 之外的多余三角——这里仅断言 ▶ 只出现一次。
+	if strings.Count(out, "▶") != 1 {
+		t.Fatalf("exactly one selected row expected, got %d ▶: %q", strings.Count(out, "▶"), out)
 	}
 }

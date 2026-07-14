@@ -7,39 +7,124 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// RenderOverview 渲染 [1] 总览：计数条 + 任务列表。纯函数（无 Store/终端/真时间）。
-// animPhase 用于进行中任务的呼吸灯明度（B4 animate 计算后传入；此处接参但走稳态）。
-// selIdx 是当前光标所在行；w 为终端宽度（预留截断用）。
+// 列宽（显示单元格）。num/status 列固定宽，description 吃剩余宽度。
+// marker 列宽 2（▶ / 空格），num 列容 "#999"，status 列容 "● needs-review"。
+const (
+	ovMarkerW = 2
+	ovNumW    = 6
+	ovStatusW = 14
+)
+
+// RenderOverview 渲染 [1] 总览：标题 + 状态计数（符号即 legend）+ 边框表格
+// （列头 №/状态/任务 + 分隔线 + 任务行）。纯函数（无 Store/终端/真时间）。
+//
+// 设计取舍（spec §6 + 可读性）：颜色只是锦上添花——边框/列头/分隔线/▶ 选中标记
+// 这些**结构性**元素在 NO_COLOR/非 TTY 降级（Ascii profile）下也立得住，这才是
+// 让「表格看起来可交互、字段不靠猜」的根。selIdx 是光标所在行；animPhase 进行中
+// 呼吸灯；w 终端宽度（列宽/盒宽/截断据此对齐）。
 func RenderOverview(snap *Snapshot, selIdx int, animPhase float64, w int) string {
+	if w < 40 {
+		w = 40 // 极窄终端兜底，保证列头不挤
+	}
+	innerW := w - 2 // 边框表格内容宽（左右各 1 个 │）；分隔线宽 = innerW 让 lipgloss 据此定盒宽
+	descW := innerW - ovMarkerW - ovNumW - ovStatusW
+	if descW < 8 {
+		descW = 8
+	}
+
 	var b strings.Builder
+
+	// ── 标题行 ──
 	b.WriteString(lipgloss.NewStyle().Bold(true).Render("loop-eng dashboard"))
 	b.WriteString("\n")
 
-	// 计数条：各状态计数一览
-	bar := fmt.Sprintf("待处理 %d · 进行中 %d · 等人审 %d · 阻塞 %d · 完成 %d · 已取消 %d",
-		snap.Counts["new"], snap.Counts["running"], snap.Counts["needs-review"],
-		snap.Counts["blocked"], snap.Counts["done"], snap.Counts["cancelled"])
-	b.WriteString(lipgloss.NewStyle().Faint(true).Render(bar))
+	// ── 状态计数行：每个段 = 符号 + 中文标签 + 计数，按状态着色；符号同时充当行的 legend ──
+	b.WriteString(strings.Join([]string{
+		countSegment("◌", "待处理", snap.Counts["new"], statusStyle("new")),
+		countSegment("●", "进行中", snap.Counts["running"], statusStyle("running")),
+		countSegment("⏸", "等人审", snap.Counts["needs-review"], statusStyle("needs-review")),
+		countSegment("✗", "阻塞", snap.Counts["blocked"], statusStyle("blocked")),
+		countSegment("✓", "完成", snap.Counts["done"], statusStyle("done")),
+		countSegment("✘", "已取消", snap.Counts["cancelled"], statusStyle("cancelled")),
+	}, "   "))
 	b.WriteString("\n\n")
 
-	// 任务列表：每行 = 选中标记 + 状态符号 + IssueRef + status + 描述
+	// ── 边框表格：列头 + 分隔线 + 任务行 ──
+	// 列头（bold，与行同列宽对齐：num/status 用 lipgloss.Width 按「显示宽度」补齐，
+	// 兼容 CJK「状态」二字）。
+	hdr := "  " +
+		lipgloss.NewStyle().Bold(true).Width(ovNumW).Render("№") +
+		lipgloss.NewStyle().Bold(true).Width(ovStatusW).Render("状态") +
+		lipgloss.NewStyle().Bold(true).Render("任务")
+
+	// 分隔线：宽 = innerW，是表格里最宽的行 → lipgloss 据此把整盒定到 innerW+2 = w。
+	sep := strings.Repeat("─", innerW)
+
+	var rows []string
 	for i, t := range snap.Tasks {
+		sel := i == selIdx
+		marker := strings.Repeat(" ", ovMarkerW)
+		if sel {
+			marker = "▶ " // 实心三角，比 ▸ 更显眼；Ascii 降级下仍保留
+		}
 		sym := statusSymbol(t.Status)
-		marker := "  "
-		if i == selIdx {
-			marker = "▸ "
-		}
-		line := fmt.Sprintf("%s%s %-12s %s  %s", marker, sym, t.IssueRef, t.Status, t.Description)
-		st := statusStyle(t.Status)
+		numCol := fmt.Sprintf("%-*s", ovNumW, t.IssueRef)
+		statusCol := fmt.Sprintf("%s %-*s", sym, ovStatusW-2, t.Status)
+		// 描述列：最末列，按显示宽度截断（MaxWidth 兼顾 CJK，不会劈开双宽字符）。
+		descCol := lipgloss.NewStyle().MaxWidth(descW).Render(t.Description)
+
+		content := marker + numCol + statusCol + descCol
+		// 整行按状态着色；running 整行呼吸（呼吸灯在「运行中的任务」上，不在顶部计数条）。
+		rowSt := statusStyle(t.Status)
 		if t.Status == "running" {
-			// 呼吸灯：animPhase 调亮度的变体（B4 提供 brightnessStyle 真实插值）
-			st = brightnessStyle(st, animPhase)
+			rowSt = brightnessStyle(statusStyle("running"), animPhase)
 		}
-		b.WriteString(st.Render(line))
-		b.WriteString("\n")
+		line := rowSt.Render(content)
+		if sel {
+			// 整行反白：彩色 profile 下最显眼的「这一行被选中」信号；
+			// Ascii 降级下 Reverse 被剥离，退回 ▶ 标记兜底。
+			line = lipgloss.NewStyle().Reverse(true).Render(line)
+		}
+		rows = append(rows, line)
 	}
-	b.WriteString("\n")
-	b.WriteString(lipgloss.NewStyle().Faint(true).Render("↑↓ 选  Enter 详情  t 轨迹  r resume  x cancel  q 退出"))
+
+	content := hdr + "\n" + sep
+	if len(rows) > 0 {
+		content += "\n" + strings.Join(rows, "\n")
+	}
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("8")).
+		Render(content)
+	b.WriteString(box)
+	b.WriteString("\n\n")
+
+	// ── 底栏：按键提示（键 bold + 描述 faint） ──
+	b.WriteString(hintsLine())
 	b.WriteString("\n")
 	return b.String()
+}
+
+// countSegment 渲染计数条的一个段：符号 + 中文标签 + 计数，按给定样式（状态色）着色。
+func countSegment(sym, label string, n int, st lipgloss.Style) string {
+	return st.Render(fmt.Sprintf("%s %s %d", sym, label, n))
+}
+
+// hintsLine 渲染底栏按键提示：键名 bold + 描述 faint，段间分隔。
+func hintsLine() string {
+	pairs := []struct{ key, desc string }{
+		{"↑↓", "选择"},
+		{"Enter", "详情"},
+		{"t", "轨迹"},
+		{"r", "恢复"},
+		{"x", "取消"},
+		{"q", "退出"},
+	}
+	var segs []string
+	for _, p := range pairs {
+		segs = append(segs,
+			lipgloss.NewStyle().Bold(true).Render(p.key)+
+				lipgloss.NewStyle().Faint(true).Render(" "+p.desc))
+	}
+	return strings.Join(segs, "  ")
 }

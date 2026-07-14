@@ -11,7 +11,7 @@ import (
 
 // TestNoColorDegradesToText 验证 NO_COLOR/非 TTY 降级契约（spec §6）：
 // lipgloss 切到 Ascii profile 后，RenderOverview 输出不含任何 ANSI 转义，
-// 而状态符号（●/◌/▸）与文本保留。
+// 而状态符号（●/◌）与选中标记（▶）与文本保留。
 //
 // 不依赖 os.Setenv——init() 在测试进程启动时已跑，env 改动不会重触发 profile
 // 切换（见 task-b8 brief 的 pitfall）。改为直接 SetColorProfile(Ascii) 确定性
@@ -42,7 +42,7 @@ func TestNoColorDegradesToText(t *testing.T) {
 		t.Fatalf("Ascii 下仍含 ANSI 转义: %q", out)
 	}
 	// 符号必须保留（spec §6「符号 + 纯文本」）
-	for _, sym := range []string{"●", "◌", "▸"} {
+	for _, sym := range []string{"●", "◌", "▶"} {
 		if !strings.Contains(out, sym) {
 			t.Fatalf("Ascii 下符号 %s 丢失: %q", sym, out)
 		}
