@@ -294,6 +294,51 @@ func TestStartEndRun(t *testing.T) {
 	}
 }
 
+func TestCommandsInsertPendingApply(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	tid, _ := s.InsertTask(TaskRow{IssueRef: "o/r#1", Description: "d"})
+
+	if err := s.InsertCommand(tid, "resume", "fix the thing"); err != nil {
+		t.Fatalf("InsertCommand: %v", err)
+	}
+	if err := s.InsertCommand(tid, "cancel", ""); err != nil {
+		t.Fatalf("InsertCommand cancel: %v", err)
+	}
+
+	pending, err := s.PendingCommands()
+	if err != nil {
+		t.Fatalf("PendingCommands: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("want 2 pending, got %d", len(pending))
+	}
+
+	// CancelRequested 看到 pending cancel
+	if ok, err := s.CancelRequested(tid); err != nil || !ok {
+		t.Fatalf("CancelRequested=%v err=%v, want true nil", ok, err)
+	}
+
+	// 应用第一条（resume），回写 applied_at
+	if err := s.MarkCommandApplied(pending[0].ID); err != nil {
+		t.Fatalf("MarkCommandApplied: %v", err)
+	}
+	// cancel 仍在 pending（第二条）
+	rest, _ := s.PendingCommands()
+	if len(rest) != 1 || rest[0].Verb != "cancel" {
+		t.Fatalf("after apply resume: pending=%+v, want only cancel", rest)
+	}
+	if err := s.MarkCommandApplied(rest[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s.CancelRequested(tid); ok {
+		t.Fatalf("CancelRequested after apply, want false")
+	}
+}
+
 func TestRunsOfTaskMultipleRuns(t *testing.T) {
 	s, _ := Open(t.TempDir() + "/state.db")
 	defer s.Close()

@@ -43,6 +43,14 @@ var schema = []string{
 			task_id TEXT PRIMARY KEY, phase TEXT, updated_at TEXT)`,
 	`CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id, seq)`,
 	`CREATE INDEX IF NOT EXISTS idx_trans_task ON transitions(task_id, at)`,
+	`CREATE TABLE IF NOT EXISTS commands(
+			id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL,
+			verb TEXT NOT NULL,
+			payload TEXT,
+			created_at TEXT NOT NULL,
+			applied_at TEXT)`,
+	`CREATE INDEX IF NOT EXISTS idx_commands_pending ON commands(applied_at)`,
 }
 
 func Open(path string) (*Store, error) {
@@ -60,6 +68,8 @@ func Open(path string) (*Store, error) {
 	// bidirectional sync (reconcile + poll-signals-on-blocked). Ignored if the
 	// column already exists in a DB created by an earlier version.
 	db.Exec(`ALTER TABLE task_status ADD COLUMN last_comment_at TEXT`)
+	// Best-effort: add run_id to verifications for Task 6 跑步 grouping.
+	db.Exec(`ALTER TABLE verifications ADD COLUMN run_id TEXT`)
 	return &Store{db: db}, nil
 }
 
@@ -594,4 +604,65 @@ func (s *Store) BudgetLedger(runID string) ([]BudgetRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// CommandRow is one row of the commands table (the TUI → daemon control
+// channel, spec §4.2). AppliedAt is "" while pending.
+type CommandRow struct {
+	ID, TaskID, Verb, Payload, CreatedAt, AppliedAt string
+}
+
+// InsertCommand appends a TUI-issued command (spec §4.2). verb is "resume" or
+// "cancel"; payload is the optional resume feedback. The daemon's drainCommands
+// step picks up rows where applied_at IS NULL.
+func (s *Store) InsertCommand(taskID, verb, payload string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO commands(id, task_id, verb, payload, created_at, applied_at)
+		 VALUES(?,?,?,?,?,NULL)`,
+		newID("cmd"), taskID, verb, payload, nowISO())
+	return err
+}
+
+// PendingCommands returns commands not yet applied (applied_at IS NULL), in
+// insertion order. drainCommands drains this each tick (spec §7).
+func (s *Store) PendingCommands() ([]CommandRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, verb, COALESCE(payload,''), created_at, COALESCE(applied_at,'')
+		 FROM commands WHERE applied_at IS NULL ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CommandRow
+	for rows.Next() {
+		var c CommandRow
+		if err := rows.Scan(&c.ID, &c.TaskID, &c.Verb, &c.Payload, &c.CreatedAt, &c.AppliedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkCommandApplied records that the daemon applied a command (spec §7).
+func (s *Store) MarkCommandApplied(cmdID string) error {
+	_, err := s.db.Exec(`UPDATE commands SET applied_at=? WHERE id=?`, nowISO(), cmdID)
+	return err
+}
+
+// CancelRequested reports whether a pending (unapplied) cancel command exists
+// for a task. SubLoop self-checks this at phase boundaries so a running task
+// stops cooperatively at the next phase (spec §4.5/§7).
+func (s *Store) CancelRequested(taskID string) (bool, error) {
+	var x int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM commands WHERE task_id=? AND verb='cancel' AND applied_at IS NULL LIMIT 1`,
+		taskID).Scan(&x)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
