@@ -405,10 +405,10 @@ func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
 	switch c.Verb {
 	case "resume":
 		if cur == "needs-review" || cur == "blocked" {
-			if err := e.Store.AppendTransition(c.TaskID, cur, "new", "tui resume: "+c.Payload); err != nil {
+			if err := e.Store.SetResumeFeedback(c.TaskID, c.Payload); err != nil {
 				return err
 			}
-			return e.Store.SetResumeFeedback(c.TaskID, c.Payload)
+			return e.Store.AppendTransition(c.TaskID, cur, "new", "tui resume: "+c.Payload)
 		}
 	case "cancel":
 		switch cur {
