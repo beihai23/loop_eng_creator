@@ -560,6 +560,43 @@ func (s *Store) Replay(runID string) ([]StepRow, error) {
 	return out, rows.Err()
 }
 
+// VerificationRow 是 verifications 表的一行，供 TUI 详情面板的逐 tier 状态展示（spec §4.6）。
+type VerificationRow struct {
+	Tier   int
+	Passed bool
+	Detail string
+}
+
+// AppendVerification 落盘一个 tier 的 verify 结果（spec §4.6）。SubLoop 在 verify.Chain
+// 之后对每个实际跑过的 tier 调一次。step_id 留 NULL（legacy 列）；run_id 列（Open 的 ALTER
+// 已加）才是 run 维度的关联键。best-effort：trace，不 gate loop。
+func (s *Store) AppendVerification(runID string, tier int, passed bool, detail string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO verifications(id, step_id, tier, passed, detail, at, run_id)
+		 VALUES(?,NULL,?,?,?,?,?)`,
+		newID("ver"), tier, passed, detail, nowISO(), runID)
+	return err
+}
+
+// VerificationsByRun 返回某 run 的逐 tier verify 行，按 tier 升序（spec §4.6）。
+func (s *Store) VerificationsByRun(runID string) ([]VerificationRow, error) {
+	rows, err := s.db.Query(
+		`SELECT tier, passed, detail FROM verifications WHERE run_id=? ORDER BY tier`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []VerificationRow
+	for rows.Next() {
+		var v VerificationRow
+		if err := rows.Scan(&v.Tier, &v.Passed, &v.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // AppendBudget records one budget event into the durable budget_ledger table.
 //
 // Spec §8.8: every budget check appends a row. SubLoop.Run emits at each of its

@@ -354,3 +354,30 @@ func TestRunsOfTaskMultipleRuns(t *testing.T) {
 		t.Fatalf("want 2 runs, got %d", len(runs))
 	}
 }
+
+// TestAppendVerificationAndRead covers per-tier verifications 落盘（spec §4.6）：
+// AppendVerification 写一行/tier，VerificationsByRun 按 tier 顺序读回。
+func TestAppendVerificationAndRead(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	tid, _ := s.InsertTask(TaskRow{IssueRef: "o/r#1", Description: "d"})
+	rid, _ := s.StartRun(tid)
+
+	if err := s.AppendVerification(rid, 1, true, "go test: ok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendVerification(rid, 2, false, "LLM: diff unrelated"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.VerificationsByRun(rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Tier != 1 || got[0].Passed != true || got[1].Tier != 2 || got[1].Passed != false {
+		t.Fatalf("verifications=%+v", got)
+	}
+}

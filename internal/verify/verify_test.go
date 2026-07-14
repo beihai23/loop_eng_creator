@@ -131,6 +131,47 @@ func TestLLMCheckSynthesizesDetailOnEmptyReason(t *testing.T) {
 	}
 }
 
+// ---- Chain 填充 Tiers（spec §4.6 逐 tier 落盘）----
+
+type stubTier struct {
+	pass   bool
+	detail string
+}
+
+func (s stubTier) Check(context.Context, string, []string, string) (VerifyResult, error) {
+	return VerifyResult{Passed: s.pass, Detail: s.detail}, nil
+}
+
+func TestChainFillsTiersAndShortCircuits(t *testing.T) {
+	// tier1 过、tier2 挂 ⇒ Tiers 有两条（tier2 失败），tier3 不跑不出现。
+	tiers := []Tier{
+		stubTier{pass: true, detail: "t1 ok"},
+		stubTier{pass: false, detail: "t2 nope"},
+		stubTier{pass: true, detail: "t3"},
+	}
+	res, err := Chain(context.Background(), tiers, "diff", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Passed {
+		t.Fatalf("want not passed")
+	}
+	if len(res.Tiers) != 2 {
+		t.Fatalf("want 2 tier outcomes (short-circuit), got %d", len(res.Tiers))
+	}
+	if res.Tiers[0].Tier != 1 || !res.Tiers[0].Passed || res.Tiers[1].Tier != 2 || res.Tiers[1].Passed {
+		t.Fatalf("Tiers=%+v", res.Tiers)
+	}
+}
+
+func TestChainFillsTiersAllPass(t *testing.T) {
+	tiers := []Tier{stubTier{pass: true, detail: "t1"}, stubTier{pass: true, detail: "t2"}}
+	res, _ := Chain(context.Background(), tiers, "diff", nil, "")
+	if !res.Passed || len(res.Tiers) != 2 {
+		t.Fatalf("want passed + 2 tiers, got %+v", res)
+	}
+}
+
 func parseVerifyOutput(b []byte) (skill.VerifyOutput, error) {
 	var o skill.VerifyOutput
 	return o, json.Unmarshal(b, &o)

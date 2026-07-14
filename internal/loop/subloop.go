@@ -258,6 +258,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			Status:     statusOf2(res.Passed),
 			OutputJSON: string(vt),
 		})
+		// 逐 tier 落盘 verifications（spec §4.6）：best-effort，trace 不 gate loop。
+		// runID 来自 Task 2 的 StartRun 透传；短路时只落实际跑过的 tier。
+		for _, to := range res.Tiers {
+			_ = sl.Store.AppendVerification(runID, to.Tier, to.Passed, to.Detail)
+		}
 		if err != nil {
 			// verify 基础设施错误：致命（auth）→ 立刻中断；可重试 flake → 当作可重试失败。
 			isolation.Discard(sl.Repo, wt)
