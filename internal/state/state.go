@@ -325,6 +325,7 @@ type StepRow struct {
 	InputJSON, OutputJSON        string
 	TokensIn, TokensOut          int
 	Status, Error                string
+	At                           string // 落盘时间（spec §5[3] trace 用）
 }
 
 func (s *Store) AppendStep(r StepRow) error {
@@ -446,6 +447,7 @@ func (s *Store) PopResumeFeedback(taskID string) (string, error) {
 // from task_status + transitions).
 type TransitionRow struct {
 	From, To, Reason string
+	At               string // 新增：落盘时间
 }
 
 // Transitions returns the lifecycle trace for one task — every status change in
@@ -455,7 +457,7 @@ type TransitionRow struct {
 // disk). Ordered by rowid = insertion order = chronological.
 func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
 	rows, err := s.db.Query(
-		`SELECT from_status, to_status, reason FROM transitions
+		`SELECT from_status, to_status, reason, at FROM transitions
 		 WHERE task_id=? ORDER BY rowid`, taskID)
 	if err != nil {
 		return nil, err
@@ -464,7 +466,7 @@ func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
 	var out []TransitionRow
 	for rows.Next() {
 		var r TransitionRow
-		if err := rows.Scan(&r.From, &r.To, &r.Reason); err != nil {
+		if err := rows.Scan(&r.From, &r.To, &r.Reason, &r.At); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -542,7 +544,7 @@ func (s *Store) RunsOfTask(taskID string) ([]RunRow, error) {
 func (s *Store) Replay(runID string) ([]StepRow, error) {
 	rows, err := s.db.Query(
 		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,
-		        tokens_in, tokens_out, status, error
+		        tokens_in, tokens_out, status, error, at
 		 FROM steps WHERE run_id=? ORDER BY seq`, runID)
 	if err != nil {
 		return nil, err
@@ -559,7 +561,7 @@ func scanStepRows(rows *sql.Rows) ([]StepRow, error) {
 	for rows.Next() {
 		var r StepRow
 		if err := rows.Scan(&r.RunID, &r.Seq, &r.Role, &r.Skill, &r.ModelRef, &r.InputJSON,
-			&r.OutputJSON, &r.TokensIn, &r.TokensOut, &r.Status, &r.Error); err != nil {
+			&r.OutputJSON, &r.TokensIn, &r.TokensOut, &r.Status, &r.Error, &r.At); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -608,7 +610,7 @@ func (s *Store) TasksByStatus() ([]TaskView, error) {
 func (s *Store) StepsOfTask(taskID string) ([]StepRow, error) {
 	rows, err := s.db.Query(
 		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,
-		        tokens_in, tokens_out, status, error
+		        tokens_in, tokens_out, status, error, at
 		 FROM steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)
 		 ORDER BY at`, taskID)
 	if err != nil {

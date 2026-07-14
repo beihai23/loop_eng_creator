@@ -410,6 +410,36 @@ func TestTasksByStatusJoinsAndOrders(t *testing.T) {
 	}
 }
 
+// TestStepsAndTransitionsCarryAt 校验 StepRow.At / TransitionRow.At 在
+// StepsOfTask 和 Transitions 读回时非空（Phase A 终审 I1，trace 时间戳用）。
+func TestStepsAndTransitionsCarryAt(t *testing.T) {
+	st, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	tid, _ := st.InsertTask(TaskRow{IssueRef: "#1", Description: "d"})
+	rid, _ := st.StartRun(tid)
+	_ = st.AppendStep(StepRow{RunID: rid, Seq: 11, Role: "plan", Status: "ok"})
+	_ = st.AppendTransition(tid, "new", "running", "dispatched")
+
+	steps, err := st.StepsOfTask(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].At == "" {
+		t.Fatalf("step At empty: %+v", steps)
+	}
+	trs, err := st.Transitions(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trs) != 1 || trs[0].At == "" {
+		t.Fatalf("transition At empty: %+v", trs)
+	}
+}
+
 // TestStepsOfTask 校验跨 run 的步骤查询（spec §5[3]）：返回某 task 所有 run
 // 的全部 step，按 steps.at 排序（规避 Task 2 修复的 per-run seq 冲突）。
 func TestStepsOfTask(t *testing.T) {
