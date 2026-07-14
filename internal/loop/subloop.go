@@ -114,7 +114,7 @@ const planExecEstimate = 1000
 // failure becomes next round's feedback (retry within budget). HumanStub is now
 // an auto-pass placeholder (NeedsHuman=false), so M1/M2 done/blocked outcomes
 // are unchanged. Every terminal outcome writes a state transition + battle report.
-func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) {
+func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err error) {
 	var taskID string
 	if sl.PreinsertedTaskID != "" {
 		taskID = sl.PreinsertedTaskID // daemon path: task already ingested by tick
@@ -130,6 +130,17 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 	}
 	sl.Store.AppendTransition(taskID, "", "running", "dispatched")
 
+	// 开一行 run（spec §4.1）：每次 Run 用 StartRun 拿真 runID 透传给 steps/budget。
+	// 修 resume 后 replay 交错 bug——修前 run_id 都是 taskID，同任务两次 run 的 step seq
+	// 撞车后 Replay 串在一起。defer 引用命名返回 out：每条终态路径都自动 EndRun，
+	// out.Status 即结局（done/blocked/needs-review/error），无需改现有 return。
+	runID, rerr := sl.Store.StartRun(taskID)
+	if rerr != nil {
+		_ = sl.Store.ClearInFlight()
+		return Outcome{Status: "error"}, rerr
+	}
+	defer func() { _ = sl.Store.EndRun(runID, out.Status) }()
+
 	// Mark the active slot in the cross-process in_flight table.
 	_ = sl.Store.SetInFlight(taskID, "starting")
 	sid := shortID(taskID)
@@ -140,7 +151,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 	}
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
 		// 预算刹车·重试：每轮入口记一行（spec §8.8）
-		sl.Store.AppendBudget(taskID, "task", "retry", attempt, sl.Budget.MaxRetries)
+		sl.Store.AppendBudget(runID, "task", "retry", attempt, sl.Budget.MaxRetries)
 
 		// ---- plan ----
 		sl.logf("[subloop] %s phase=plan start", sid)
@@ -150,13 +161,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(taskID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		_, u, err := sl.Plan.Run(ctx, skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: priorFailure,
 		})
 		sl.Budget.AfterCall(u)
-		sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
 		if err != nil {
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
@@ -183,7 +194,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(taskID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
@@ -201,12 +212,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "execute error: " + err.Error()
-			sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", Error: err.Error()})
+			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", Error: err.Error()})
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
 		diff := worktreeDiff(sl.Repo, wt)
-		sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
 		sl.logf("[subloop] %s phase=execute done", sid)
 
 		// ---- verify (Chain of tiers; independent judgment) ----
@@ -223,7 +234,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			FailingCriteria: res.FailingCriteria,
 		})
 		sl.Store.AppendStep(state.StepRow{
-			RunID: taskID, Seq: attempt*10 + 3, Role: "verify",
+			RunID: runID, Seq: attempt*10 + 3, Role: "verify",
 			Status:     statusOf2(res.Passed),
 			OutputJSON: string(vt),
 		})

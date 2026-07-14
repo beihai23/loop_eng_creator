@@ -14,6 +14,7 @@ import (
 
 	"loop-eng/internal/budget"
 	"loop-eng/internal/channel"
+	"loop-eng/internal/isolation"
 	"loop-eng/internal/model"
 	"loop-eng/internal/skill"
 	"loop-eng/internal/state"
@@ -146,12 +147,17 @@ func TestSubLoopWritesBudgetLedger(t *testing.T) {
 	if out.Status != "done" {
 		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
 	}
-	// Run inserts the task itself; recover its id to scope the ledger read.
+	// Run inserts the task itself; recover its id, then the run id (budget_ledger
+	// 现按 run_id 落库——spec §4.1/§8.8，修 replay 交错 bug）来 scope 本次读取。
 	statuses, err := st.ListStatuses()
 	if err != nil || len(statuses) != 1 {
 		t.Fatalf("want exactly 1 task status, got %d (err %v)", len(statuses), err)
 	}
-	rows, err := st.BudgetLedger(statuses[0].ID)
+	runs, err := st.RunsOfTask(statuses[0].ID)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("want 1 run for the done task, got %d (err %v)", len(runs), err)
+	}
+	rows, err := st.BudgetLedger(runs[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,5 +607,80 @@ func TestSubLoopInFlightClearedOnNeedsReview(t *testing.T) {
 
 	if _, ok, _ := st.InFlight(); ok {
 		t.Fatal("in_flight must be empty after SubLoop.Run returns needs-review")
+	}
+}
+
+// TestReplayNoInterleaveAfterResume 钉死 spec §4.1 的 bug：同任务两次 run，各自
+// attempt=1 的 plan step seq 都是 11。修前 AppendStep 的 RunID 传的是 taskID 且无
+// StartRun ⇒ RunsOfTask 空、两次 run 的 step 全压在同一个 taskID 下、Replay 交错；
+// 修后每次 Run 用 StartRun 拿独立 runID 透传，每个 run 的 Replay 只剩自己那条 plan
+// step（seq=11 至多一条）。构造照搬 TestSubLoopDoneOnFirstPass 的 passing SubLoop。
+func TestReplayNoInterleaveAfterResume(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	task := channel.Task{Ref: "40", Description: "d", AcceptanceCriteria: []string{"c"}}
+	taskID, err := st.InsertTask(state.TaskRow{
+		IssueRef: task.Ref, Description: task.Description,
+		TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl.PreinsertedTaskID = taskID // 两次 Run 复用同一 taskID（模拟 resume 后再 dispatch）
+	ctx := context.Background()
+
+	// run 1（first pass → done）
+	out1, err := sl.Run(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1.Status != "done" {
+		t.Fatalf("run 1: want done, got %s (%s)", out1.Status, out1.Detail)
+	}
+	// done 保留 worktree + 分支 loop/<taskID>-r1；丢弃后 run 2 才能重建同名 worktree。
+	if out1.Worktree != "" {
+		if derr := isolation.Discard(sl.Repo, out1.Worktree); derr != nil {
+			t.Fatalf("discard run-1 worktree: %v", derr)
+		}
+	}
+
+	// run 2（模拟 resume 后再次 dispatch 同一 task）
+	if _, err := sl.Run(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	runs, err := st.RunsOfTask(taskID)
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("want 2 runs, got %d (err %v)", len(runs), err)
+	}
+	for _, r := range runs {
+		steps, err := st.Replay(r.ID)
+		if err != nil {
+			t.Fatalf("Replay(%s): %v", r.ID, err)
+		}
+		// 每个 run 的 plan step（seq=11）至多一条；两次 run 不交错 ⇒ 不应出现两条 seq=11。
+		var planSeq11 int
+		for _, s := range steps {
+			if s.Seq == 11 && s.Role == "plan" {
+				planSeq11++
+			}
+		}
+		if planSeq11 > 1 {
+			t.Fatalf("run %s: got %d plan seq=11 steps (interleaved), want ≤1", r.ID, planSeq11)
+		}
 	}
 }
