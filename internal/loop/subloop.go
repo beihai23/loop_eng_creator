@@ -150,6 +150,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		priorFailure = fb
 	}
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
+		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
+		if ok, _ := sl.Store.CancelRequested(taskID); ok {
+			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
+		}
 		// 预算刹车·重试：每轮入口记一行（spec §8.8）
 		sl.Store.AppendBudget(runID, "task", "retry", attempt, sl.Budget.MaxRetries)
 
@@ -179,6 +185,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			continue
 		}
 		sl.logf("[subloop] %s phase=plan done", sid)
+
+		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
+		if ok, _ := sl.Store.CancelRequested(taskID); ok {
+			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
+		}
 
 		// ---- execute (in a fresh worktree) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
@@ -219,6 +232,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		diff := worktreeDiff(sl.Repo, wt)
 		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
 		sl.logf("[subloop] %s phase=execute done", sid)
+
+		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
+		if ok, _ := sl.Store.CancelRequested(taskID); ok {
+			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
+		}
 
 		// ---- verify (Chain of tiers; independent judgment) ----
 		sl.logf("[subloop] %s phase=verify start", sid)

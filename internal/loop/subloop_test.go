@@ -610,6 +610,83 @@ func TestSubLoopInFlightClearedOnNeedsReview(t *testing.T) {
 	}
 }
 
+// TestCooperativeCancel 钉死协作式 cancel（spec §4.5/§7）：一个跑起来的 SubLoop
+// 必须在每个 phase 边界自查 Store.CancelRequested，命中则提前以 cancelled 收尾
+// （协作式，非硬杀）。测试包住 Plan skill 的 model.Client：第一次 plan 调用返回
+// 后插入一条 pending cancel 命令，使 execute 前的自查命中并 bail。defer EndRun
+// （Task 2）用 out.Status=cancelled 自动收尾，InFlight 必须清空。
+func TestCooperativeCancel(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	task := channel.Task{Ref: "50", Description: "d", AcceptanceCriteria: []string{"c"}}
+	taskID, err := st.InsertTask(state.TaskRow{
+		IssueRef: task.Ref, Description: task.Description,
+		TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute: fake,
+		// Plan 的 model.Client 被包一层：第一次 plan 调用后插入 cancel 命令，
+		// execute 前的自查即会命中。
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", &cancelOnFirstCall{inner: fake, store: st, taskID: taskID, t: t}),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	sl.PreinsertedTaskID = taskID
+
+	out, err := sl.Run(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Status != "cancelled" {
+		t.Fatalf("status=%q want cancelled (detail=%s)", out.Status, out.Detail)
+	}
+	// 终态后 InFlight 必须清空
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after cooperative cancel")
+	}
+	// run 关闭为 cancelled（defer EndRun 用 out.Status 收尾）
+	runs, err := st.RunsOfTask(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Outcome != "cancelled" {
+		t.Fatalf("runs=%+v want exactly 1 run with outcome=cancelled", runs)
+	}
+}
+
+// cancelOnFirstCall 包住一个 model.Client：第一次 Call 在委托给内部 client 后
+// 往 store 插一条 pending cancel 命令，使 SubLoop 下一个 phase 边界自查
+// （Store.CancelRequested）bail 到 cancelled。仅用于测试，模拟 TUI 中途下发 cancel。
+type cancelOnFirstCall struct {
+	inner  model.Client
+	store  *state.Store
+	taskID string
+	done   bool
+	t      *testing.T
+}
+
+func (c *cancelOnFirstCall) Call(ctx context.Context, prompt string) (string, model.Usage, error) {
+	out, u, err := c.inner.Call(ctx, prompt)
+	if !c.done {
+		c.done = true
+		if e := c.store.InsertCommand(c.taskID, "cancel", ""); e != nil {
+			c.t.Fatal(e)
+		}
+	}
+	return out, u, err
+}
+
 // TestReplayNoInterleaveAfterResume 钉死 spec §4.1 的 bug：同任务两次 run，各自
 // attempt=1 的 plan step seq 都是 11。修前 AppendStep 的 RunID 传的是 taskID 且无
 // StartRun ⇒ RunsOfTask 空、两次 run 的 step 全压在同一个 taskID 下、Replay 交错；
