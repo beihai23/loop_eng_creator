@@ -7,8 +7,7 @@ import (
 	"loop-eng/internal/state"
 )
 
-// RenderTrace 渲染 [3] 轨迹：按 run 分组的时间线。transitions + steps，
-// 按 at 排序。纯读 Store。
+// RenderTrace 渲染 [3] 轨迹：按 run 分组，组内 transitions + steps 分列。纯读 Store。
 func RenderTrace(st *state.Store, taskID string) string {
 	runs, _ := st.RunsOfTask(taskID)
 	trans, _ := st.Transitions(taskID)

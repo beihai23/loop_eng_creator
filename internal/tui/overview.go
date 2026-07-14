@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"loop-eng/internal/state"
 )
 
 // RenderOverview 渲染 [1] 总览：计数条 + 任务列表。纯函数（无 Store/终端/真时间）。
@@ -42,7 +41,5 @@ func RenderOverview(snap *Snapshot, selIdx int, animPhase float64, w int) string
 	b.WriteString("\n")
 	b.WriteString(lipgloss.NewStyle().Faint(true).Render("↑↓ 选  Enter 详情  t 轨迹  r resume  x cancel  q 退出"))
 	b.WriteString("\n")
-	_ = state.TaskView{}
-	_ = w
 	return b.String()
 }

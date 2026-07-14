@@ -76,6 +76,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case animTickMsg:
 		m.animPhase += 0.15
+		// I1：动画仅在 overview 可见——detail/trace 暂停 tick，避免每 60ms 跑 View()。
+		if m.tab != tabOverview {
+			return m, nil
+		}
 		return m, animTick()
 
 	case tea.KeyMsg:
@@ -85,12 +89,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "1":
 			m.tab = tabOverview
+			return m, animTick() // I1：回到 overview 重启呼吸灯
 		case "2":
 			m.tab = tabDetail
 		case "3", "t":
 			m.tab = tabTrace
 		case "esc":
 			m.tab = tabOverview
+			return m, animTick() // I1：回到 overview 重启呼吸灯
 		case "up", "k":
 			if m.selIdx > 0 {
 				m.selIdx--

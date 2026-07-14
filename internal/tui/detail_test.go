@@ -22,6 +22,7 @@ func TestRenderDetailFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Models.Verify = config.ModelRef{Name: "glm-5.2"}
 	cfg.Verify.Tier3Human = true
+	cfg.Budget.PerTaskTokens = 100000
 
 	out := RenderDetail(st, cfg, tid)
 	for _, want := range []string{"#18", "给 budget 加硬上限", "feature",
@@ -43,5 +44,9 @@ func TestRenderDetailFields(t *testing.T) {
 	}
 	if !strings.Contains(out, "✗") {
 		t.Fatalf("detail missing tier-2 ✗ in:\n%s", out)
+	}
+	// I2：预算行展示真实上限（cfg.Budget.PerTaskTokens）
+	if !strings.Contains(out, "100000") {
+		t.Fatalf("detail budget line missing real cap 100000 in:\n%s", out)
 	}
 }
