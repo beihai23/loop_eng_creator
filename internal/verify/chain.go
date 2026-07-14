@@ -16,15 +16,24 @@ func (HumanStub) Check(context.Context, string, []string, string) (VerifyResult,
 // 若是注入的真人审 tier 产 NeedsHuman=true，则 SubLoop 据此路由到 needs-review。
 func Chain(ctx context.Context, tiers []Tier, diff string, criteria []string, priorFailure string) (VerifyResult, error) {
 	var last VerifyResult
-	for _, t := range tiers {
+	// outcomes 在循环外声明——last=r 会覆盖整个 struct（含 Tiers），故累积器
+	// 必须独立于 last，否则每轮被清空。每次 append 后把 outcomes 挂回 last.Tiers，
+	// 短路时随 last 返回，全过时也随最后一次 last 返回（spec §4.6 逐 tier 落盘）。
+	var outcomes []TierOutcome
+	for i, t := range tiers {
 		r, err := t.Check(ctx, diff, criteria, priorFailure)
 		if err != nil {
 			return VerifyResult{}, err
 		}
+		outcomes = append(outcomes, TierOutcome{
+			Tier: i + 1, Passed: r.Passed, NeedsHuman: r.NeedsHuman, Detail: r.Detail,
+		})
 		last = r
+		last.Tiers = outcomes
 		if !r.Passed {
-			return r, nil // 短路
+			return last, nil // 短路：未到的 tier 不进 outcomes
 		}
 	}
+	last.Tiers = outcomes
 	return last, nil
 }

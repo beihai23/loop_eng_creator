@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -38,8 +39,18 @@ var schema = []string{
 			id TEXT PRIMARY KEY, run_id TEXT, scope TEXT, kind TEXT, amount INTEGER, limit_val INTEGER, at TEXT)`,
 	`CREATE TABLE IF NOT EXISTS reports(
 			id TEXT PRIMARY KEY, task_id TEXT, round INTEGER, channel_ref TEXT, at TEXT)`,
+	`CREATE TABLE IF NOT EXISTS in_flight(
+			task_id TEXT PRIMARY KEY, phase TEXT, updated_at TEXT)`,
 	`CREATE INDEX IF NOT EXISTS idx_steps_run ON steps(run_id, seq)`,
 	`CREATE INDEX IF NOT EXISTS idx_trans_task ON transitions(task_id, at)`,
+	`CREATE TABLE IF NOT EXISTS commands(
+			id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL,
+			verb TEXT NOT NULL,
+			payload TEXT,
+			created_at TEXT NOT NULL,
+			applied_at TEXT)`,
+	`CREATE INDEX IF NOT EXISTS idx_commands_pending ON commands(applied_at)`,
 }
 
 func Open(path string) (*Store, error) {
@@ -53,6 +64,12 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
 	}
+	// Best-effort migration: add last_comment_at to task_status for the
+	// bidirectional sync (reconcile + poll-signals-on-blocked). Ignored if the
+	// column already exists in a DB created by an earlier version.
+	db.Exec(`ALTER TABLE task_status ADD COLUMN last_comment_at TEXT`)
+	// Best-effort: add run_id to verifications for Task 6 的 per-run 分组。
+	db.Exec(`ALTER TABLE verifications ADD COLUMN run_id TEXT`)
 	return &Store{db: db}, nil
 }
 
@@ -109,37 +126,63 @@ type StatusRow struct {
 // occupying the active slot; Phase is that task's most recent sub-loop step
 // role (triage|plan|execute|verify). Single-active by construction (spec §12)
 // means at most one running task, so at most one InFlight — there is no list.
+// Read from the dedicated in_flight table (SetInFlight / ClearInFlight write
+// it; spec §8.7: cross-process readable, persisted on disk).
 type InFlight struct {
 	TaskID string
 	Phase  string
 }
 
-// InFlight returns the currently active sub-loop: the single task in
-// task_status with status="running" (spec §8.7: only running occupies the
-// active slot; FIFO ingest order is irrelevant once a task is dispatched) plus
-// its latest phase. ok is false when the active slot is empty. Phase is the
-// most recent steps.role for that task — the sub-loop writes steps keyed by
-// task id (RunID = task id, see subloop.go), so run_id IS the task id here and
-// no runs-table join is needed; Phase is "" before the first step lands. This
-// is the read side of the single-active invariant and the `loop-eng status
-// --watch` live view.
+// InFlight returns the currently active sub-loop from the dedicated in_flight
+// table. ok is false when the active slot is empty (no row in in_flight).
+// This is the read side of the single-active invariant and the `loop-eng
+// status --watch` live view (spec §8.7: cross-process observable).
 func (s *Store) InFlight() (InFlight, bool, error) {
-	var taskID string
+	var ifl InFlight
 	err := s.db.QueryRow(
-		`SELECT task_id FROM task_status WHERE status='running' LIMIT 1`).Scan(&taskID)
+		`SELECT task_id, phase FROM in_flight LIMIT 1`).Scan(&ifl.TaskID, &ifl.Phase)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return InFlight{}, false, nil
 		}
 		return InFlight{}, false, err
 	}
-	// Phase = newest step role for this task. Steps are append-only; ordering by
-	// at (RFC3339Nano → lexical = chronological) with rowid tiebreak is
-	// deterministic even when two steps share a timestamp.
-	var phase sql.NullString
-	_ = s.db.QueryRow(
-		`SELECT role FROM steps WHERE run_id=? ORDER BY at DESC, rowid DESC LIMIT 1`, taskID).Scan(&phase)
-	return InFlight{TaskID: taskID, Phase: phase.String}, true, nil
+	return ifl, true, nil
+}
+
+// SetInFlight records the currently active sub-loop's task and phase into the
+// durable in_flight table. At most one row exists (single-active, spec §12);
+// a DELETE-then-INSERT replaces any prior row so the table always reflects the
+// latest active task+phase regardless of which task_id was previously set.
+// This is the write side called by SubLoop before each phase
+// (plan/execute/verify); it is what makes the live --watch view
+// cross-process readable (spec §8.7).
+func (s *Store) SetInFlight(taskID, phase string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM in_flight`); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO in_flight(task_id, phase, updated_at) VALUES(?,?,?)`,
+		taskID, phase, nowISO()); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearInFlight removes the active sub-loop row from the in_flight table. All
+// terminal paths in SubLoop.Run (done, blocked, needs-review, error) must call
+// this so the in_flight table is empty when the active slot is free — the
+// watch view renders "（无活跃任务）" and the next dispatch can SetInFlight
+// afresh. Idempotent: calling on an already-empty table is a no-op.
+func (s *Store) ClearInFlight() error {
+	_, err := s.db.Exec(`DELETE FROM in_flight`)
+	return err
 }
 
 // ListStatuses returns every task_status row (id + status). Ordered by
@@ -220,16 +263,49 @@ func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 // spec §10 (needs-info/needs-human-decision/blocked) wait on different human
 // inputs and land with the triage/gate/help-skills issues.
 func (s *Store) ParkedTasks() ([]TaskRow, error) {
+	return s.listTasksByStatus("needs-review")
+}
+
+// BlockedTasks returns every task whose status is "blocked" (retries exhausted,
+// verify rejection, etc.), oldest first. The daemon polls these alongside
+// needs-review tasks for new human replies — a reply on a blocked task signals
+// "I've addressed the block; retry this task."
+func (s *Store) BlockedTasks() ([]TaskRow, error) {
+	return s.listTasksByStatus("blocked")
+}
+
+// TerminalTasks returns every task whose status is "done" or "blocked" — the
+// terminal states that the daemon's reconcile step checks against the channel
+// side for human-driven reversals (reopen, un-label).
+func (s *Store) TerminalTasks() ([]TaskRow, error) {
 	rows, err := s.db.Query(
 		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
-		 WHERE ts.status = 'needs-review'
+		 WHERE ts.status IN ('done', 'blocked')
 		 ORDER BY t.created_at ASC, t.rowid ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanTaskRows(rows)
+}
+
+func (s *Store) listTasksByStatus(status string) ([]TaskRow, error) {
+	rows, err := s.db.Query(
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		 FROM tasks t
+		 JOIN task_status ts ON ts.task_id = t.id
+		 WHERE ts.status = ?
+		 ORDER BY t.created_at ASC, t.rowid ASC`, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTaskRows(rows)
+}
+
+func scanTaskRows(rows *sql.Rows) ([]TaskRow, error) {
 	var out []TaskRow
 	for rows.Next() {
 		var t TaskRow
@@ -249,6 +325,7 @@ type StepRow struct {
 	InputJSON, OutputJSON        string
 	TokensIn, TokensOut          int
 	Status, Error                string
+	At                           string // 落盘时间（spec §5[3] trace 用）
 }
 
 func (s *Store) AppendStep(r StepRow) error {
@@ -282,6 +359,8 @@ func (s *Store) AppendTransition(taskID, from, to, reason string) error {
 // a crashed/killed previous run (spec principle 4 — recover from disk). Without
 // this, a daemon killed mid-task leaves that task wedged in "running" forever
 // (NextReadyTask only returns "new" tasks, so it would never be re-dispatched).
+// Also clears in_flight: an orphaned running task's in_flight row (if any) must
+// not survive a daemon restart.
 func (s *Store) RequeueOrphanedRunning() (int, error) {
 	rows, err := s.db.Query(`SELECT task_id FROM task_status WHERE status='running'`)
 	if err != nil {
@@ -302,7 +381,65 @@ func (s *Store) RequeueOrphanedRunning() (int, error) {
 			return 0, err
 		}
 	}
+	// Clear stale in_flight: the orphan's in_flight row (if any) must not survive
+	// the restart — the watch view shows no active task until the next dispatch.
+	_ = s.ClearInFlight()
 	return len(ids), nil
+}
+
+// LastCommentAt returns the last time the daemon posted a comment for this
+// task (stored in task_status.last_comment_at). A zero time means the daemon
+// has not posted any comment yet. The daemon's pollSignals step uses this to
+// filter for human replies that arrived after the daemon's last interaction.
+func (s *Store) LastCommentAt(taskID string) (time.Time, error) {
+	var t sql.NullString
+	err := s.db.QueryRow(`SELECT last_comment_at FROM task_status WHERE task_id=?`, taskID).Scan(&t)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	if !t.Valid || t.String == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339Nano, t.String)
+}
+
+// SetLastCommentAt records the timestamp of the daemon's most recent comment on
+// this task. Called from the SubLoop's report() after a successful PostComment,
+// so the daemon's pollSignals step knows which human replies are new.
+func (s *Store) SetLastCommentAt(taskID string, t time.Time) error {
+	_, err := s.db.Exec(`UPDATE task_status SET last_comment_at=? WHERE task_id=?`,
+		t.Format(time.RFC3339Nano), taskID)
+	return err
+}
+
+// SetResumeFeedback stores the human feedback that triggered a resume (parked →
+// new re-queue) in the task_status.parked_detail column, so the SubLoop's next
+// Run can read it as the initial priorFailure for the Plan skill's BattleReport.
+func (s *Store) SetResumeFeedback(taskID, feedback string) error {
+	_, err := s.db.Exec(`UPDATE task_status SET parked_detail=? WHERE task_id=?`, feedback, taskID)
+	return err
+}
+
+// PopResumeFeedback reads and clears the resume feedback for a task. Returns ""
+// if no feedback was set. Called by SubLoop at the start of each Run so the
+// human's reply from the previous parked round feeds into the Plan skill.
+func (s *Store) PopResumeFeedback(taskID string) (string, error) {
+	var fb sql.NullString
+	err := s.db.QueryRow(`SELECT parked_detail FROM task_status WHERE task_id=?`, taskID).Scan(&fb)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	s.db.Exec(`UPDATE task_status SET parked_detail='' WHERE task_id=?`, taskID)
+	if !fb.Valid {
+		return "", nil
+	}
+	return fb.String, nil
 }
 
 // TransitionRow is one lifecycle transition in the append-only transitions
@@ -310,6 +447,7 @@ func (s *Store) RequeueOrphanedRunning() (int, error) {
 // from task_status + transitions).
 type TransitionRow struct {
 	From, To, Reason string
+	At               string // 新增：落盘时间
 }
 
 // Transitions returns the lifecycle trace for one task — every status change in
@@ -319,7 +457,7 @@ type TransitionRow struct {
 // disk). Ordered by rowid = insertion order = chronological.
 func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
 	rows, err := s.db.Query(
-		`SELECT from_status, to_status, reason FROM transitions
+		`SELECT from_status, to_status, reason, at FROM transitions
 		 WHERE task_id=? ORDER BY rowid`, taskID)
 	if err != nil {
 		return nil, err
@@ -328,7 +466,74 @@ func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
 	var out []TransitionRow
 	for rows.Next() {
 		var r TransitionRow
-		if err := rows.Scan(&r.From, &r.To, &r.Reason); err != nil {
+		if err := rows.Scan(&r.From, &r.To, &r.Reason, &r.At); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RunRow is one row of the runs table surfaced to readers (TUI detail/trace).
+// RetryCount and TotalTokens are derived by the reader from budget_ledger /
+// steps; the runs row itself only carries the run lifecycle.
+type RunRow struct {
+	ID, TaskID, StartedAt, EndedAt, Outcome string
+}
+
+// StartRun opens a new run for a task: inserts a row with started_at=now,
+// ended_at=NULL, and returns the new run id. Called by SubLoop at Run entry
+// (spec §4.1). A task may have many runs across park/resume.
+func (s *Store) StartRun(taskID string) (string, error) {
+	id := newID("run")
+	_, err := s.db.Exec(
+		`INSERT INTO runs(id, task_id, started_at, ended_at, outcome, total_tokens, retry_count)
+		 VALUES(?,?,?,NULL,'',0,0)`,
+		id, taskID, nowISO())
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// EndRun closes a run with its terminal outcome (spec §4.1). Idempotent in
+// spirit: SubLoop calls it exactly once per run via defer. outcome is one of
+// done|blocked|needs-review|cancelled|error.
+func (s *Store) EndRun(runID, outcome string) error {
+	_, err := s.db.Exec(`UPDATE runs SET ended_at=?, outcome=? WHERE id=?`,
+		nowISO(), outcome, runID)
+	return err
+}
+
+// ActiveRun returns the open run (ended_at IS NULL) for a task — the run a
+// running task currently occupies. ok is false when no open run exists.
+func (s *Store) ActiveRun(taskID string) (runID, startedAt string, ok bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT id, started_at FROM runs WHERE task_id=? AND ended_at IS NULL
+		 ORDER BY rowid DESC LIMIT 1`, taskID).Scan(&runID, &startedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return runID, startedAt, true, nil
+}
+
+// RunsOfTask returns every run of a task, oldest first (rowid = insertion
+// order). Used by the TUI trace tab to group steps per run (spec §4.1/§5[3]).
+func (s *Store) RunsOfTask(taskID string) ([]RunRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, started_at, COALESCE(ended_at,''), COALESCE(outcome,'')
+		 FROM runs WHERE task_id=? ORDER BY rowid`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RunRow
+	for rows.Next() {
+		var r RunRow
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.StartedAt, &r.EndedAt, &r.Outcome); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -339,20 +544,115 @@ func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
 func (s *Store) Replay(runID string) ([]StepRow, error) {
 	rows, err := s.db.Query(
 		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,
-		        tokens_in, tokens_out, status, error
+		        tokens_in, tokens_out, status, error, at
 		 FROM steps WHERE run_id=? ORDER BY seq`, runID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanStepRows(rows)
+}
+
+// scanStepRows 把 steps 表的逐行扫描抽出来，供 Replay（按 seq 排单 run）与
+// StepsOfTask（按 at 排跨 run）共用。调用方负责构造查询并关闭 rows。这行
+// SELECT 列表与 steps 表的可读列一一对应（与 AppendStep 写入的列同序）。
+func scanStepRows(rows *sql.Rows) ([]StepRow, error) {
 	var out []StepRow
 	for rows.Next() {
 		var r StepRow
 		if err := rows.Scan(&r.RunID, &r.Seq, &r.Role, &r.Skill, &r.ModelRef, &r.InputJSON,
-			&r.OutputJSON, &r.TokensIn, &r.TokensOut, &r.Status, &r.Error); err != nil {
+			&r.OutputJSON, &r.TokensIn, &r.TokensOut, &r.Status, &r.Error, &r.At); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// TaskView 是 tasks+task_status join 出的一行，喂给 TUI 概览列表（spec §5[1]）。
+// 一条查询喂整张列表（无 N+1）：每个 task 带它当前的 status。Phase B 的 TUI
+// reader 直接消费。
+type TaskView struct {
+	ID, IssueRef, Description, TaskType, Status string
+	CreatedAt                                   string
+}
+
+// TasksByStatus 返回全部 task 及其当前 status，按 TUI 概览优先级排序：
+// new → needs-review → needs-info → blocked → done → cancelled（其余垫底），
+// 组内按 created_at 升序（最老的最先）。正在 running 的 task 由 ActiveRun 单独
+// 透出，不在此列表里参与 status 分组。
+func (s *Store) TasksByStatus() ([]TaskView, error) {
+	rows, err := s.db.Query(
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, ts.status, t.created_at
+		 FROM tasks t JOIN task_status ts ON ts.task_id = t.id
+		 ORDER BY CASE ts.status
+		     WHEN 'new' THEN 1 WHEN 'needs-review' THEN 2 WHEN 'needs-info' THEN 3
+		     WHEN 'blocked' THEN 4 WHEN 'done' THEN 5 WHEN 'cancelled' THEN 6
+		     ELSE 7 END, t.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskView
+	for rows.Next() {
+		var v TaskView
+		if err := rows.Scan(&v.ID, &v.IssueRef, &v.Description, &v.TaskType, &v.Status, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// StepsOfTask 返回某 task 所有 run 的全部 step，按 steps.at（时间戳）排序——
+// 这是跨 run 的轨迹视图（spec §5[3]）。按 at 排而非按 seq 排，是为了规避 Task 2
+// 修复过的 per-run seq 冲突（每次 attempt 重置 seq，跨 run 拼接会错序）。
+func (s *Store) StepsOfTask(taskID string) ([]StepRow, error) {
+	rows, err := s.db.Query(
+		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,
+		        tokens_in, tokens_out, status, error, at
+		 FROM steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)
+		 ORDER BY at`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanStepRows(rows)
+}
+
+// VerificationRow 是 verifications 表的一行，供 TUI 详情面板的逐 tier 状态展示（spec §4.6）。
+type VerificationRow struct {
+	Tier   int
+	Passed bool
+	Detail string
+}
+
+// AppendVerification 落盘一个 tier 的 verify 结果（spec §4.6）。SubLoop 在 verify.Chain
+// 之后对每个实际跑过的 tier 调一次。step_id 留 NULL（legacy 列）；run_id 列（Open 的 ALTER
+// 已加）才是 run 维度的关联键。best-effort：trace，不 gate loop。
+func (s *Store) AppendVerification(runID string, tier int, passed bool, detail string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO verifications(id, step_id, tier, passed, detail, at, run_id)
+		 VALUES(?,NULL,?,?,?,?,?)`,
+		newID("ver"), tier, passed, detail, nowISO(), runID)
+	return err
+}
+
+// VerificationsByRun 返回某 run 的逐 tier verify 行，按 tier 升序（spec §4.6）。
+func (s *Store) VerificationsByRun(runID string) ([]VerificationRow, error) {
+	rows, err := s.db.Query(
+		`SELECT tier, passed, detail FROM verifications WHERE run_id=? ORDER BY tier`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []VerificationRow
+	for rows.Next() {
+		var v VerificationRow
+		if err := rows.Scan(&v.Tier, &v.Passed, &v.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
 	}
 	return out, rows.Err()
 }
@@ -401,4 +701,65 @@ func (s *Store) BudgetLedger(runID string) ([]BudgetRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// CommandRow is one row of the commands table (the TUI → daemon control
+// channel, spec §4.2). AppliedAt is "" while pending.
+type CommandRow struct {
+	ID, TaskID, Verb, Payload, CreatedAt, AppliedAt string
+}
+
+// InsertCommand appends a TUI-issued command (spec §4.2). verb is "resume" or
+// "cancel"; payload is the optional resume feedback. The daemon's drainCommands
+// step picks up rows where applied_at IS NULL.
+func (s *Store) InsertCommand(taskID, verb, payload string) error {
+	_, err := s.db.Exec(
+		`INSERT INTO commands(id, task_id, verb, payload, created_at, applied_at)
+		 VALUES(?,?,?,?,?,NULL)`,
+		newID("cmd"), taskID, verb, payload, nowISO())
+	return err
+}
+
+// PendingCommands returns commands not yet applied (applied_at IS NULL), in
+// insertion order. drainCommands drains this each tick (spec §7).
+func (s *Store) PendingCommands() ([]CommandRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, verb, COALESCE(payload,''), created_at, COALESCE(applied_at,'')
+		 FROM commands WHERE applied_at IS NULL ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CommandRow
+	for rows.Next() {
+		var c CommandRow
+		if err := rows.Scan(&c.ID, &c.TaskID, &c.Verb, &c.Payload, &c.CreatedAt, &c.AppliedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// MarkCommandApplied records that the daemon applied a command (spec §7).
+func (s *Store) MarkCommandApplied(cmdID string) error {
+	_, err := s.db.Exec(`UPDATE commands SET applied_at=? WHERE id=?`, nowISO(), cmdID)
+	return err
+}
+
+// CancelRequested reports whether a pending (unapplied) cancel command exists
+// for a task. SubLoop self-checks this at phase boundaries so a running task
+// stops cooperatively at the next phase (spec §4.5/§7).
+func (s *Store) CancelRequested(taskID string) (bool, error) {
+	var x int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM commands WHERE task_id=? AND verb='cancel' AND applied_at IS NULL LIMIT 1`,
+		taskID).Scan(&x)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }

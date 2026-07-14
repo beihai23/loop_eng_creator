@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
+	"time"
 
 	"loop-eng/internal/budget"
 	"loop-eng/internal/channel"
@@ -48,6 +50,35 @@ type SubLoop struct {
 	HumanTier           verify.Tier            // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
 	Channel             channel.Channel
 	PreinsertedTaskID   string // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
+
+	// Log is the observability sink for phase start/done, retry, and budget
+	// events. When nil, defaults to os.Stderr with a "[subloop]" prefix. Tests
+	// inject a logger backed by a bytes.Buffer to assert on log output without
+	// scraping stderr.
+	Log *log.Logger
+
+	// RetryBackoff is the backoff per attempt before re-running after a verify
+	// failure. Zero (the default) means no sleep — useful in tests. In
+	// production a small backoff (e.g. 1s × attempt) spaces retries so the
+	// daemon's self-healing logs have observable gaps.
+	RetryBackoff time.Duration
+}
+
+// logf writes a formatted line to the SubLoop log (or stderr if Log is nil).
+func (sl *SubLoop) logf(format string, args ...interface{}) {
+	if sl.Log != nil {
+		sl.Log.Printf(format, args...)
+	} else {
+		fmt.Fprintf(os.Stderr, format+"\n", args...)
+	}
+}
+
+// shortID returns a truncated task ID for log lines (first 12 chars).
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // tiersFor 在每轮按 worktree 重建 tier 链：tier1（在 wt 里跑）→ tier2 → tier3。
@@ -83,7 +114,7 @@ const planExecEstimate = 1000
 // failure becomes next round's feedback (retry within budget). HumanStub is now
 // an auto-pass placeholder (NeedsHuman=false), so M1/M2 done/blocked outcomes
 // are unchanged. Every terminal outcome writes a state transition + battle report.
-func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) {
+func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err error) {
 	var taskID string
 	if sl.PreinsertedTaskID != "" {
 		taskID = sl.PreinsertedTaskID // daemon path: task already ingested by tick
@@ -99,42 +130,84 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 	}
 	sl.Store.AppendTransition(taskID, "", "running", "dispatched")
 
+	// 开一行 run（spec §4.1）：每次 Run 用 StartRun 拿真 runID 透传给 steps/budget。
+	// 修 resume 后 replay 交错 bug——修前 run_id 都是 taskID，同任务两次 run 的 step seq
+	// 撞车后 Replay 串在一起。defer 引用命名返回 out：每条终态路径都自动 EndRun，
+	// out.Status 即结局（done/blocked/needs-review/error），无需改现有 return。
+	runID, rerr := sl.Store.StartRun(taskID)
+	if rerr != nil {
+		_ = sl.Store.ClearInFlight()
+		return Outcome{Status: "error"}, rerr
+	}
+	defer func() { _ = sl.Store.EndRun(runID, out.Status) }()
+
+	// Mark the active slot in the cross-process in_flight table.
+	_ = sl.Store.SetInFlight(taskID, "starting")
+	sid := shortID(taskID)
+
 	priorFailure := ""
+	if fb, err := sl.Store.PopResumeFeedback(taskID); err == nil && fb != "" {
+		priorFailure = fb
+	}
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
+		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
+		if ok, _ := sl.Store.CancelRequested(taskID); ok {
+			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
+		}
 		// 预算刹车·重试：每轮入口记一行（spec §8.8）
-		sl.Store.AppendBudget(taskID, "task", "retry", attempt, sl.Budget.MaxRetries)
+		sl.Store.AppendBudget(runID, "task", "retry", attempt, sl.Budget.MaxRetries)
 
 		// ---- plan ----
+		sl.logf("[subloop] %s phase=plan start", sid)
+		_ = sl.Store.SetInFlight(taskID, "plan")
 		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
+			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(taskID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		_, u, err := sl.Plan.Run(ctx, skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: priorFailure,
 		})
 		sl.Budget.AfterCall(u)
-		sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
 		if err != nil {
+			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
+				_ = sl.Store.ClearInFlight()
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "plan error: " + err.Error()
+			sl.logRetry(sid, attempt, priorFailure)
 			continue
+		}
+		sl.logf("[subloop] %s phase=plan done", sid)
+
+		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
+		if ok, _ := sl.Store.CancelRequested(taskID); ok {
+			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
 		}
 
 		// ---- execute (in a fresh worktree) ----
+		sl.logf("[subloop] %s phase=execute start", sid)
+		_ = sl.Store.SetInFlight(taskID, "execute")
 		wt, err := isolation.Create(sl.Repo, taskID+"-r"+fmt.Sprint(attempt))
 		if err != nil {
+			_ = sl.Store.ClearInFlight()
 			return Outcome{Status: "error", Detail: err.Error()}, err
 		}
 		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
 			isolation.Discard(sl.Repo, wt)
+			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(taskID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
@@ -146,17 +219,30 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 		_ = execOut
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
+			sl.logf("[subloop] %s phase=execute fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
+				_ = sl.Store.ClearInFlight()
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "execute error: " + err.Error()
-			sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", Error: err.Error()})
+			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", Error: err.Error()})
+			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
 		diff := worktreeDiff(sl.Repo, wt)
-		sl.Store.AppendStep(state.StepRow{RunID: taskID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
+		sl.logf("[subloop] %s phase=execute done", sid)
+
+		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
+		if ok, _ := sl.Store.CancelRequested(taskID); ok {
+			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
+		}
 
 		// ---- verify (Chain of tiers; independent judgment) ----
+		sl.logf("[subloop] %s phase=verify start", sid)
+		_ = sl.Store.SetInFlight(taskID, "verify")
 		res, err := verify.Chain(ctx, sl.tiersFor(wt), diff, task.AcceptanceCriteria, priorFailure)
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
@@ -168,25 +254,36 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			FailingCriteria: res.FailingCriteria,
 		})
 		sl.Store.AppendStep(state.StepRow{
-			RunID: taskID, Seq: attempt*10 + 3, Role: "verify",
+			RunID: runID, Seq: attempt*10 + 3, Role: "verify",
 			Status:     statusOf2(res.Passed),
 			OutputJSON: string(vt),
 		})
+		// 逐 tier 落盘 verifications（spec §4.6）：best-effort，trace 不 gate loop。
+		// runID 来自 Task 2 的 StartRun 透传；短路时只落实际跑过的 tier。
+		for _, to := range res.Tiers {
+			_ = sl.Store.AppendVerification(runID, to.Tier, to.Passed, to.Detail)
+		}
 		if err != nil {
 			// verify 基础设施错误：致命（auth）→ 立刻中断；可重试 flake → 当作可重试失败。
 			isolation.Discard(sl.Repo, wt)
+			sl.logf("[subloop] %s phase=verify error: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
+				_ = sl.Store.ClearInFlight()
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "verify error: " + err.Error()
+			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
 		// tier-3 人审 → needs-review：park、释放活跃位，worktree 保留待 daemon 恢复（spec §7.2c/§8.6/§10）。
 		// 在 Passed 之前裁决——NeedsHuman 优先于 done/反馈。注意：worktree 不丢弃（park 保留）。
 		if res.NeedsHuman {
+			sl.logf("[subloop] %s phase=verify done needs-human", sid)
+			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "needs-review", res.Detail), nil
 		}
 		if res.Passed {
+			sl.logf("[subloop] %s phase=verify done passed", sid)
 			// Capture the execute output on the worktree's branch, then hand the
 			// branch to the caller for landing. The execute prompt forbids the
 			// model from committing, so loop-eng commits the work itself; the
@@ -195,22 +292,46 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (Outcome, error) 
 			// verify used to leave the worktree uncommitted → diff vanished.
 			branch := branchName(taskID, attempt)
 			if cerr := commitWorktree(wt, branch, landCommitMessage(task, taskID)); cerr != nil {
+				_ = sl.Store.ClearInFlight()
 				// commit failed — verify still passed, so this stays done; but landing
 				// is now manual. Leave the worktree (uncommitted changes survive on
 				// disk) and surface in Detail so the operator can salvage by hand.
 				return sl.report(ctx, taskID, task, "done", res.Detail+
 					" [land: worktree commit failed: "+cerr.Error()+"; worktree preserved at "+wt+"]"), nil
 			}
+			_ = sl.Store.ClearInFlight()
 			out := sl.report(ctx, taskID, task, "done", res.Detail)
 			out.Worktree = wt
 			out.Branch = branch
 			return out, nil
 		}
 		// 不过 → 反馈，下一轮重试
+		sl.logf("[subloop] %s phase=verify done rejected: %s", sid, res.Detail)
 		priorFailure = res.Detail
 		isolation.Discard(sl.Repo, wt)
+		sl.logRetry(sid, attempt, priorFailure)
 	}
+	_ = sl.Store.ClearInFlight()
 	return sl.report(ctx, taskID, task, "blocked", "retries exhausted: "+priorFailure), nil
+}
+
+// logRetry logs a retry event and sleeps the backoff. The backoff is
+// attempt × RetryBackoff (zero RetryBackoff = no sleep, test-friendly).
+func (sl *SubLoop) logRetry(sid string, attempt int, reason string) {
+	backoff := time.Duration(attempt) * sl.RetryBackoff
+	sl.logf("[subloop] %s retry attempt=%d reason=%q backoff=%s",
+		sid, attempt, truncateStr(reason, 80), backoff)
+	if backoff > 0 {
+		time.Sleep(backoff)
+	}
+}
+
+// truncateStr returns s cut to at most n runes with "…" appended.
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // criteriaBlock formats acceptance criteria into a bullet list string.
@@ -275,6 +396,9 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 	if err := sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: PostComment failed: %v\n", err)
 		detail += " [writeback partial: comment: " + err.Error() + "]"
+	} else if err := sl.Store.SetLastCommentAt(taskID, time.Now()); err != nil {
+		fmt.Fprintf(os.Stderr, "writeback error: SetLastCommentAt failed: %v\n", err)
+		detail += " [writeback partial: last_comment_at: " + err.Error() + "]"
 	}
 	// Mark the ticket's status: Local writes status/<ref>; GitHub adds a
 	// loop:<status> label. Same error contract as PostComment — surface to
@@ -282,6 +406,12 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 	if err := sl.Channel.UpdateStatus(ctx, task.Ref, status); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: UpdateStatus failed: %v\n", err)
 		detail += " [writeback partial: status: " + err.Error() + "]"
+	}
+	if status == "done" {
+		if err := sl.Channel.CloseIssue(ctx, task.Ref); err != nil {
+			fmt.Fprintf(os.Stderr, "writeback error: CloseIssue failed: %v\n", err)
+			detail += " [writeback partial: close: " + err.Error() + "]"
+		}
 	}
 	return Outcome{Status: status, Detail: detail}
 }

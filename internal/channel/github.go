@@ -33,9 +33,11 @@ type ghIssue struct {
 }
 
 // ghComment is the slice of `gh issue view <ref> --json comments`; only body
-// is carried — Replies are body-only by design.
+// and createdAt are carried — Replies are body-only by design, but createdAt is
+// used client-side to filter for new comments since the last daemon reply.
 type ghComment struct {
-	Body string `json:"body"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"createdAt"`
 }
 
 type ghIssueComments struct {
@@ -63,14 +65,22 @@ func parseIssuesJSON(raw []byte) ([]Task, error) {
 // parseIssueCommentsJSON decodes `gh issue view <ref> --json comments` output
 // into Replies — one Reply per comment, body verbatim (other fields like
 // author/createdAt are ignored). M3 daemon polls these to surface human-review
-// responses on parked tasks.
-func parseIssueCommentsJSON(raw []byte) ([]Reply, error) {
+// responses on parked tasks. When since is non-zero, only comments created after
+// that time are included (used to detect new human replies after the daemon's
+// last comment).
+func parseIssueCommentsJSON(raw []byte, since time.Time) ([]Reply, error) {
 	var c ghIssueComments
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return nil, fmt.Errorf("parse gh issue comments: %w", err)
 	}
 	replies := make([]Reply, 0, len(c.Comments))
 	for _, cm := range c.Comments {
+		if !since.IsZero() {
+			t, err := time.Parse(time.RFC3339, cm.CreatedAt)
+			if err != nil || !t.After(since) {
+				continue
+			}
+		}
 		replies = append(replies, Reply{Body: cm.Body})
 	}
 	return replies, nil
@@ -96,19 +106,55 @@ func (g *GitHub) UpdateStatus(ctx context.Context, ref, status string) error {
 	return err
 }
 
-func (g *GitHub) ListReplies(ctx context.Context, refs []string) (map[string][]Reply, error) {
-	// M3 daemon 轮询 parked 任务的人审回复：逐个 issue 拉 comments，解析成 map[ref][]Reply。
+func (g *GitHub) CloseIssue(ctx context.Context, ref string) error {
+	_, err := g.gh(ctx, "issue", "close", ref, "--repo", g.Repo)
+	return err
+}
+
+func (g *GitHub) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
 	out := make(map[string][]Reply, len(refs))
 	for _, ref := range refs {
 		raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "comments")
 		if err != nil {
 			return nil, err
 		}
-		replies, err := parseIssueCommentsJSON(raw)
+		replies, err := parseIssueCommentsJSON(raw, since)
 		if err != nil {
 			return nil, err
 		}
 		out[ref] = replies
+	}
+	return out, nil
+}
+
+type ghIssueView struct {
+	State  string         `json:"state"`
+	Labels []ghIssueLabel `json:"labels"`
+}
+
+type ghIssueLabel struct {
+	Name string `json:"name"`
+}
+
+func (g *GitHub) GetTaskStates(ctx context.Context, refs []string) (map[string]TaskState, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]TaskState, len(refs))
+	for _, ref := range refs {
+		raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "state,labels")
+		if err != nil {
+			return nil, err
+		}
+		var v ghIssueView
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, fmt.Errorf("parse gh issue state: %w", err)
+		}
+		labels := make([]string, 0, len(v.Labels))
+		for _, l := range v.Labels {
+			labels = append(labels, l.Name)
+		}
+		out[ref] = TaskState{Ref: ref, IsOpen: v.State == "OPEN", Labels: labels}
 	}
 	return out, nil
 }

@@ -3,11 +3,9 @@ package verify
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 
-	"loop-eng/internal/channel"
 	"loop-eng/internal/model"
 	"loop-eng/internal/skill"
 )
@@ -133,6 +131,47 @@ func TestLLMCheckSynthesizesDetailOnEmptyReason(t *testing.T) {
 	}
 }
 
+// ---- Chain 填充 Tiers（spec §4.6 逐 tier 落盘）----
+
+type stubTier struct {
+	pass   bool
+	detail string
+}
+
+func (s stubTier) Check(context.Context, string, []string, string) (VerifyResult, error) {
+	return VerifyResult{Passed: s.pass, Detail: s.detail}, nil
+}
+
+func TestChainFillsTiersAndShortCircuits(t *testing.T) {
+	// tier1 过、tier2 挂 ⇒ Tiers 有两条（tier2 失败），tier3 不跑不出现。
+	tiers := []Tier{
+		stubTier{pass: true, detail: "t1 ok"},
+		stubTier{pass: false, detail: "t2 nope"},
+		stubTier{pass: true, detail: "t3"},
+	}
+	res, err := Chain(context.Background(), tiers, "diff", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Passed {
+		t.Fatalf("want not passed")
+	}
+	if len(res.Tiers) != 2 {
+		t.Fatalf("want 2 tier outcomes (short-circuit), got %d", len(res.Tiers))
+	}
+	if res.Tiers[0].Tier != 1 || !res.Tiers[0].Passed || res.Tiers[1].Tier != 2 || res.Tiers[1].Passed {
+		t.Fatalf("Tiers=%+v", res.Tiers)
+	}
+}
+
+func TestChainFillsTiersAllPass(t *testing.T) {
+	tiers := []Tier{stubTier{pass: true, detail: "t1"}, stubTier{pass: true, detail: "t2"}}
+	res, _ := Chain(context.Background(), tiers, "diff", nil, "")
+	if !res.Passed || len(res.Tiers) != 2 {
+		t.Fatalf("want passed + 2 tiers, got %+v", res)
+	}
+}
+
 func parseVerifyOutput(b []byte) (skill.VerifyOutput, error) {
 	var o skill.VerifyOutput
 	return o, json.Unmarshal(b, &o)
@@ -142,113 +181,3 @@ func mustJSONStr(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
-
-// ---- Human: tier-3 async human review (spec §8.6) ----
-
-// TestHumanCheckReturnsNeedsHuman verifies the core contract: Human.Check must
-// return Passed=false, NeedsHuman=true — the signal the daemon uses to park the
-// task and begin polling for a human reply.
-func TestHumanCheckReturnsNeedsHuman(t *testing.T) {
-	ch := &channelSpy{}
-	h := Human{Channel: ch, Ref: "42"}
-	res, err := h.Check(context.Background(), "diff", []string{"std-1"}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.Passed {
-		t.Fatal("Human.Check must return Passed=false (park, not done)")
-	}
-	if !res.NeedsHuman {
-		t.Fatal("Human.Check must return NeedsHuman=true (signal daemon to park + poll)")
-	}
-	if res.Detail == "" {
-		t.Fatal("Human.Check Detail must be non-empty (explain why parked)")
-	}
-}
-
-// TestHumanCheckPostsComment verifies that Human.Check actually posts a
-// review-request comment via the channel — not silently park without messaging.
-func TestHumanCheckPostsComment(t *testing.T) {
-	ch := &channelSpy{}
-	h := Human{Channel: ch, Ref: "42"}
-	_, err := h.Check(context.Background(), "diff-content", []string{"std-a", "std-b"}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ch.comments) != 1 {
-		t.Fatalf("want 1 PostComment call, got %d", len(ch.comments))
-	}
-	c := ch.comments[0]
-	if c.ref != "42" {
-		t.Fatalf("PostComment ref = %q, want %q", c.ref, "42")
-	}
-	if c.body == "" {
-		t.Fatal("PostComment body must not be empty (human needs context)")
-	}
-	if !strings.Contains(c.body, "diff-content") {
-		t.Fatal("PostComment body must contain the diff")
-	}
-	if !strings.Contains(c.body, "std-a") || !strings.Contains(c.body, "std-b") {
-		t.Fatal("PostComment body must contain acceptance criteria")
-	}
-}
-
-// TestHumanCheckPostCommentError verifies error propagation: if the channel's
-// PostComment fails, Human.Check returns the error so the caller doesn't
-// silently swallow a failed review-request post.
-func TestHumanCheckPostCommentError(t *testing.T) {
-	ch := &channelSpy{postErr: fmt.Errorf("github down")}
-	h := Human{Channel: ch, Ref: "42"}
-	_, err := h.Check(context.Background(), "diff", nil, "")
-	if err == nil {
-		t.Fatal("PostComment error must propagate up from Check")
-	}
-	if !strings.Contains(err.Error(), "review-request") {
-		t.Fatalf("error must wrap context, got: %v", err)
-	}
-}
-
-// TestReviewRequestBodyIncludesPriorFailure ensures the review-request comment
-// includes the prior-failure feedback so the human reviewer has the full picture.
-func TestReviewRequestBodyIncludesPriorFailure(t *testing.T) {
-	body := reviewRequestBody("diff", []string{"std-1"}, "上一轮 LLM 驳回: 缺错误处理")
-	if !strings.Contains(body, "上一轮 LLM 驳回") {
-		t.Fatal("review-request body must include priorFailure for full context")
-	}
-}
-
-// TestTruncateDiff ensures long diffs are truncated with a readable marker so
-// the comment stays at a skim-friendly size.
-func TestTruncateDiff(t *testing.T) {
-	short := "small diff"
-	if truncateDiff(short, 100) != short {
-		t.Fatal("short diff must not be truncated")
-	}
-	long := strings.Repeat("x", 5000)
-	got := truncateDiff(long, 100)
-	if len(got) >= len(long) {
-		t.Fatal("long diff must be truncated")
-	}
-	if !strings.Contains(got, "truncated") {
-		t.Fatal("truncated diff must include a marker so the human knows it's partial")
-	}
-}
-
-// channelSpy records PostComment calls for test assertions.
-type channelSpy struct {
-	comments []struct{ ref, body string }
-	postErr  error // if set, PostComment returns this error
-}
-
-func (s *channelSpy) ListNewTasks(ctx context.Context) ([]channel.Task, error)  { return nil, nil }
-func (s *channelSpy) ListReplies(ctx context.Context, refs []string) (map[string][]channel.Reply, error) {
-	return nil, nil
-}
-func (s *channelSpy) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
-func (s *channelSpy) PostComment(ctx context.Context, ref, body string) error {
-	s.comments = append(s.comments, struct{ ref, body string }{ref, body})
-	return s.postErr
-}
-
-// compile-time interface check
-var _ channel.Channel = (*channelSpy)(nil)

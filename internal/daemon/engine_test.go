@@ -33,7 +33,7 @@ func (f *scriptedChannel) ListNewTasks(ctx context.Context) ([]channel.Task, err
 // ListReplies returns the scripted human replies for the parked refs the daemon
 // asks about. The daemon only calls this with parked (needs-review) refs, so a
 // test simulates "human answered" by setting replies[<ref>] before the tick.
-func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string) (map[string][]channel.Reply, error) {
+func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
 	out := make(map[string][]channel.Reply)
 	for _, r := range refs {
 		if rs, ok := f.replies[r]; ok {
@@ -44,6 +44,10 @@ func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string) (map[s
 }
 func (f *scriptedChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
 func (f *scriptedChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
+func (f *scriptedChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
+func (f *scriptedChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
 
 // cancelChannel returns no tasks but cancels its context on the Nth
 // ListNewTasks call, letting TestRunLoopsUntilCancelled stop the resident loop
@@ -62,11 +66,15 @@ func (f *cancelChannel) ListNewTasks(ctx context.Context) ([]channel.Task, error
 	return nil, nil
 }
 
-func (f *cancelChannel) ListReplies(ctx context.Context, refs []string) (map[string][]channel.Reply, error) {
+func (f *cancelChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
 	return nil, nil
 }
 func (f *cancelChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
 func (f *cancelChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
+func (f *cancelChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
+func (f *cancelChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
 
 func newTestStore(t *testing.T) *state.Store {
 	t.Helper()
@@ -457,5 +465,101 @@ func TestIsTransientInfra(t *testing.T) {
 		if got := isTransientInfra(detail); got != want {
 			t.Errorf("isTransientInfra(%q) = %v, want %v", detail, got, want)
 		}
+	}
+}
+
+// TestDrainCommandsResumeAndCancel is the step-3.5 acceptance test (spec §7):
+// a "resume" command on a needs-review task flips it → new and records the
+// payload as resume feedback; a "cancel" command on a blocked task flips it →
+// cancelled. Both commands are marked applied (PendingCommands drains to 0).
+// 测试直接驱动 drainCommands —— 同 package，无需导出。
+func TestDrainCommandsResumeAndCancel(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{} // drainCommands 不触碰 channel
+	eng := &Engine{Channel: ch, Store: st, Interval: time.Second}
+
+	t1, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#1", Description: "d"})
+	if err != nil {
+		t.Fatalf("insert t1: %v", err)
+	}
+	t2, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#2", Description: "d"})
+	if err != nil {
+		t.Fatalf("insert t2: %v", err)
+	}
+	if err := st.AppendTransition(t1, "new", "needs-review", "parked"); err != nil {
+		t.Fatalf("transition t1: %v", err)
+	}
+	if err := st.AppendTransition(t2, "new", "blocked", "exhausted"); err != nil {
+		t.Fatalf("transition t2: %v", err)
+	}
+
+	if err := st.InsertCommand(t1, "resume", "please retry with fix X"); err != nil {
+		t.Fatalf("insert resume cmd: %v", err)
+	}
+	if err := st.InsertCommand(t2, "cancel", ""); err != nil {
+		t.Fatalf("insert cancel cmd: %v", err)
+	}
+
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	// t1: needs-review → new，反馈落盘
+	if got := statusOf(t, st, t1); got != "new" {
+		t.Fatalf("t1 status=%q want new", got)
+	}
+	fb, err := st.PopResumeFeedback(t1)
+	if err != nil {
+		t.Fatalf("pop feedback t1: %v", err)
+	}
+	if !strings.Contains(fb, "fix X") {
+		t.Fatalf("t1 feedback=%q want contains 'fix X'", fb)
+	}
+	// t2: blocked → cancelled
+	if got := statusOf(t, st, t2); got != "cancelled" {
+		t.Fatalf("t2 status=%q want cancelled", got)
+	}
+	// 全部已应用（pending 清零）
+	pend, err := st.PendingCommands()
+	if err != nil {
+		t.Fatalf("pending cmds: %v", err)
+	}
+	if len(pend) != 0 {
+		t.Fatalf("pending=%d want 0", len(pend))
+	}
+}
+
+// TestDrainCommandsIdempotent 证明 drainCommands 对终态任务幂等：对已 done 的
+// 任务 cancel 是 no-op（状态保持 done），但命令仍标记 applied（spec §7：
+// running/done/cancelled → 不动作，只回写 applied_at，下 tick 不重试）。
+func TestDrainCommandsIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{}
+	eng := &Engine{Channel: ch, Store: st, Interval: time.Second}
+
+	t1, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#1", Description: "d"})
+	if err != nil {
+		t.Fatalf("insert t1: %v", err)
+	}
+	if err := st.AppendTransition(t1, "new", "done", "ran"); err != nil {
+		t.Fatalf("transition t1: %v", err)
+	}
+	if err := st.InsertCommand(t1, "cancel", ""); err != nil {
+		t.Fatalf("insert cancel cmd: %v", err)
+	}
+
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if got := statusOf(t, st, t1); got != "done" {
+		t.Fatalf("done task flipped to %q (must stay done)", got)
+	}
+	// cancel 命令虽是 no-op，仍标记 applied（不会下 tick 重试）
+	pend, err := st.PendingCommands()
+	if err != nil {
+		t.Fatalf("pending cmds: %v", err)
+	}
+	if len(pend) != 0 {
+		t.Fatalf("pending=%d want 0 (cancel on terminal must still be marked applied)", len(pend))
 	}
 }

@@ -1,9 +1,11 @@
 package loop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 
 	"loop-eng/internal/budget"
 	"loop-eng/internal/channel"
+	"loop-eng/internal/isolation"
 	"loop-eng/internal/model"
 	"loop-eng/internal/skill"
 	"loop-eng/internal/state"
@@ -144,12 +147,17 @@ func TestSubLoopWritesBudgetLedger(t *testing.T) {
 	if out.Status != "done" {
 		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
 	}
-	// Run inserts the task itself; recover its id to scope the ledger read.
+	// Run inserts the task itself; recover its id, then the run id (budget_ledger
+	// 现按 run_id 落库——spec §4.1/§8.8，修 replay 交错 bug）来 scope 本次读取。
 	statuses, err := st.ListStatuses()
 	if err != nil || len(statuses) != 1 {
 		t.Fatalf("want exactly 1 task status, got %d (err %v)", len(statuses), err)
 	}
-	rows, err := st.BudgetLedger(statuses[0].ID)
+	runs, err := st.RunsOfTask(statuses[0].ID)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("want 1 run for the done task, got %d (err %v)", len(runs), err)
+	}
+	rows, err := st.BudgetLedger(runs[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,5 +412,352 @@ func TestSubLoopDoneCommitsWorktree(t *testing.T) {
 	got, _ := os.ReadFile(filepath.Join(out.Worktree, "landed.txt"))
 	if string(got) != "done work" {
 		t.Fatalf("worktree file content = %q, want %q", string(got), "done work")
+	}
+}
+
+// ---- observability tests (spec §8.7) ----
+
+// TestSubLoopPhaseLogsAsserts asserts that each phase (plan/execute/verify)
+// emits a [subloop] log line at start and done with the task short ID and phase
+// name. Uses an injected logger backed by a bytes.Buffer so assertions are
+// against structured output, not stderr scraping.
+func TestSubLoopPhaseLogsAsserts(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	var buf bytes.Buffer
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:  fake,
+		Plan:     mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:   channel.NewLocal(t.TempDir()),
+		Log:       log.New(&buf, "", log.Lmsgprefix),
+	}
+
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "30", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+
+	logs := buf.String()
+	t.Logf("SubLoop logs:\n%s", logs)
+
+	// Each phase must have a start and a done log line.
+	for _, phase := range []string{"plan", "execute", "verify"} {
+		wantStart := "phase=" + phase + " start"
+		if !strings.Contains(logs, wantStart) {
+			t.Errorf("phase %q: missing start log (want %q in logs)", phase, wantStart)
+		}
+		wantDone := "phase=" + phase + " done"
+		if !strings.Contains(logs, wantDone) {
+			t.Errorf("phase %q: missing done log (want %q in logs)", phase, wantDone)
+		}
+	}
+}
+
+// TestSubLoopRetryLogs asserts retry logs with attempt number, reason, and
+// backoff when verify repeatedly fails. The fake verify always rejects; after
+// max retries the task blocks.
+func TestSubLoopRetryLogs(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "reject reason here"}),
+	})
+	var buf bytes.Buffer
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:  fake,
+		Plan:     mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:   channel.NewLocal(t.TempDir()),
+		Log:       log.New(&buf, "", log.Lmsgprefix),
+	}
+
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "31", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("want blocked, got %s", out.Status)
+	}
+
+	logs := buf.String()
+	t.Logf("Retry logs:\n%s", logs)
+
+	// Must have retry log lines with attempt, reason, backoff.
+	if !strings.Contains(logs, "retry") {
+		t.Error("expected retry log lines, got none")
+	}
+	if !strings.Contains(logs, "attempt=") {
+		t.Error("retry log missing attempt number")
+	}
+	if !strings.Contains(logs, "reason=") {
+		t.Error("retry log missing reason")
+	}
+	if !strings.Contains(logs, "backoff=") {
+		t.Error("retry log missing backoff")
+	}
+}
+
+// TestSubLoopInFlightClearedOnDone verifies InFlight is cleared after a done
+// outcome (terminal path). The Store's in_flight table must be empty after
+// SubLoop.Run returns done.
+func TestSubLoopInFlightClearedOnDone(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "32", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s", out.Status)
+	}
+
+	// InFlight must be empty after terminal outcome.
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after SubLoop.Run returns done")
+	}
+}
+
+// TestSubLoopInFlightClearedOnBlocked verifies InFlight is cleared after a
+// blocked outcome (retries exhausted).
+func TestSubLoopInFlightClearedOnBlocked(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope"}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "33", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("want blocked, got %s", out.Status)
+	}
+
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after SubLoop.Run returns blocked")
+	}
+}
+
+// TestSubLoopInFlightClearedOnNeedsReview verifies InFlight is cleared after a
+// needs-review outcome (tier-3 human review park).
+func TestSubLoopInFlightClearedOnNeedsReview(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		HumanTier:  needsHumanTier{},
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "34", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "needs-review" {
+		t.Fatalf("want needs-review, got %s", out.Status)
+	}
+
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after SubLoop.Run returns needs-review")
+	}
+}
+
+// TestCooperativeCancel 钉死协作式 cancel（spec §4.5/§7）：一个跑起来的 SubLoop
+// 必须在每个 phase 边界自查 Store.CancelRequested，命中则提前以 cancelled 收尾
+// （协作式，非硬杀）。测试包住 Plan skill 的 model.Client：第一次 plan 调用返回
+// 后插入一条 pending cancel 命令，使 execute 前的自查命中并 bail。defer EndRun
+// （Task 2）用 out.Status=cancelled 自动收尾，InFlight 必须清空。
+func TestCooperativeCancel(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	task := channel.Task{Ref: "50", Description: "d", AcceptanceCriteria: []string{"c"}}
+	taskID, err := st.InsertTask(state.TaskRow{
+		IssueRef: task.Ref, Description: task.Description,
+		TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute: fake,
+		// Plan 的 model.Client 被包一层：第一次 plan 调用后插入 cancel 命令，
+		// execute 前的自查即会命中。
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", &cancelOnFirstCall{inner: fake, store: st, taskID: taskID, t: t}),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	sl.PreinsertedTaskID = taskID
+
+	out, err := sl.Run(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if out.Status != "cancelled" {
+		t.Fatalf("status=%q want cancelled (detail=%s)", out.Status, out.Detail)
+	}
+	// 终态后 InFlight 必须清空
+	if _, ok, _ := st.InFlight(); ok {
+		t.Fatal("in_flight must be empty after cooperative cancel")
+	}
+	// run 关闭为 cancelled（defer EndRun 用 out.Status 收尾）
+	runs, err := st.RunsOfTask(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Outcome != "cancelled" {
+		t.Fatalf("runs=%+v want exactly 1 run with outcome=cancelled", runs)
+	}
+}
+
+// cancelOnFirstCall 包住一个 model.Client：第一次 Call 在委托给内部 client 后
+// 往 store 插一条 pending cancel 命令，使 SubLoop 下一个 phase 边界自查
+// （Store.CancelRequested）bail 到 cancelled。仅用于测试，模拟 TUI 中途下发 cancel。
+type cancelOnFirstCall struct {
+	inner  model.Client
+	store  *state.Store
+	taskID string
+	done   bool
+	t      *testing.T
+}
+
+func (c *cancelOnFirstCall) Call(ctx context.Context, prompt string) (string, model.Usage, error) {
+	out, u, err := c.inner.Call(ctx, prompt)
+	if !c.done {
+		c.done = true
+		if e := c.store.InsertCommand(c.taskID, "cancel", ""); e != nil {
+			c.t.Fatal(e)
+		}
+	}
+	return out, u, err
+}
+
+// TestReplayNoInterleaveAfterResume 钉死 spec §4.1 的 bug：同任务两次 run，各自
+// attempt=1 的 plan step seq 都是 11。修前 AppendStep 的 RunID 传的是 taskID 且无
+// StartRun ⇒ RunsOfTask 空、两次 run 的 step 全压在同一个 taskID 下、Replay 交错；
+// 修后每次 Run 用 StartRun 拿独立 runID 透传，每个 run 的 Replay 只剩自己那条 plan
+// step（seq=11 至多一条）。构造照搬 TestSubLoopDoneOnFirstPass 的 passing SubLoop。
+func TestReplayNoInterleaveAfterResume(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	task := channel.Task{Ref: "40", Description: "d", AcceptanceCriteria: []string{"c"}}
+	taskID, err := st.InsertTask(state.TaskRow{
+		IssueRef: task.Ref, Description: task.Description,
+		TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl.PreinsertedTaskID = taskID // 两次 Run 复用同一 taskID（模拟 resume 后再 dispatch）
+	ctx := context.Background()
+
+	// run 1（first pass → done）
+	out1, err := sl.Run(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out1.Status != "done" {
+		t.Fatalf("run 1: want done, got %s (%s)", out1.Status, out1.Detail)
+	}
+	// done 保留 worktree + 分支 loop/<taskID>-r1；丢弃后 run 2 才能重建同名 worktree。
+	if out1.Worktree != "" {
+		if derr := isolation.Discard(sl.Repo, out1.Worktree); derr != nil {
+			t.Fatalf("discard run-1 worktree: %v", derr)
+		}
+	}
+
+	// run 2（模拟 resume 后再次 dispatch 同一 task）
+	if _, err := sl.Run(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	runs, err := st.RunsOfTask(taskID)
+	if err != nil || len(runs) != 2 {
+		t.Fatalf("want 2 runs, got %d (err %v)", len(runs), err)
+	}
+	for _, r := range runs {
+		steps, err := st.Replay(r.ID)
+		if err != nil {
+			t.Fatalf("Replay(%s): %v", r.ID, err)
+		}
+		// 每个 run 的 plan step（seq=11）至多一条；两次 run 不交错 ⇒ 不应出现两条 seq=11。
+		var planSeq11 int
+		for _, s := range steps {
+			if s.Seq == 11 && s.Role == "plan" {
+				planSeq11++
+			}
+		}
+		if planSeq11 > 1 {
+			t.Fatalf("run %s: got %d plan seq=11 steps (interleaved), want ≤1", r.ID, planSeq11)
+		}
 	}
 }
