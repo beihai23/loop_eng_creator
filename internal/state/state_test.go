@@ -381,3 +381,46 @@ func TestAppendVerificationAndRead(t *testing.T) {
 		t.Fatalf("verifications=%+v", got)
 	}
 }
+
+// TestTasksByStatusJoinsAndOrders 校验 tasks+task_status join 的 TUI 概览查询
+// （spec §5[1]）：每条 task 带当前 status，一条查询喂整张列表（无 N+1）。
+func TestTasksByStatusJoinsAndOrders(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+	// new、needs-review、done 各一
+	a, _ := s.InsertTask(TaskRow{IssueRef: "#a", Description: "desc a"})
+	b, _ := s.InsertTask(TaskRow{IssueRef: "#b", Description: "desc b"})
+	c, _ := s.InsertTask(TaskRow{IssueRef: "#c", Description: "desc c"})
+	_ = s.AppendTransition(b, "new", "needs-review", "park")
+	_ = s.AppendTransition(c, "new", "done", "ran")
+
+	got, err := s.TasksByStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]TaskView{}
+	for _, v := range got {
+		byID[v.ID] = v
+	}
+	if byID[a].Status != "new" || byID[a].Description != "desc a" || byID[a].IssueRef != "#a" {
+		t.Fatalf("a = %+v", byID[a])
+	}
+	if byID[b].Status != "needs-review" || byID[c].Status != "done" {
+		t.Fatalf("b=%+v c=%+v", byID[b], byID[c])
+	}
+}
+
+// TestStepsOfTask 校验跨 run 的步骤查询（spec §5[3]）：返回某 task 所有 run
+// 的全部 step，按 steps.at 排序（规避 Task 2 修复的 per-run seq 冲突）。
+func TestStepsOfTask(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+	tid, _ := s.InsertTask(TaskRow{IssueRef: "#a", Description: "d"})
+	rid, _ := s.StartRun(tid)
+	_ = s.AppendStep(StepRow{RunID: rid, Seq: 11, Role: "plan", Status: "ok"})
+	_ = s.AppendStep(StepRow{RunID: rid, Seq: 12, Role: "execute", Status: "ok"})
+	got, err := s.StepsOfTask(tid)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("StepsOfTask=%+v err=%v want 2", got, err)
+	}
+}

@@ -548,6 +548,13 @@ func (s *Store) Replay(runID string) ([]StepRow, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanStepRows(rows)
+}
+
+// scanStepRows 把 steps 表的逐行扫描抽出来，供 Replay（按 seq 排单 run）与
+// StepsOfTask（按 at 排跨 run）共用。调用方负责构造查询并关闭 rows。这行
+// SELECT 列表与 steps 表的可读列一一对应（与 AppendStep 写入的列同序）。
+func scanStepRows(rows *sql.Rows) ([]StepRow, error) {
 	var out []StepRow
 	for rows.Next() {
 		var r StepRow
@@ -558,6 +565,57 @@ func (s *Store) Replay(runID string) ([]StepRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// TaskView 是 tasks+task_status join 出的一行，喂给 TUI 概览列表（spec §5[1]）。
+// 一条查询喂整张列表（无 N+1）：每个 task 带它当前的 status。Phase B 的 TUI
+// reader 直接消费。
+type TaskView struct {
+	ID, IssueRef, Description, TaskType, Status string
+	CreatedAt                                   string
+}
+
+// TasksByStatus 返回全部 task 及其当前 status，按 TUI 概览优先级排序：
+// new → needs-review → needs-info → blocked → done → cancelled（其余垫底），
+// 组内按 created_at 升序（最老的最先）。正在 running 的 task 由 ActiveRun 单独
+// 透出，不在此列表里参与 status 分组。
+func (s *Store) TasksByStatus() ([]TaskView, error) {
+	rows, err := s.db.Query(
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, ts.status, t.created_at
+		 FROM tasks t JOIN task_status ts ON ts.task_id = t.id
+		 ORDER BY CASE ts.status
+		     WHEN 'new' THEN 1 WHEN 'needs-review' THEN 2 WHEN 'needs-info' THEN 3
+		     WHEN 'blocked' THEN 4 WHEN 'done' THEN 5 WHEN 'cancelled' THEN 6
+		     ELSE 7 END, t.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskView
+	for rows.Next() {
+		var v TaskView
+		if err := rows.Scan(&v.ID, &v.IssueRef, &v.Description, &v.TaskType, &v.Status, &v.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// StepsOfTask 返回某 task 所有 run 的全部 step，按 steps.at（时间戳）排序——
+// 这是跨 run 的轨迹视图（spec §5[3]）。按 at 排而非按 seq 排，是为了规避 Task 2
+// 修复过的 per-run seq 冲突（每次 attempt 重置 seq，跨 run 拼接会错序）。
+func (s *Store) StepsOfTask(taskID string) ([]StepRow, error) {
+	rows, err := s.db.Query(
+		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,
+		        tokens_in, tokens_out, status, error
+		 FROM steps WHERE run_id IN (SELECT id FROM runs WHERE task_id=?)
+		 ORDER BY at`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanStepRows(rows)
 }
 
 // VerificationRow 是 verifications 表的一行，供 TUI 详情面板的逐 tier 状态展示（spec §4.6）。
