@@ -33,6 +33,30 @@ func TestKeySwitchAndCancel(t *testing.T) {
 	}
 }
 
+// TestTabKeyAutoSelectsCursorRow 守住：在总览直接按 t（没先按 Enter）时，
+// 自动把光标行选为 selTask，否则轨迹/详情会落到「（未选中任务）」。
+func TestTabKeyAutoSelectsCursorRow(t *testing.T) {
+	st, _ := state.Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	tid, _ := st.InsertTask(state.TaskRow{IssueRef: "#1", Description: "d"})
+
+	m := New(st, nil)
+	m.selIdx = 0
+	m.snap, _ = ReadSnapshot(st, nil) // 模拟 dataTick 已加载快照
+	if m.selTask != "" {
+		t.Fatalf("前置：selTask 应为空")
+	}
+
+	m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	mm := m2.(Model)
+	if mm.tab != tabTrace {
+		t.Fatalf("tab 不是 trace")
+	}
+	if mm.selTask != tid {
+		t.Fatalf("'t' 应自动选中光标行；selTask=%q want %q", mm.selTask, tid)
+	}
+}
+
 func TestQuitOnQAndCtrlC(t *testing.T) {
 	msgs := []tea.KeyMsg{
 		{Type: tea.KeyRunes, Runes: []rune("q")},

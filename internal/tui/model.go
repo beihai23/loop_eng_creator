@@ -91,8 +91,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tab = tabOverview
 			return m, animTick() // I1：回到 overview 重启呼吸灯
 		case "2":
+			// 切详情/轨迹前先把光标行选中：没按过 Enter 时 selTask 为空，否则
+			// 直接按 t/2 会落到「（未选中任务）」。动作键 r/x 不自动选（避免误触发）。
+			if m.snap != nil && m.selIdx >= 0 && m.selIdx < len(m.snap.Tasks) {
+				m.selTask = m.snap.Tasks[m.selIdx].ID
+			}
 			m.tab = tabDetail
 		case "3", "t":
+			if m.snap != nil && m.selIdx >= 0 && m.selIdx < len(m.snap.Tasks) {
+				m.selTask = m.snap.Tasks[m.selIdx].ID
+			}
 			m.tab = tabTrace
 		case "esc":
 			m.tab = tabOverview
