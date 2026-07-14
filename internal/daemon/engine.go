@@ -136,6 +136,11 @@ func (e *Engine) tick(ctx context.Context) error {
 		e.logf("[daemon] poll signals error: %v", err)
 	}
 
+	// ---- step 3.5: drain TUI commands (spec §4.2/§7) ----
+	if err := e.drainCommands(ctx); err != nil {
+		e.logf("[daemon] drain commands error: %v", err)
+	}
+
 	// ---- step 4: dispatch (spec §7.1 step 3) ----
 	if e.RunTask == nil {
 		return nil
@@ -366,4 +371,51 @@ func joinReplies(rs []channel.Reply) string {
 		parts[i] = r.Body
 	}
 	return strings.Join(parts, " | ")
+}
+
+// drainCommands applies every pending TUI command (resume/cancel) and marks it
+// applied (spec §4.2/§7)。幂等：目标已终态（done/cancelled）或 running（由 SubLoop
+// 自查处理）的命令只回写 applied_at，不产生 transition。单条命令出错则中断本轮
+// drain，下 tick 从尚未 applied 的行重试。
+func (e *Engine) drainCommands(ctx context.Context) error {
+	cmds, err := e.Store.PendingCommands()
+	if err != nil {
+		return err
+	}
+	for _, c := range cmds {
+		if err := e.applyCommand(ctx, c); err != nil {
+			return err
+		}
+		if err := e.Store.MarkCommandApplied(c.ID); err != nil {
+			return err
+		}
+	}
+	if len(cmds) > 0 {
+		e.logf("[daemon] tick commands: drained %d", len(cmds))
+	}
+	return nil
+}
+
+// applyCommand 把单条 TUI 命令翻译成 transition（spec §7）：
+//   - resume（needs-review/blocked）→ X→new 并把 payload 落盘为 resume 反馈。
+//   - cancel（new/needs-info/needs-review/blocked）→ X→cancelled。
+//   - running/done/cancelled → 不动作（running 由 SubLoop 自查；其余已终态）。
+func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
+	cur, _ := e.statusOf(c.TaskID)
+	switch c.Verb {
+	case "resume":
+		if cur == "needs-review" || cur == "blocked" {
+			if err := e.Store.AppendTransition(c.TaskID, cur, "new", "tui resume: "+c.Payload); err != nil {
+				return err
+			}
+			return e.Store.SetResumeFeedback(c.TaskID, c.Payload)
+		}
+	case "cancel":
+		switch cur {
+		case "new", "needs-info", "needs-review", "blocked":
+			return e.Store.AppendTransition(c.TaskID, cur, "cancelled", "cancelled by TUI")
+		}
+		// running → SubLoop 自查处理；done/cancelled → 已终态
+	}
+	return nil
 }
