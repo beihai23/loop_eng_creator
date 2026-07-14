@@ -462,6 +462,73 @@ func (s *Store) Transitions(taskID string) ([]TransitionRow, error) {
 	return out, rows.Err()
 }
 
+// RunRow is one row of the runs table surfaced to readers (TUI detail/trace).
+// RetryCount and TotalTokens are derived by the reader from budget_ledger /
+// steps; the runs row itself only carries the run lifecycle.
+type RunRow struct {
+	ID, TaskID, StartedAt, EndedAt, Outcome string
+}
+
+// StartRun opens a new run for a task: inserts a row with started_at=now,
+// ended_at=NULL, and returns the new run id. Called by SubLoop at Run entry
+// (spec §4.1). A task may have many runs across park/resume.
+func (s *Store) StartRun(taskID string) (string, error) {
+	id := newID("run")
+	_, err := s.db.Exec(
+		`INSERT INTO runs(id, task_id, started_at, ended_at, outcome, total_tokens, retry_count)
+		 VALUES(?,?,?,NULL,'',0,0)`,
+		id, taskID, nowISO())
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// EndRun closes a run with its terminal outcome (spec §4.1). Idempotent in
+// spirit: SubLoop calls it exactly once per run via defer. outcome is one of
+// done|blocked|needs-review|cancelled|error.
+func (s *Store) EndRun(runID, outcome string) error {
+	_, err := s.db.Exec(`UPDATE runs SET ended_at=?, outcome=? WHERE id=?`,
+		nowISO(), outcome, runID)
+	return err
+}
+
+// ActiveRun returns the open run (ended_at IS NULL) for a task — the run a
+// running task currently occupies. ok is false when no open run exists.
+func (s *Store) ActiveRun(taskID string) (runID, startedAt string, ok bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT id, started_at FROM runs WHERE task_id=? AND ended_at IS NULL
+		 ORDER BY rowid DESC LIMIT 1`, taskID).Scan(&runID, &startedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return runID, startedAt, true, nil
+}
+
+// RunsOfTask returns every run of a task, oldest first (rowid = insertion
+// order). Used by the TUI trace tab to group steps per run (spec §4.1/§5[3]).
+func (s *Store) RunsOfTask(taskID string) ([]RunRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, started_at, COALESCE(ended_at,''), COALESCE(outcome,'')
+		 FROM runs WHERE task_id=? ORDER BY rowid`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RunRow
+	for rows.Next() {
+		var r RunRow
+		if err := rows.Scan(&r.ID, &r.TaskID, &r.StartedAt, &r.EndedAt, &r.Outcome); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Replay(runID string) ([]StepRow, error) {
 	rows, err := s.db.Query(
 		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,

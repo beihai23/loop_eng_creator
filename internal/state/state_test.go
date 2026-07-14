@@ -1,6 +1,9 @@
 package state
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestInsertAndGetTask(t *testing.T) {
 	s, err := Open(t.TempDir() + "/state.db")
@@ -244,5 +247,65 @@ func TestParkedTasksAndResumeTransitions(t *testing.T) {
 	// After resume A is no longer parked.
 	if parked2, _ := s.ParkedTasks(); len(parked2) != 0 {
 		t.Fatalf("A resumed → no parked tasks, got %+v", parked2)
+	}
+}
+
+func TestStartEndRun(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	tid, err := s.InsertTask(TaskRow{IssueRef: "o/r#1", Description: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rid, err := s.StartRun(tid)
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if rid == "" || !strings.HasPrefix(rid, "run_") {
+		t.Fatalf("runID want run_ prefix, got %q", rid)
+	}
+
+	// ActiveRun 看到未结束的 run
+	gotID, _, ok, err := s.ActiveRun(tid)
+	if err != nil || !ok || gotID != rid {
+		t.Fatalf("ActiveRun = %q %v %v, want %q true nil", gotID, ok, err, rid)
+	}
+
+	if err := s.EndRun(rid, "done"); err != nil {
+		t.Fatalf("EndRun: %v", err)
+	}
+
+	// 结束后 ActiveRun 无活跃 run
+	if _, _, ok, err := s.ActiveRun(tid); err != nil || ok {
+		t.Fatalf("ActiveRun after EndRun: ok=%v err=%v, want false nil", ok, err)
+	}
+
+	runs, err := s.RunsOfTask(tid)
+	if err != nil {
+		t.Fatalf("RunsOfTask: %v", err)
+	}
+	if len(runs) != 1 || runs[0].Outcome != "done" || runs[0].EndedAt == "" {
+		t.Fatalf("RunsOfTask = %+v, want 1 done run with EndedAt", runs)
+	}
+}
+
+func TestRunsOfTaskMultipleRuns(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+	tid, _ := s.InsertTask(TaskRow{IssueRef: "o/r#1", Description: "d"})
+
+	r1, _ := s.StartRun(tid)
+	_ = s.EndRun(r1, "needs-review")
+	r2, _ := s.StartRun(tid)
+	_ = s.EndRun(r2, "done")
+
+	runs, _ := s.RunsOfTask(tid)
+	if len(runs) != 2 {
+		t.Fatalf("want 2 runs, got %d", len(runs))
 	}
 }
