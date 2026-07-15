@@ -39,17 +39,16 @@ type Outcome struct {
 // on verify failure up to Budget.MaxRetries. Each attempt executes in a fresh
 // worktree; a non-passing attempt discards that worktree.
 type SubLoop struct {
-	Repo                string
-	Store               *state.Store
-	Budget              *budget.Enforcer
-	Execute             model.Executer
-	Plan                skill.Skill[skill.PlanInput, skill.PlanOutput]
-	VerifyDeterministic []verify.Deterministic // tier1：Dir 每轮设为 wt
-	VerifyLLM           verify.LLM             // tier2
-	Tier3Human          bool                   // tier3 开关：true 时挂 tier-3（HumanTier，否则回落 HumanStub）
-	HumanTier           verify.Tier            // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
-	Channel             channel.Channel
-	PreinsertedTaskID   string // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
+	Repo              string
+	Store             *state.Store
+	Budget            *budget.Enforcer
+	Execute           model.Executer
+	Plan              skill.Skill[skill.PlanInput, skill.PlanOutput]
+	VerifyLLM         verify.LLM  // tier2
+	Tier3Human        bool        // tier3 开关：true 时挂 tier-3（HumanTier，否则回落 HumanStub）
+	HumanTier         verify.Tier // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
+	Channel           channel.Channel
+	PreinsertedTaskID string // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
 
 	// Log is the observability sink for phase start/done, retry, and budget
 	// events. When nil, defaults to os.Stderr with a "[subloop]" prefix. Tests
@@ -81,13 +80,23 @@ func shortID(id string) string {
 	return id
 }
 
-// tiersFor 在每轮按 worktree 重建 tier 链：tier1（在 wt 里跑）→ tier2 → tier3。
-// 这是裁决 E 的落地——execute 已 worktree 化（Task 2/3），故 tier1 的 Dir 可注入。
-func (sl *SubLoop) tiersFor(wt string) []verify.Tier {
+// tiersFor 在每轮按 worktree + plan 产出重建 tier 链：tier1（plan 产出的验收脚本，
+// 在 wt 里跑）→ tier2 → tier3。
+//
+// tier-1 完全来自 plan（planOut.VerifyScript），无任何静态/兜底列表：
+//   - plan 产出且 Valid（非空、有运行命令）→ 挂 tier-1（Dir=wt，脚本 body 先落盘）。
+//   - plan 未产出（VerifyScript=nil）→ tier-1 缺席，链直接落 tier-2。
+//   - plan 产出了但非法（缺运行命令等）→ Run 已记一行，这里同样跳过，落 tier-2。
+func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput) []verify.Tier {
 	var tiers []verify.Tier
-	for _, d := range sl.VerifyDeterministic {
-		d.Dir = wt
-		tiers = append(tiers, d)
+	if s := planOut.VerifyScript; s.Valid() {
+		tiers = append(tiers, verify.Deterministic{
+			Label:      labelOf(s),
+			Cmd:        s.Run,
+			Dir:        wt,
+			ScriptFile: s.File,
+			ScriptBody: s.Body,
+		})
 	}
 	tiers = append(tiers, sl.VerifyLLM)
 	// tier-3：M3 注入了真人审 tier（HumanTier）就用它；否则 Tier3Human 时挂 HumanStub
@@ -99,6 +108,18 @@ func (sl *SubLoop) tiersFor(wt string) []verify.Tier {
 		tiers = append(tiers, verify.HumanStub{})
 	}
 	return tiers
+}
+
+// labelOf picks the tier-1 observability tag from a plan verify script, falling
+// back to the run command (or "tier-1") when the planner left Label blank.
+func labelOf(s *skill.PlanVerifyScript) string {
+	if s.Label != "" {
+		return s.Label
+	}
+	if len(s.Run) > 0 {
+		return strings.Join(s.Run, " ")
+	}
+	return "tier-1"
 }
 
 // planExecEstimate is the conservative per-call token estimate SubLoop feeds
@@ -171,7 +192,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
 		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
-		_, u, err := sl.Plan.Run(ctx, skill.PlanInput{
+		planOut, u, err := sl.Plan.Run(ctx, skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
 		})
@@ -188,6 +209,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			continue
 		}
 		sl.logf("[subloop] %s phase=plan done", sid)
+		// plan 产出验收脚本但非法（缺运行命令等）→ tier-1 缺席，落 tier-2。记一行可观测。
+		// plan 未产出是正常分支（判定不可脚本化 → tier-2），不算异常，不打 warning。
+		if vs := planOut.VerifyScript; vs != nil && !vs.Valid() {
+			sl.logf("[subloop] %s plan verify_script invalid (run command missing?) — skip tier-1, fall to tier-2", sid)
+		}
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
 		if ok, _ := sl.Store.CancelRequested(taskID); ok {
@@ -246,7 +272,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- verify (Chain of tiers; independent judgment) ----
 		sl.logf("[subloop] %s phase=verify start", sid)
 		_ = sl.Store.SetInFlight(taskID, "verify")
-		res, err := verify.Chain(ctx, sl.tiersFor(wt), diff, task.AcceptanceCriteria, priorFailure)
+		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut), diff, task.AcceptanceCriteria, priorFailure)
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
 		// 且 failing_criteria 随行落库——修 #10 黑箱（旧 trace 只剩空的 detail=）。

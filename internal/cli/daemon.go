@@ -50,22 +50,18 @@ func NewDaemonCmd() *cobra.Command {
 				bz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
 				exec, plan, verifySkill, _ := buildModels(cfg, models, bz)
 
-				dets := make([]verify.Deterministic, 0, len(cfg.Verify.Deterministic))
-				for _, d := range cfg.Verify.Deterministic {
-					dets = append(dets, verify.Deterministic{Label: d.Label, Cmd: d.Cmd})
-				}
-
+				// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
+				// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
 				sl := &loop.SubLoop{
-					Repo:                repo,
-					Store:               st,
-					Budget:              bz,
-					Execute:             exec,
-					Plan:                plan,
-					VerifyDeterministic: dets,
-					VerifyLLM:           verify.LLM{Skill: verifySkill},
-					Tier3Human:          cfg.Verify.Tier3Human,
-					Channel:             ch,
-					PreinsertedTaskID:   task.ID,
+					Repo:              repo,
+					Store:             st,
+					Budget:            bz,
+					Execute:           exec,
+					Plan:              plan,
+					VerifyLLM:         verify.LLM{Skill: verifySkill},
+					Tier3Human:        cfg.Verify.Tier3Human,
+					Channel:           ch,
+					PreinsertedTaskID: task.ID,
 				}
 
 				ct := channel.Task{

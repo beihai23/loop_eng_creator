@@ -9,6 +9,7 @@ package skill
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"loop-eng/internal/model"
 )
@@ -67,6 +68,54 @@ type PlanStep struct {
 type PlanOutput struct {
 	Plan  []PlanStep `json:"plan"`
 	Risks []string   `json:"risks"`
+	// VerifyScript is the tier-1 acceptance script the planner emits when it
+	// judges the task scriptable. It REPLACES the old static
+	// config.verify.deterministic list — tier-1 is now per-task, produced by
+	// plan. nil (or invalid) ⇒ tier-1 absent ⇒ the verify chain falls straight
+	// to tier-2 (LLM). No static/fallback list anywhere.
+	VerifyScript *PlanVerifyScript `json:"verify_script,omitempty"`
+}
+
+// PlanVerifyScript is the plan-produced tier-1 acceptance script: a runnable
+// command (Run) plus, optionally, a multi-line script body (Body) the tier
+// writes into the worktree before running. The tech stack is chosen by the
+// planner — Go/Node/Python/Rust/... all flow through the same {run, body, file}
+// shape. There is no static config list behind this; every tier-1 script comes
+// from a PlanOutput.
+//
+// Fields:
+//   - Run:  the run command (REQUIRED), executed in the worktree root; exit 0
+//     = pass. e.g. ["go","test","./..."], ["sh","-c","CGO_ENABLED=0 go build ./..."],
+//     ["npm","test"], ["sh","verify.sh"].
+//   - Body: optional script source. When non-empty the tier writes it to
+//     <worktree>/<File> first, then runs Run — for multi-line scripts.
+//   - File: worktree-relative path Body is written to. REQUIRED when Body is
+//     non-empty (nowhere to land otherwise).
+//   - Label: optional one-line observability tag (lands in the verify trace).
+type PlanVerifyScript struct {
+	Label string   `json:"label,omitempty"`
+	File  string   `json:"file,omitempty"`
+	Body  string   `json:"body,omitempty"`
+	Run   []string `json:"run"`
+}
+
+// Valid reports whether a plan-produced verify script is runnable — the basic
+// plan-output validation (non-empty + has a run command). A nil receiver ("plan
+// did not produce one") is NOT invalid, it is absent: callers treat absent as
+// "skip tier-1, fall to tier-2". Invalid means "plan produced a script that
+// cannot run" (missing Run, or a Body with no File to land in) — callers also
+// drop it to tier-2 and log the drop.
+func (s *PlanVerifyScript) Valid() bool {
+	if s == nil {
+		return false
+	}
+	if len(s.Run) == 0 { // 必须有运行命令
+		return false
+	}
+	if strings.TrimSpace(s.Body) != "" && s.File == "" { // 有 body 必须有落盘文件
+		return false
+	}
+	return true
 }
 
 type VerifyInput struct {

@@ -98,7 +98,7 @@ type: feature
 
 | 想干什么 | 改哪里 | 说明 |
 |---|---|---|
-| 配项目测试 / lint 命令 | `verify.deterministic` | 列表，每项 `{ label, cmd }`；在 worktree 里按序跑，看退出码。例：`{ label: tests, cmd: ["go","test","./..."] }` |
+| tier-1 验收脚本 | —（不在 config 里） | 由 **plan 按每个任务产出**（`PlanOutput.verify_script`），按项目技术栈写成脚本，在 worktree 里跑，看退出码。不可脚本化的任务 plan 不产出，直接落 tier-2。 |
 | 关掉人工复核（纯自动跑） | `verify.tier3_human` | `false` 则跳过人工复核这一关 |
 | 调预算（三道刹车） | `budget.per_call_tokens` / `per_task_tokens` / `max_retries` | 单次调用 / 单任务 / 最大重试。**三项必填且必须 > 0**，否则拒绝启动 |
 | 给某角色换模型 | `models.<role>.name` | 可选；默认用 claude 的默认模型。`<role>` ∈ triage / plan / execute / verify |
@@ -116,7 +116,7 @@ type: feature
 | 命令 | 用途 |
 |---|---|
 | `loop-eng init [--repo <path>]` | 在仓库生成 `.loop/`，并把 `.loop/` 加进 `.gitignore`。 |
-| `loop-eng task new <desc> [--repo <path>] [--type feature\|bugfix\|docs\|refactor]` | 生成 `inbox/<n>.md`，自动检测项目语言（go/node/rust/python/java）并建议验收标准 + verify 命令。 |
+| `loop-eng task new <desc> [--repo <path>] [--type feature\|bugfix\|docs\|refactor]` | 生成 `inbox/<n>.md`，自动检测项目语言（go/node/rust/python/java）并建议验收标准。 |
 | `loop-eng run-once [--repo <path>] [--models real\|fake] [--channel local\|github]` | **同步**：捞 inbox 第一个任务，跑完整 plan→execute→verify→writeback；`done` 自动 land。 |
 | `loop-eng daemon [--repo <path>] [--channel local\|github] [--models real\|fake] [--poll-interval <dur>] [--cooldown <dur>]` | **常驻**：轮询工单、逐个跑、park/resume、崩溃可恢复。`--cooldown` 是上游瞬时阻塞（如限流）后的派发冷却。 |
 | `loop-eng status [--repo <path>] [--task <id>] [--watch]` | 打印任务态；`--watch` 实时刷新（Ctrl-C 退出）。 |
@@ -138,7 +138,7 @@ type: feature
 计划   读落盘状态 + 任务 + 验收标准 → 执行计划（不写代码）
 执行   在 worktree 里：计划 + 任务 + 标准 → diff + 自报（只是信号）
 验证   三层链，按序短路：
-         第一层  确定性脚本（你在 config 里配的测试/lint）   ─不过→ 反馈
+         第一层  确定性脚本（plan 按任务产出，按技术栈，在 worktree 里跑）   ─不过→ 反馈
          第二层  claude 新会话：只给 diff + 验收标准            ─不过→ 反馈
          第三层  异步人审：发 review 评论 → 挂起 → 等回复
        第一层 + 第二层全过 → 写回 → done → 自动 land 到主分支
