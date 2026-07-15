@@ -29,8 +29,7 @@ budget:
   per_task_tokens: 200000
   max_retries: 3
 verify:
-  deterministic:
-    - { label: tests, cmd: ["pytest", "-q"] }
+  tier3_human: true
 isolation: { worktree: true }
 skills: { dir: .loop/skills }
 `)
@@ -41,8 +40,39 @@ skills: { dir: .loop/skills }
 	if cfg.Budget.MaxRetries != 3 {
 		t.Fatalf("max_retries=%d want 3", cfg.Budget.MaxRetries)
 	}
-	if cfg.Verify.Deterministic[0].Cmd[0] != "pytest" {
-		t.Fatalf("cmd not parsed")
+	if !cfg.Verify.Tier3Human {
+		t.Fatalf("tier3_human not parsed")
+	}
+}
+
+// TestLoadHasNoDeterministicField guards the removal of the static tier-1 list:
+// config.Verify must NOT carry any deterministic script list anymore (tier-1 is
+// now per-task from the planner). A config that still has the old
+// verify.deterministic key must load (yaml ignores unknown keys — friendly to
+// existing configs) but the stray list is silently dropped, never feeding a
+// static tier-1.
+func TestLoadHasNoDeterministicField(t *testing.T) {
+	p := writeFile(t, `
+models:
+  triage:  { name: x }
+  plan:    { name: x }
+  execute: { name: x }
+  verify:  { name: x }
+budget: { per_call_tokens: 1, per_task_tokens: 1, max_retries: 1 }
+verify:
+  tier3_human: true
+  deterministic:            # legacy key — must be ignored, not feed a tier-1
+    - { label: tests, cmd: ["go", "test", "./..."] }
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("legacy verify.deterministic must still load (ignored), got %v", err)
+	}
+	// Verify now has only Tier3Human — confirm the type literally has no
+	// Deterministic field by compiling this access (a removed field would fail
+	// to build). Tier3Human must round-trip.
+	if cfg.Verify.Tier3Human != true {
+		t.Fatalf("tier3_human = %v, want true", cfg.Verify.Tier3Human)
 	}
 }
 

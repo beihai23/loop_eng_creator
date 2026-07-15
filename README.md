@@ -30,7 +30,7 @@
 计划   plan skill       读落盘状态 + 任务 + 验收标准 → 执行计划（不写代码）
 执行   `claude -p`       在 worktree 里：计划 + 任务 + 标准 → diff + 自报（只是信号）
 验证   三层链，按序短路：
-         tier 1  确定性脚本（你在 config 里配的测试/lint 命令）   ─不过→ 反馈
+         tier 1  确定性脚本（plan 按任务产出的验收脚本，在 worktree 里跑） ─不过→ 反馈
          tier 2  `claude -p` 新鲜会话：只给 diff + 验收标准        ─不过→ 反馈
          tier 3  异步人审：发 review-request 评论 → park → 等回复
        tier 1/2 全过 → 写回 → done → 自动 FF-merge 到主分支
@@ -175,10 +175,9 @@ budget:
   per_task_tokens: 200000     # 单任务 token 上限
   max_retries: 3              # 最大重试次数
 verify:
-  deterministic: []           # 配你项目的确定性检查，tier-1 按序跑
-  # 例：- { label: tests, cmd: ["go", "test", "./..."] }
-  #     - { label: build, cmd: ["sh", "-c", "CGO_ENABLED=0 go build ./..."] }
   tier3_human: true           # 关掉则跳过 tier-3（纯自动跑时）
+  # 注意：tier-1 的确定性验收脚本不在 config 里配——由 plan 按每个任务产出
+  # （PlanOutput.verify_script），在 worktree 里跑。不可脚本化的任务直接落 tier-2。
 isolation: { worktree: true } # 每个子循环在 .loop/worktrees/<run-id>/ 里执行
 skills: { dir: .loop/skills } # 此目录下同名文件覆盖内置 skill
 channel: { provider: local }  # local | github
@@ -192,7 +191,7 @@ daemon: { poll_interval: 60s }# daemon 轮询间隔（<=0 时回落 --poll-inter
 | `models.<role>` | `binary` / `cmd` | 四个角色（triage/plan/execute/verify）全走 `claude -p`，每次调用开**新会话**（验证独立性的一部分）。`cmd` 透传给 `claude`。 |
 | | `name` | 可选：给某角色指定模型（→ `claude --model <name>`），默认用 claude 的默认模型。 |
 | `budget` | 三道刹车 | **三者的存在本身不可配**；值缺失/非法（<=0）= 加载硬错误。 |
-| `verify.deterministic` | `label` / `cmd` | tier-1 在 worktree 里按序跑这些命令，看退出码 + 输出。脚本报错按「失败带详情」处理，绝不静默通过。 |
+| `verify` | `tier3_human` | tier-1 的确定性验收脚本**不在 config 里**——由 plan 按每个任务产出（`PlanOutput.verify_script`：脚本内容 + 运行方式，技术栈由 plan 选），在 worktree 里跑，看退出码 + 输出。不可脚本化的任务 plan 不产出，直接落 tier-2。脚本报错按「失败带详情」处理，绝不静默通过。 |
 | `channel` | `provider` | `local`：读 `<repo>/inbox/*.md`，写 `<repo>/outbox/`、`<repo>/status/`。`github`：经已认证的 `gh` CLI，按 `task_label` 过滤 issue，评论=战报，状态用 `loop:<status>` 标签。 |
 | | `repo` / `task_label` | 仅 `github` 必填（`owner/name` + issue 过滤标签，如 `loop:task`）。 |
 
@@ -227,7 +226,7 @@ v1 = 子项目 1（核心地基）。分三个里程碑交付，**目前 M1/M2/M
 ## 开发
 
 ```sh
-make test     # CGO_ENABLED=0 go test ./...（loop-eng 自己的 verify.deterministic 就是这条）
+make test     # CGO_ENABLED=0 go test ./...（loop-eng 自举时 plan 产出的 tier-1 验收脚本就是这条）
 make fmt vet
 ```
 

@@ -60,8 +60,13 @@ func TestTaskNewUnknownLanguage(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(repo, "inbox", "1.md"))
-	if !strings.Contains(string(body), "verify.deterministic") {
-		t.Fatalf("unknown language should suggest configuring verify: %s", body)
+	// tier-1 验收脚本现在由 plan 产出，不在 config 里——未知语言应指向 plan/tier-1，
+	// 而非旧的「配置 verify.deterministic」。
+	if strings.Contains(string(body), "verify.deterministic") {
+		t.Fatalf("unknown language must NOT reference the removed config verify.deterministic: %s", body)
+	}
+	if !strings.Contains(string(body), "tier-1") {
+		t.Fatalf("unknown language should point to plan-driven tier-1: %s", body)
 	}
 }
 

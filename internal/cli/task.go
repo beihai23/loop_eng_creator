@@ -49,8 +49,9 @@ func newTaskNewCmd() *cobra.Command {
 			fmt.Printf("Task created: %s\n", path)
 			fmt.Printf("Detected language: %s\n", lang)
 			if verifyCmd != "" {
-				fmt.Printf("Suggested verify command: %s\n", verifyCmd)
-				fmt.Printf("  → add to .loop/config.yaml: verify.deterministic: [{label: tests, cmd: [%s]}]\n", quoteCmd(verifyCmd))
+				// tier-1 验收脚本由 plan 按任务产出（PlanOutput.verify_script），不再写进
+				// config——这里只把检测到的测试命令作为信息提示。
+				fmt.Printf("Suggested verify command: %s (plan 会据此自动产出 tier-1 验收脚本，无需写进 config)\n", verifyCmd)
 			}
 			if buildCmd != "" {
 				fmt.Printf("Suggested build: %s\n", buildCmd)
@@ -124,7 +125,7 @@ func suggestCriteria(lang string) (verifyCmd, buildCmd, criteria string) {
 	default:
 		criteria = "- [ ] 满足任务描述的全部要求\n" +
 			"- [ ] 不破坏现有功能\n" +
-			"- [ ] 配置好 .loop/config.yaml 的 verify.deterministic（测试命令）"
+			"- [ ] 可脚本化的验收由 plan 产出 tier-1 脚本；不可脚本化的交 tier-2/tier-3"
 	}
 	return
 }
@@ -140,14 +141,4 @@ func nextInboxNumber(inboxDir string) int {
 		}
 	}
 	return max + 1
-}
-
-// quoteCmd turns "go test ./..." into "\"go\", \"test\", \"./...\"" for YAML.
-func quoteCmd(cmd string) string {
-	parts := strings.Fields(cmd)
-	quoted := make([]string, len(parts))
-	for i, p := range parts {
-		quoted[i] = "\"" + p + "\""
-	}
-	return strings.Join(quoted, ", ")
 }

@@ -44,11 +44,11 @@ type Budget struct {
 	MaxRetries    int `yaml:"max_retries"`
 }
 
+// Verify carries the verify-chain config. There is NO static tier-1 script list
+// here — tier-1 acceptance scripts are produced per-task by the planner
+// (skill.PlanOutput.VerifyScript) and run in the worktree. config only carries
+// the tier-3 human-review switch.
 type Verify struct {
-	Deterministic []struct {
-		Label string   `yaml:"label"`
-		Cmd   []string `yaml:"cmd"`
-	} `yaml:"deterministic"`
 	Tier3Human bool `yaml:"tier3_human"`
 }
 

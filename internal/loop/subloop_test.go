@@ -99,24 +99,218 @@ func TestSubLoopTier1FailBlocks(t *testing.T) {
 	repo := initRepo(t)
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
+	// plan 产出一个永远失败的 tier-1 验收脚本（run=false）→ tier-1 挂、短路 → blocked。
+	// tier-1 完全来自 plan，无静态 config 列表。
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"false"}}}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}), // tier-2 本会过，但 tier-1 先短路
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "3", Description: "d"})
+	if out.Status != "blocked" {
+		t.Fatalf("plan tier-1 always-fail must block, got %s", out.Status)
+	}
+}
+
+// TestSubLoopPlanScriptRunsTier1 钉死「plan 产出脚本 → tier-1 执行」：plan 产出一个
+// 会通过的 tier-1 验收脚本（在 worktree 写一个 sentinel 文件后 exit 0）。tier-2 也过
+// ⇒ done，且 sentinel 文件存在 + 逐 tier 行里有 tier=1 已过 ⇒ tier-1 脚本确实在 worktree
+// 里跑了（不是被跳过）。tier-1 完全来自 plan，无静态/兜底列表。
+func TestSubLoopPlanScriptRunsTier1(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	script := &skill.PlanVerifyScript{
+		Label: "sentinel",
+		File:  "verify_tier1.sh",
+		Body:  "#!/bin/sh\necho ran > tier1-ran\n",
+		Run:   []string{"sh", "verify_tier1.sh"},
+	}
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: script}),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
 	sl := &SubLoop{
-		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
-		Execute:             fake,
-		Plan:                mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		VerifyDeterministic: []verify.Deterministic{{Label: "go-test", Cmd: []string{"false"}}}, // 永远失败
-		VerifyLLM:           verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
-		Tier3Human:          true,
-		Channel:             channel.NewLocal(t.TempDir()),
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
 	}
-	out, _ := sl.Run(context.Background(), channel.Task{Ref: "3", Description: "d"})
-	if out.Status != "blocked" {
-		t.Fatalf("tier1 always-fail must block, got %s", out.Status)
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "60", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	// sentinel 文件存在 ⇒ tier-1 脚本确在 worktree 里跑过
+	got, rerr := os.ReadFile(filepath.Join(out.Worktree, "tier1-ran"))
+	if rerr != nil {
+		t.Fatalf("tier-1 sentinel not written — script did not run: %v", rerr)
+	}
+	if strings.TrimSpace(string(got)) != "ran" {
+		t.Fatalf("sentinel content = %q, want %q", got, "ran")
+	}
+	// 逐 tier 行里必有 tier=1 且过——对称地证明 tier-1 在场（与下面的 skip 测试对照）
+	t1 := false
+	for _, v := range verificationsOf(t, st) {
+		if v.Tier == 1 && v.Passed {
+			t1 = true
+		}
+	}
+	if !t1 {
+		t.Fatalf("expected a passing tier=1 verification row, got %+v", verificationsOf(t, st))
+	}
+}
+
+// TestSubLoopNoPlanScriptSkipsTier1 钉死「plan 不产出 → 跳过 tier-1 落 tier-2」：plan
+// VerifyScript=nil ⇒ Deterministic tier 不挂，链 = [LLM, HumanStub]。逐 tier 行恰好 2 条
+// （产脚本时是 3 条）+ done ⇒ deterministic tier-1 没跑、LLM（tier-2）拍板通过。
+func TestSubLoopNoPlanScriptSkipsTier1(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}), // 无 VerifyScript —— 不可脚本化
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "61", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	vs := verificationsOf(t, st)
+	// plan 没产脚本 ⇒ tiersFor 不挂 Deterministic，链 = [LLM, HumanStub] ⇒ 恰好 2 条逐
+	// tier 行（产脚本时会是 3 条）。结合 done（LLM 必过）证明 deterministic tier-1 缺席。
+	if len(vs) != 2 {
+		t.Fatalf("want exactly 2 verification rows (LLM + human-stub; no deterministic tier-1), got %d: %+v", len(vs), vs)
+	}
+}
+
+// TestSubLoopInvalidPlanScriptSkipsTier1：plan 产出了一个非法脚本（缺运行命令）⇒ SubLoop
+// 丢弃它、tier-1 缺席、落 tier-2（不制造假绿灯、也不整任务失败）。验证链第一条须是 tier=2。
+func TestSubLoopInvalidPlanScriptSkipsTier1(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "bad"}}), // 无 Run
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	var buf bytes.Buffer
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+		Log:        log.New(&buf, "", log.Lmsgprefix),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "62", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("invalid plan script must fall to tier-2 (done), got %s (%s)", out.Status, out.Detail)
+	}
+	if !strings.Contains(buf.String(), "verify_script invalid") {
+		t.Fatalf("expected an invalid-script log line, got:\n%s", buf.String())
+	}
+	// 非法脚本被丢 ⇒ 同样不挂 Deterministic，链 = [LLM, HumanStub] ⇒ 2 条逐 tier 行。
+	if len(verificationsOf(t, st)) != 2 {
+		t.Fatalf("invalid plan script must be dropped → 2 verification rows (no deterministic tier-1), got %+v", verificationsOf(t, st))
+	}
+}
+
+// TestTiersForPlanDriven 是 tiersFor 的直接单测——权威地钉死「tier-1 完全来自 plan」：
+// plan 产出合法脚本 ⇒ 链首是 verify.Deterministic；未产出 / 产出非法 ⇒ 没有 Deterministic，
+// LLM 成为链首（落 tier-2）。无任何静态/兜底来源。tier 编号是位置序号（Chain 里 i+1），
+// 故这里按类型断言，而不是按 tier 号。
+func TestTiersForPlanDriven(t *testing.T) {
+	sl := &SubLoop{Tier3Human: true}
+
+	// plan 产出合法脚本（纯命令）→ Deterministic 在链首。
+	with := skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"go", "test", "./..."}}}
+	tiers := sl.tiersFor("/wt", with)
+	if len(tiers) != 3 {
+		t.Fatalf("valid script: want 3 tiers (det+llm+human), got %d", len(tiers))
+	}
+	d, ok := tiers[0].(verify.Deterministic)
+	if !ok {
+		t.Fatalf("valid script: tier[0] must be verify.Deterministic, got %T", tiers[0])
+	}
+	if d.Dir != "/wt" || len(d.Cmd) != 3 || d.Cmd[0] != "go" {
+		t.Fatalf("deterministic tier not wired from plan script: %+v", d)
+	}
+
+	// plan 产出带 body 的脚本 → body/file 透传到 Deterministic。
+	withBody := skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{File: "v.sh", Body: "echo ok", Run: []string{"sh", "v.sh"}}}
+	tiers2 := sl.tiersFor("/wt", withBody)
+	d2, _ := tiers2[0].(verify.Deterministic)
+	if d2.ScriptFile != "v.sh" || d2.ScriptBody != "echo ok" {
+		t.Fatalf("script body/file not passed through: %+v", d2)
+	}
+
+	// plan 未产出 → 无 Deterministic，LLM 是链首。
+	none := skill.PlanOutput{}
+	tiers3 := sl.tiersFor("/wt", none)
+	if _, ok := tiers3[0].(verify.Deterministic); ok {
+		t.Fatal("no script: tier[0] must NOT be Deterministic (tier-1 absent)")
+	}
+	if _, ok := tiers3[0].(verify.LLM); !ok {
+		t.Fatalf("no script: tier[0] must be verify.LLM (fall to tier-2), got %T", tiers3[0])
+	}
+
+	// plan 产出非法（缺 Run）→ 同样无 Deterministic。
+	invalid := skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "bad"}}
+	tiers4 := sl.tiersFor("/wt", invalid)
+	if _, ok := tiers4[0].(verify.Deterministic); ok {
+		t.Fatal("invalid script: tier[0] must NOT be Deterministic (dropped to tier-2)")
+	}
+}
+
+// verificationsOf returns the per-tier verification rows for the (single) run of
+// the (single) task these subloop tests insert. Run inserts the task itself, so
+// its status row is the one and only task; that task has exactly one run here.
+func verificationsOf(t *testing.T, st *state.Store) []state.VerificationRow {
+	t.Helper()
+	statuses, err := st.ListStatuses()
+	if err != nil || len(statuses) != 1 {
+		t.Fatalf("want exactly 1 task status, got %d (err %v)", len(statuses), err)
+	}
+	runs, err := st.RunsOfTask(statuses[0].ID)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("want 1 run, got %d (err %v)", len(runs), err)
+	}
+	vs, err := st.VerificationsByRun(runs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return vs
 }
 
 // TestSubLoopWritesBudgetLedger closes the M1 deferral: every budget check in
@@ -213,26 +407,25 @@ func TestSubLoopWritesStatusDone(t *testing.T) {
 	}
 }
 
-// TestSubLoopWritesStatusBlocked: tier1 always-fail → blocked, and the blocked
-// outcome must mark the ticket status — for Local, status/<ref> == "blocked".
+// TestSubLoopWritesStatusBlocked: plan 产出 tier-1 脚本（run=false 永失败）→ blocked，
+// 且 blocked 结局必须把工单态标成 "blocked"——Local 即 status/<ref> == "blocked"。
 func TestSubLoopWritesStatusBlocked(t *testing.T) {
 	repo := initRepo(t)
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"false"}}}), // tier-1 永失败
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
 	root := t.TempDir()
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
-		Execute:             fake,
-		Plan:                mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		VerifyDeterministic: []verify.Deterministic{{Label: "go-test", Cmd: []string{"false"}}}, // tier1 永失败
-		VerifyLLM:           verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
-		Tier3Human:          true,
-		Channel:             channel.NewLocal(root),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(root),
 	}
 	out, _ := sl.Run(context.Background(), channel.Task{Ref: "8", Description: "d"})
 	if out.Status != "blocked" {
@@ -383,9 +576,9 @@ func TestSubLoopDoneCommitsWorktree(t *testing.T) {
 	})
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
-		Execute:   fileWriteExec{},
-		Plan:      mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Execute:    fileWriteExec{},
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
 		Tier3Human: true,
 		Channel:    channel.NewLocal(t.TempDir()),
 	}
@@ -433,12 +626,12 @@ func TestSubLoopPhaseLogsAsserts(t *testing.T) {
 	var buf bytes.Buffer
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
-		Execute:  fake,
-		Plan:     mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
 		Tier3Human: true,
-		Channel:   channel.NewLocal(t.TempDir()),
-		Log:       log.New(&buf, "", log.Lmsgprefix),
+		Channel:    channel.NewLocal(t.TempDir()),
+		Log:        log.New(&buf, "", log.Lmsgprefix),
 	}
 
 	out, err := sl.Run(context.Background(), channel.Task{Ref: "30", Description: "d", AcceptanceCriteria: []string{"c"}})
@@ -480,12 +673,12 @@ func TestSubLoopRetryLogs(t *testing.T) {
 	var buf bytes.Buffer
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
-		Execute:  fake,
-		Plan:     mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
-		VerifyLLM: verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
 		Tier3Human: true,
-		Channel:   channel.NewLocal(t.TempDir()),
-		Log:       log.New(&buf, "", log.Lmsgprefix),
+		Channel:    channel.NewLocal(t.TempDir()),
+		Log:        log.New(&buf, "", log.Lmsgprefix),
 	}
 
 	out, _ := sl.Run(context.Background(), channel.Task{Ref: "31", Description: "d"})

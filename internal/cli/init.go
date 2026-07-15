@@ -16,10 +16,10 @@ import (
 var skillFiles embed.FS
 
 // defaultConfig: all roles via `claude -p`, NO model pinned (model-agnostic; no
-// SDK, no API key, no alias drift). verify.deterministic is EMPTY by default —
-// configure your project's test command in .loop/config.yaml (e.g.
-// ["pytest","-q"] or ["go","test","./..."]). Per-role model opt-in: set `name`
-// in .loop/config.yaml if a role needs a different model.
+// SDK, no API key, no alias drift). There is NO static tier-1 script list —
+// tier-1 acceptance scripts are produced per-task by the planner and run in the
+// worktree. Per-role model opt-in: set `name` in .loop/config.yaml if a role
+// needs a different model.
 var defaultConfig = `
 models:
   triage:  { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
@@ -31,7 +31,6 @@ budget:
   per_task_tokens: 200000
   max_retries: 3
 verify:
-  deterministic: []   # 配你项目的测试命令，如 { label: tests, cmd: ["pytest","-q"] }
   tier3_human: true
 isolation: { worktree: true }
 skills: { dir: .loop/skills }

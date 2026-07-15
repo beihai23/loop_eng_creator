@@ -54,7 +54,7 @@ func TestRunOnceEndToEnd(t *testing.T) {
 // flag (here: local) and still wires the SubLoop end-to-end — init a repo,
 // drop an inbox task, run-once --channel local --models fake, assert the
 // terminal battle report landed in outbox. This is the assembly test for
-// Task 6: --channel flag + buildChannel + tier1 from cfg.Verify.Deterministic.
+// Task 6: --channel flag + buildChannel (tier-1 is now plan-driven, not config).
 // It exercises the local provider path (no real `gh` call).
 func TestRunOnceGitHubPathWiresChannel(t *testing.T) {
 	repo := t.TempDir()
