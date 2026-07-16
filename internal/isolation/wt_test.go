@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,4 +89,31 @@ func TestCreateReturnsAbsolutePath(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+// TestCreateToleratesLeftoverBranch: 一个残留的分支（上次 run 在 Discard 前崩溃、
+// land 失败、或手工遗留）不得让下一次 Create 崩。用 -B 强制重置，而非 -b 的
+// "already exists" 报错（#20 在 retry attempt 2 正是栽在这）。
+func TestCreateToleratesLeftoverBranch(t *testing.T) {
+	repo := initRepo(t)
+	// 第一次 create，然后只删 worktree、留分支（模拟崩溃前没跑到 Discard）。
+	wt, err := Create(repo, "run-leftover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "worktree", "remove", "--force", wt).CombinedOutput(); err != nil {
+		t.Fatalf("remove worktree (precondition): %v: %s", err, out)
+	}
+	// 前置确认：分支确实残留。
+	if out, _ := exec.Command("git", "-C", repo, "branch", "--list", "loop/run-leftover").CombinedOutput(); strings.TrimSpace(string(out)) == "" {
+		t.Fatal("precondition failed: leftover branch loop/run-leftover should still exist")
+	}
+	// 同 runID 再 create：-b 会崩 "already exists"；-B 应成功重置。
+	wt2, err := Create(repo, "run-leftover")
+	if err != nil {
+		t.Fatalf("Create must tolerate leftover branch: %v", err)
+	}
+	if err := Discard(repo, wt2); err != nil {
+		t.Fatal(err)
+	}
 }

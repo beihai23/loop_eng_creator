@@ -1048,3 +1048,106 @@ func TestSubLoopFeedsIssueCommentsToPlan(t *testing.T) {
 		t.Fatalf("plan prompt 缺失 issue 评论（reopen 反馈丢失）:\n%s", rec.got[0])
 	}
 }
+
+// echoExec 写一个文件（保证非空 diff）并返回一个可识别的输出串，用于断言
+// execute 的模型输出被落进了 trace（而非被 `_ = execOut` 丢弃）。
+type echoExec struct{ out, body string }
+
+func (e echoExec) Exec(_ context.Context, dir, _ string) (string, model.Usage, error) {
+	if err := os.WriteFile(filepath.Join(dir, "landed.txt"), []byte(e.body), 0644); err != nil {
+		return "", model.Usage{}, err
+	}
+	return e.out, model.Usage{}, nil
+}
+
+// TestSubLoopCapturesExecuteOutput: execute 的模型输出（execOut）+ prompt 必须落进
+// trace。之前 execOut 被丢弃，导致「空 diff」时无从诊断 claude 到底返回了啥。
+func TestSubLoopCapturesExecuteOutput(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":   mustJSON(skill.PlanOutput{}),
+		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    echoExec{out: "MODEL_ECHO_42", body: "done work"},
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "1", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	statuses, _ := st.ListStatuses()
+	runs, _ := st.RunsOfTask(statuses[0].ID)
+	steps, _ := st.Replay(runs[0].ID)
+	var execStep state.StepRow
+	found := false
+	for _, s := range steps {
+		if s.Role == "execute" {
+			execStep, found = s, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no execute step recorded")
+	}
+	if !strings.Contains(execStep.OutputJSON, "MODEL_ECHO_42") {
+		t.Fatalf("execute OutputJSON 缺失模型输出（execOut 被丢弃了？）: %s", execStep.OutputJSON)
+	}
+	if !strings.Contains(execStep.OutputJSON, "landed.txt") {
+		t.Fatalf("execute OutputJSON 缺失 diff: %s", execStep.OutputJSON)
+	}
+	if !strings.Contains(execStep.InputJSON, "EXECUTE:") {
+		t.Fatalf("execute InputJSON 缺失 prompt: %s", execStep.InputJSON)
+	}
+}
+
+// captureExec 记录 execute 收到的 prompt（不写文件 → 空 diff），用于断言 issue 评论
+// 也喂给了 execute（不只是 plan）。
+type captureExec struct{ got string }
+
+func (c *captureExec) Exec(_ context.Context, _ string, prompt string) (string, model.Usage, error) {
+	c.got = prompt
+	return "ok", model.Usage{}, nil
+}
+
+// TestSubLoopFeedsIssueCommentsToExecute: issue 评论必须喂给 EXECUTE，否则 execute 只
+// 对照验收标准、看不见反馈，对「已实现但需按反馈精修」的任务反复空 diff（#20 即此）。
+func TestSubLoopFeedsIssueCommentsToExecute(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":   mustJSON(skill.PlanOutput{}),
+		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	exec := &captureExec{}
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    exec,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel: &fakeCommentChan{replies: map[string][]channel.Reply{
+			"9": {{Body: "EXEC_FEEDBACK: plan.md 例子要按实现个性化"}},
+		}},
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "9", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	if !strings.Contains(exec.got, "EXEC_FEEDBACK: plan.md 例子要按实现个性化") {
+		t.Fatalf("execute prompt 缺失 issue 评论（反馈只给了 plan 没给 execute）:\n%s", exec.got)
+	}
+}

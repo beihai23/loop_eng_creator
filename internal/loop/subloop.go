@@ -239,13 +239,18 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
-			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n" +
-			"上下文：若任务/issue 引用了设计文档或 spec，开工前先读相关章节；也可浏览仓库的 README/docs 了解项目约定与冻结接口，再动手。\n" +
+			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n"
+		// 战报/反馈也喂给 execute（不只是 plan）：否则 execute 只对照验收标准、看不见
+		// issue 里的反馈，对「已实现但需按反馈精修」的任务会反复产出空 diff（#20 即此）。
+		if issueContext != "" {
+			execPrompt += "战报/反馈（issue 评论，含历轮驳回与人审意见）——务必据此修正代码，" +
+				"不要只对照验收标准就说「已完成」:\n" + issueContext + "\n"
+		}
+		execPrompt += "上下文：若任务/issue 引用了设计文档或 spec，开工前先读相关章节；也可浏览仓库的 README/docs 了解项目约定与冻结接口，再动手。\n" +
 			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
 		sl.Budget.AfterCall(u2)
-		_ = execOut
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=execute fail: %v", sid, err)
@@ -254,12 +259,19 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "execute error: " + err.Error()
-			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", Error: err.Error()})
+			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", InputJSON: execPrompt, Error: err.Error()})
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
 		diff := worktreeDiff(sl.Repo, wt)
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", OutputJSON: diff})
+		// 捕获 execute 的完整 I/O 进 trace：之前 execOut 被 `_ = execOut` 丢弃，
+		// 导致「空 diff」时无从诊断 claude 到底返回了啥、为什么没改文件。
+		// InputJSON=execute prompt；OutputJSON={out: 模型输出, diff: 捕获的改动}。
+		rec, _ := json.Marshal(struct {
+			Out  string `json:"out"`
+			Diff string `json:"diff"`
+		}{Out: execOut, Diff: diff})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", InputJSON: execPrompt, OutputJSON: string(rec)})
 		sl.logf("[subloop] %s phase=execute done", sid)
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。

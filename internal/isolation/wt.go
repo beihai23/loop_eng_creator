@@ -19,8 +19,11 @@ func Create(baseRepo, runID string) (string, error) {
 	}
 	wtPath := filepath.Join(wtRoot, runID)
 	branch := "loop/" + runID
+	// -B（不是 -b）：分支已存在时强制重置到 HEAD，而非报 "already exists" 崩掉。
+	// 同一 <taskID>-r<attempt> 分支可能因上次 run 在 Discard 前崩溃、land 失败、
+	// 或手工操作而残留——-b 会让下一次 Create 直接 error（#20 就栽在这）。
 	out, err := exec.Command("git", "-C", baseRepo,
-		"worktree", "add", "-b", branch, wtPath, "HEAD").CombinedOutput()
+		"worktree", "add", "-B", branch, wtPath, "HEAD").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git worktree add: %s", out)
 	}
