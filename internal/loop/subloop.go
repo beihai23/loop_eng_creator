@@ -145,6 +145,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	_ = sl.Store.SetInFlight(taskID, "starting")
 	sid := shortID(taskID)
 
+	// 每次运行（不论触发原因：首次 / reopen / resume / 重排队）都收集 issue 的全部
+	// 评论作为「战报」上下文喂给 plan —— 修「reopen 写的反馈 plan 看不到」的 bug。
+	issueContext := sl.collectIssueComments(ctx, task.Ref)
 	priorFailure := ""
 	if fb, err := sl.Store.PopResumeFeedback(taskID); err == nil && fb != "" {
 		priorFailure = fb
@@ -170,7 +173,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		_, u, err := sl.Plan.Run(ctx, skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
-			BattleReport: priorFailure,
+			BattleReport: joinNonEmpty(issueContext, priorFailure),
 		})
 		sl.Budget.AfterCall(u)
 		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
@@ -359,6 +362,40 @@ type verifyTrace struct {
 	NeedsHuman      bool     `json:"needs_human"`
 	Detail          string   `json:"detail"`
 	FailingCriteria []string `json:"failing_criteria,omitempty"`
+}
+
+// collectIssueComments 拉取 issue/ticket 的全部评论（人审反馈 + 历轮战报）作为 plan
+// 的上下文。每次 Run 都调——不论触发原因（修「reopen 写的反馈 plan 看不到」）：
+// reopen 走 reconcile 只翻状态、不读评论，导致 plan 拿不到人在 issue 里写的反馈。
+// since 为零值表示「全部评论」。读失败非致命（plan 只是少了上下文，不致崩）。
+func (sl *SubLoop) collectIssueComments(ctx context.Context, ref string) string {
+	if sl.Channel == nil {
+		return ""
+	}
+	replies, err := sl.Channel.ListReplies(ctx, []string{ref}, time.Time{})
+	if err != nil {
+		sl.logf("[subloop] collect comments: ListReplies(%s) failed: %v", ref, err)
+		return ""
+	}
+	parts := make([]string, 0, len(replies[ref]))
+	for _, r := range replies[ref] {
+		if s := strings.TrimSpace(r.Body); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return strings.Join(parts, "\n---\n")
+}
+
+// joinNonEmpty 用双换行拼接非空片段（issue 战报 + 当轮失败/反馈），喂给 plan 的
+// BattleReport。空片段跳过，避免前导空行。
+func joinNonEmpty(parts ...string) string {
+	var out []string
+	for _, p := range parts {
+		if strings.TrimSpace(p) != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, "\n\n")
 }
 
 // landCommitMessage builds the commit subject for a done task's auto-land: the
