@@ -105,6 +105,26 @@ func TestVerifySkillCarriesAcceptanceCriteria(t *testing.T) {
 	}
 }
 
+// TestPlanPromptScriptIsPersonalized guards the reopened feedback on plan.md:
+// the plan skill MUST instruct the planner to write a tier-1 verify_script that
+// is personalized to its own implementation design — testing the specific
+// functions/classes/signatures the plan introduces — and MUST NOT recommend
+// project-wide smoke checks (`go test ./...`, `npm test`, lint, `cargo build`,
+// …) as the tier-1 output. Those pass regardless of whether the task's work is
+// correct, manufacturing a fake green light, and they misled the planner's
+// thinking in earlier rounds. This test pins the fix and fails the moment
+// plan.md regresses to the generic "适合脚本化（建议产出）" smoke-check examples.
+func TestPlanPromptScriptIsPersonalized(t *testing.T) {
+	p := mustSkillPrompt("plan")
+	if !strings.Contains(p, "个性化") {
+		t.Fatalf("plan.md 必须要求验收脚本针对 plan 自身的实现方案个性化定制")
+	}
+	// 旧的「建议产出」裸全仓命令（直接拿 go test ./... 当 tier-1）必须消失——假绿灯。
+	if strings.Contains(p, `{"run":["go","test","./..."]}`) {
+		t.Fatalf("plan.md 不得再把裸 `go test ./...` 当作 tier-1 验收脚本的推荐产出（假绿灯）")
+	}
+}
+
 // renderTemplate is a test-only helper mirroring skill.render (unexported) so
 // the test can assert on the rendered prompt without going through model.Call.
 func renderTemplate(t *testing.T, tmpl string, in any) string {
