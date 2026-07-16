@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"loop-eng/internal/budget"
 	"loop-eng/internal/channel"
@@ -759,5 +760,98 @@ func TestReplayNoInterleaveAfterResume(t *testing.T) {
 		if planSeq11 > 1 {
 			t.Fatalf("run %s: got %d plan seq=11 steps (interleaved), want ≤1", r.ID, planSeq11)
 		}
+	}
+}
+
+// ---- reopen/反馈：每次运行都把 issue 评论喂给 plan（修 reopen 反馈丢失 bug）----
+
+// fakeCommentChan：channel.Channel 桩，ListReplies 返回预设评论。local 通道不返回
+// 评论，故用它证明 SubLoop 把评论收集进 plan 的 BattleReport。
+type fakeCommentChan struct{ replies map[string][]channel.Reply }
+
+func (f *fakeCommentChan) ListNewTasks(context.Context) ([]channel.Task, error) { return nil, nil }
+func (f *fakeCommentChan) ListReplies(_ context.Context, _ []string, _ time.Time) (map[string][]channel.Reply, error) {
+	return f.replies, nil
+}
+func (f *fakeCommentChan) PostComment(context.Context, string, string) error  { return nil }
+func (f *fakeCommentChan) UpdateStatus(context.Context, string, string) error { return nil }
+func (f *fakeCommentChan) CloseIssue(context.Context, string) error           { return nil }
+func (f *fakeCommentChan) GetTaskStates(context.Context, []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
+
+// recorder：包一层 model.Client，记录每次被调用的 prompt，以便断言 plan 真收到了什么。
+type recorder struct {
+	model.Client
+	got []string
+}
+
+func (r *recorder) Call(ctx context.Context, prompt string) (string, model.Usage, error) {
+	r.got = append(r.got, prompt)
+	return r.Client.Call(ctx, prompt)
+}
+
+// TestCollectIssueComments：收集器把 ref 的全部评论拉下来拼接（trim 首尾空白）；nil channel → ""。
+func TestCollectIssueComments(t *testing.T) {
+	sl := &SubLoop{Channel: &fakeCommentChan{replies: map[string][]channel.Reply{
+		"42": {{Body: "第一轮反馈"}, {Body: "  第二轮反馈  "}},
+	}}}
+	got := sl.collectIssueComments(context.Background(), "42")
+	for _, want := range []string{"第一轮反馈", "第二轮反馈"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("评论 %q 丢失: %q", want, got)
+		}
+	}
+	if (&SubLoop{}).collectIssueComments(context.Background(), "x") != "" {
+		t.Fatal("nil channel 应返回空")
+	}
+}
+
+// TestSubLoopFeedsIssueCommentsToPlan：reopen 后人在 issue 写的反馈，plan 必须能看到
+// —— 核心修复：之前 reopen 走 reconcile 只翻状态、不读评论，反馈丢失，plan 盲跑。
+func TestSubLoopFeedsIssueCommentsToPlan(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	rec := &recorder{Client: fake}
+
+	ch := &fakeCommentChan{replies: map[string][]channel.Reply{
+		"77": {{Body: "USER_FEEDBACK: plan.md 例子是瞎讲，脚本要按 plan 实现个性化"}},
+	}}
+
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute: fake,
+		Plan: skill.Skill[skill.PlanInput, skill.PlanOutput]{
+			Name:       "plan",
+			PromptTmpl: "PLAN:\n战报: {{.BattleReport}}\n任务: {{.Task}}",
+			ParseJSON: func(b []byte) (skill.PlanOutput, error) {
+				var o skill.PlanOutput
+				return o, json.Unmarshal(b, &o)
+			},
+			Model: rec,
+		},
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    ch,
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "77", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	if len(rec.got) == 0 {
+		t.Fatal("plan 未被调用")
+	}
+	if !strings.Contains(rec.got[0], "USER_FEEDBACK: plan.md 例子是瞎讲") {
+		t.Fatalf("plan prompt 缺失 issue 评论（reopen 反馈丢失）:\n%s", rec.got[0])
 	}
 }
