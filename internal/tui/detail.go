@@ -11,10 +11,12 @@ import (
 )
 
 // RenderDetail 渲染 [2] 详情（全屏）。读 Store 组装字段后渲染。
-// 验收方式：tier-1 固定 go test；tier-2 = cfg.Models.Verify.Name；tier-3 由 cfg.Verify.Tier3Human 开关。
+// 验收方式：tier-1 标签取 tier=1 verification 行 Detail 冒号前的真值（plan 产出）；tier-2 = cfg.Models.Verify.Name；tier-3 由 cfg.Verify.Tier3Human 开关。
 // 逐 tier 状态来自 verifications 表（按 run+tier）。
 // 预算/retry 从 budget_ledger 派生（runs 列恒为 0，Phase A 终审 I2）。
 // M3：ActiveRun/VerificationsByRun/BudgetLedger 每帧各查一次（顶部捕获，逐 tier 扫内存切片）。
+// run_id 取最新 run：优先 active run（in-flight），空时兜底 RunsOfTask 末尾——done/blocked 也
+// 能展示逐 tier 状态与预算。
 // I3：选中任务恰为 in-flight 时附 phase；run 有 retry 行时附 retry <次数>/<MaxRetries>。
 func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	t, err := st.GetTask(taskID)
@@ -23,7 +25,19 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	}
 
 	// M3：顶部一次性捕获 run-scoped 数据，避免逐 tier 重复查询。
-	runID, startedAt, runOK, _ := st.ActiveRun(taskID)
+	// run_id：优先 active run（in-flight）；done/blocked 无 active run 时兜底到最新 run
+	// （RunsOfTask 末尾），让验证/预算有数据可展。activeOK 单独记，避免给已结束 run 渲染
+	// 「已运行」递增计时——elapsed 行只对真正的 active run 显示。
+	runID, startedAt, activeOK, _ := st.ActiveRun(taskID)
+	runOK := activeOK
+	if !runOK {
+		if runs, e := st.RunsOfTask(taskID); e == nil && len(runs) > 0 {
+			last := runs[len(runs)-1]
+			runID = last.ID
+			startedAt = last.StartedAt
+			runOK = true
+		}
+	}
 	var vers []state.VerificationRow
 	var budgetRows []state.BudgetRow
 	if runOK {
@@ -42,8 +56,9 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	}
 	b.WriteString(statusLine + "\n")
 
-	// 启动时间 / 运行时长（从 runs）
-	if runOK {
+	// 启动时间 / 运行时长：仅 in-flight 的 active run 才显示——已结束 run（done/blocked 兜底）
+	// 不渲染「已运行」递增计时，避免对一个不再推进的 run 误读。
+	if activeOK {
 		b.WriteString(fmt.Sprintf("启动: %s · 已运行 %s\n", startedAt, elapsedSince(startedAt)))
 	}
 
@@ -101,8 +116,8 @@ type tierView struct {
 
 func verifyTiers(cfg *config.Config, vers []state.VerificationRow) []tierView {
 	var out []tierView
-	// tier-1 固定
-	out = append(out, tierView{1, "go test ./...", symbolForTier(vers, 1)})
+	// tier-1 标签取 tier=1 verification 行 Detail 的真值（冒号前）；无 tier=1 行 → (plan 未产出)
+	out = append(out, tierView{1, tier1Label(vers), symbolForTier(vers, 1)})
 	// tier-2
 	name := "LLM"
 	if cfg != nil && cfg.Models.Verify.Name != "" {
@@ -127,6 +142,18 @@ func symbolForTier(vers []state.VerificationRow, tier int) string {
 		}
 	}
 	return "—" // 未触发
+}
+
+// tier1Label 取 tier=1 verification 行 Detail 冒号前的真值——plan 产出的验收标签
+// （deterministic.Check 落盘形如 "<label>: ok" / "<label>: <output>"）。无 tier=1 行
+// （plan 未产出验收脚本）→ "(plan 未产出)"。
+func tier1Label(vers []state.VerificationRow) string {
+	for _, v := range vers {
+		if v.Tier == 1 {
+			return strings.TrimSpace(strings.SplitN(v.Detail, ":", 2)[0])
+		}
+	}
+	return "(plan 未产出)"
 }
 
 // budgetUsed 累加 run 的 token 行得到 used；limit 取 cfg.Budget.PerTaskTokens（I2）。

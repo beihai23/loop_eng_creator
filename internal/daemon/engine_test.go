@@ -1,8 +1,12 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -454,10 +458,10 @@ func TestEngineNoCooldownOnRealBlock(t *testing.T) {
 func TestIsTransientInfra(t *testing.T) {
 	cases := map[string]bool{
 		"retries exhausted: plan error: API Error: 529 [1305][该模型当前访问量过大]": true,
-		"API Error: 529":                true,
-		"upstream rate limit exceeded":  true,
-		"503 service unavailable":       true,
-		"verify rejected: missing test": false,
+		"API Error: 529":                                             true,
+		"upstream rate limit exceeded":                               true,
+		"503 service unavailable":                                    true,
+		"verify rejected: missing test":                              false,
 		"retries exhausted: plan error: claude -p: context canceled": false,
 		"": false,
 	}
@@ -561,5 +565,273 @@ func TestDrainCommandsIdempotent(t *testing.T) {
 	}
 	if len(pend) != 0 {
 		t.Fatalf("pending=%d want 0 (cancel on terminal must still be marked applied)", len(pend))
+	}
+}
+
+// growingChannel models a channel whose visible task set grows over time:
+// ListNewTasks always returns the *current* snapshot (no per-call advance), and
+// add() appends a task mid-flight. This simulates a human filing a new issue
+// (#31) while the daemon is busy running another task — the core scenario the
+// background ingest goroutine exists to cover.
+type growingChannel struct {
+	mu    sync.Mutex
+	tasks []channel.Task
+}
+
+func (c *growingChannel) add(t ...channel.Task) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tasks = append(c.tasks, t...)
+}
+
+func (c *growingChannel) snapshot() []channel.Task {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]channel.Task, len(c.tasks))
+	copy(out, c.tasks)
+	return out
+}
+
+func (c *growingChannel) ListNewTasks(ctx context.Context) ([]channel.Task, error) {
+	return c.snapshot(), nil
+}
+func (c *growingChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
+	return nil, nil
+}
+func (c *growingChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
+func (c *growingChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
+func (c *growingChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
+func (c *growingChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
+
+// flakyChannel fails ListNewTasks for the first failN calls (transient upstream
+// error), then returns the configured task. Used to prove the background ingest
+// loop logs the error and retries on the next jitter rather than giving up.
+type flakyChannel struct {
+	failN int
+	task  channel.Task
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *flakyChannel) ListNewTasks(ctx context.Context) ([]channel.Task, error) {
+	c.mu.Lock()
+	c.calls++
+	n := c.calls
+	c.mu.Unlock()
+	if n <= c.failN {
+		return nil, fmt.Errorf("upstream flaky (call %d)", n)
+	}
+	return []channel.Task{c.task}, nil
+}
+func (c *flakyChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
+	return nil, nil
+}
+func (c *flakyChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
+func (c *flakyChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
+func (c *flakyChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
+func (c *flakyChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
+	return nil, nil
+}
+
+// waitUntil polls cond every few ms until it returns true or the timeout
+// elapses. Used by the background-ingest tests to observe asynchronous
+// ingestion without fixed sleeps (the goroutine runs on a small jitter).
+func waitUntil(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+	t.Fatalf("condition not satisfied within %s", timeout)
+}
+
+// TestBackgroundIngestDuringRun is the headline acceptance test for the
+// single-active sync-tick blind spot (criterion 3/4/6): while RunTask is
+// blocked running task A (the main tick is stuck inside the synchronous
+// dispatch), a freshly-filed issue B must still be ingested into state.db by
+// the background goroutine — and the dashboard (reading state.db) would see it.
+// B lands as status="new" (ingest only inserts; it never takes the active slot),
+// and A stays "running" the whole time.
+//
+// To prove criterion 6 (dashboard sees the runtime-ingested task), the test also
+// opens a SECOND Store on the same DB file — exactly how the dashboard command
+// opens its own connection pool — and asserts that reader sees B too, live.
+func TestBackgroundIngestDuringRun(t *testing.T) {
+	// Open the daemon's store on an explicit path so the "dashboard" reader can
+	// open the same file.
+	dbPath := t.TempDir() + "/state.db"
+	st, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open daemon store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// The dashboard: its own *state.Store on the same DB (own connection pool /
+	// process). WAL lets it read committed writes without blocking on the daemon.
+	dash, err := state.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open dashboard store: %v", err)
+	}
+	t.Cleanup(func() { dash.Close() })
+
+	ch := &growingChannel{}
+	ch.add(channel.Task{Ref: "A", Description: "task A", TaskType: "feat"})
+
+	runStarted := make(chan struct{}) // closed once RunTask(A) is actually executing
+	proceed := make(chan struct{})    // test closes it to let RunTask(A) return
+
+	var aID string
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second,
+		// tiny jitter so the test observes ingestion within ms, not seconds
+		IngestMin: 2 * time.Millisecond,
+		IngestMax: 8 * time.Millisecond,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
+			aID = task.ID
+			close(runStarted)
+			// Block here — this is the "task runs for minutes" window during
+			// which the synchronous tick would otherwise never poll again.
+			select {
+			case <-proceed:
+			case <-ctx.Done():
+			}
+			return "done", "", nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- eng.Run(ctx) }()
+
+	<-runStarted // A is running: active slot busy, main tick blocked in RunTask
+
+	// While A is still running, file issue B on the channel.
+	ch.add(channel.Task{Ref: "B", Description: "task B", TaskType: "feat"})
+
+	// The background ingest goroutine must persist B even though the main tick
+	// is stuck. (With the old sync-only tick, B would never appear here until A
+	// finished.)
+	waitUntil(t, 2*time.Second, func() bool {
+		refs, err := st.IssueRefs()
+		return err == nil && refs["A"] && refs["B"]
+	})
+
+	// Invariant (criterion 4): ingest only inserts. B is status="new", A is
+	// still "running" — the active slot was NOT stolen by ingestion.
+	statuses, err := st.ListStatuses()
+	if err != nil {
+		t.Fatalf("list statuses: %v", err)
+	}
+	byID := map[string]string{}
+	for _, sr := range statuses {
+		byID[sr.ID] = sr.Status
+	}
+	if len(statuses) != 2 {
+		t.Fatalf("expected 2 tasks (A running + B new), got %+v", statuses)
+	}
+	if byID[aID] != "running" {
+		t.Fatalf("A must still be running while B was ingested, got %q", byID[aID])
+	}
+
+	// Criterion 6: the dashboard's OWN store sees B live, while A is still
+	// running. This is the real-time pending-list update the bug blocked.
+	dashViews, err := dash.TasksByStatus()
+	if err != nil {
+		t.Fatalf("dashboard TasksByStatus: %v", err)
+	}
+	var sawBNew bool
+	for _, v := range dashViews {
+		if v.IssueRef == "B" && v.Status == "new" {
+			sawBNew = true
+		}
+	}
+	if !sawBNew {
+		t.Fatalf("dashboard did not see runtime-ingested B as new: %+v", dashViews)
+	}
+
+	// Let A finish and shut the daemon down cleanly (Run waits for the ingest
+	// goroutine before returning).
+	close(proceed)
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("Run returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after shutdown (ingest goroutine leaked?)")
+	}
+}
+
+// TestIngestLoopRetriesOnError proves criterion 5: a transient ListNewTasks
+// failure is logged and retried on the next jitter, never affecting the main
+// loop. The flaky channel errors the first few calls, then succeeds; the
+// background loop must eventually ingest the task despite the earlier errors.
+func TestIngestLoopRetriesOnError(t *testing.T) {
+	st := newTestStore(t)
+	ch := &flakyChannel{failN: 3, task: channel.Task{Ref: "X", Description: "task X", TaskType: "feat"}}
+
+	var buf bytes.Buffer
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second,
+		IngestMin: 1 * time.Millisecond,
+		IngestMax: 3 * time.Millisecond,
+		Log:       log.New(&buf, "", 0),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eng.wg.Add(1)
+	go eng.ingestLoop(ctx)
+
+	// Despite 3 consecutive ListNewTasks errors, the loop retries and ingests X.
+	waitUntil(t, 2*time.Second, func() bool {
+		refs, err := st.IssueRefs()
+		return err == nil && refs["X"]
+	})
+
+	// Stop the goroutine BEFORE reading buf: bytes.Buffer is not concurrency-safe,
+	// and ingestLoop keeps running until cancelled. The 3 error lines were written
+	// during the failing calls, well before X landed — so they survive shutdown.
+	cancel()
+	eng.wg.Wait() // ingestLoop exits promptly on ctx cancel
+
+	// The transient errors were logged (proving they were observed, not panic'd).
+	if !strings.Contains(buf.String(), "background ingest error") {
+		t.Fatalf("expected logged ingest errors, got log:\n%s", buf.String())
+	}
+}
+
+// TestNextIngestDelayJitter pins the jitter contract: the delay always lands in
+// [IngestMin, IngestMax) and varies across draws (not a fixed beat).
+func TestNextIngestDelayJitter(t *testing.T) {
+	eng := &Engine{IngestMin: 3 * time.Second, IngestMax: 10 * time.Second}
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 1000; i++ {
+		d := eng.nextIngestDelay()
+		if d < 3*time.Second || d >= 10*time.Second {
+			t.Fatalf("delay %s outside [3s, 10s)", d)
+		}
+		seen[d] = true
+	}
+	// Randomized → many distinct values across 1000 draws (not one fixed delay).
+	if len(seen) < 100 {
+		t.Fatalf("jitter produced only %d distinct delays in 1000 draws; not randomized?", len(seen))
+	}
+
+	// Degenerate range (max <= min) collapses to min with no panic.
+	eng2 := &Engine{IngestMin: 5 * time.Second, IngestMax: 5 * time.Second}
+	if got := eng2.nextIngestDelay(); got != 5*time.Second {
+		t.Fatalf("degenerate range: got %s want 5s", got)
+	}
+	eng3 := &Engine{IngestMin: 0, IngestMax: 0}
+	if got := eng3.nextIngestDelay(); got != 0 {
+		t.Fatalf("zero range: got %s want 0", got)
 	}
 }
