@@ -348,6 +348,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		// 不过 → 反馈，下一轮重试
 		sl.logf("[subloop] %s phase=verify done rejected: %s", sid, res.Detail)
+		// verify 不过必给「失败理由 + 改进建议」，落进 issue 评论：给人看（驳回不再黑箱）
+		// + 作下一轮持久反馈（collectIssueComments 下一轮读回喂 plan/execute）。best-effort——
+		// 发评论失败只记日志、不 gate loop（与 report 的 PostComment 容错一致）。
+		if cErr := sl.Channel.PostComment(ctx, task.Ref, verifyFailComment(task, attempt, res)); cErr != nil {
+			sl.logf("[subloop] %s verify-fail comment post failed: %v", sid, cErr)
+		}
 		priorFailure = res.Detail
 		isolation.Discard(sl.Repo, wt)
 		sl.logRetry(sid, attempt, priorFailure)
@@ -450,6 +456,66 @@ func landCommitMessage(task channel.Task, taskID string) string {
 		subject = subject[:72]
 	}
 	return "loop-eng auto-land #" + task.Ref + ": " + subject
+}
+
+// verifyFailComment 构造「verify 驳回」的 issue 评论正文：失败理由 + 改进建议。
+//
+// verify 不过（且非 needs-human）时落进 issue 评论——双重作用：
+//   - 给人看：驳回不再是黑箱，每轮失败原因 + 该怎么改都可见（issue 侧的可观测性）。
+//   - 作下一轮的持久反馈：collectIssueComments 下一轮（及 reopen/resume 后）读回，
+//     喂给 plan/execute。in-memory 的 priorFailure 只活在一次 Run 内；落成评论后，
+//     即便跨进程重启、跨 reopen，反馈也不丢。
+//
+// 纯函数（不碰 channel），便于直接单测正文；调用方负责 PostComment + best-effort 容错。
+// 签名固定为 (channel.Task, int, verify.VerifyResult)：task 给验收标准（推导建议），
+// attempt 标第几轮，res 给失败理由 + 未满足标准。测试必须与此签名对齐。
+func verifyFailComment(task channel.Task, attempt int, res verify.VerifyResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "## VERIFY-FAIL（第 %d 轮 verify 驳回）\n\n", attempt)
+
+	b.WriteString("### 失败理由\n")
+	if reason := strings.TrimSpace(res.Detail); reason != "" {
+		b.WriteString(reason)
+	} else {
+		b.WriteString("（verify 驳回但未给出理由——请逐条复核验收标准）")
+	}
+	b.WriteString("\n\n")
+
+	b.WriteString("### 改进建议\n")
+	for _, s := range improvementSuggestions(task, res) {
+		b.WriteString("- " + s + "\n")
+	}
+	return b.String()
+}
+
+// improvementSuggestions 由 verify 结果推导下一轮的可执行修正方向：
+//   - 有 FailingCriteria → 每条未满足标准转成「针对性修正」（最准）。
+//   - 否则回退到任务的验收标准，逐条提示复核（tier-1 这类不给 FailingCriteria 的驳回）。
+//   - 两者皆空 → 兜底一条通用建议（引用失败理由，绝不交空的建议区）。
+func improvementSuggestions(task channel.Task, res verify.VerifyResult) []string {
+	var fc []string
+	for _, c := range res.FailingCriteria {
+		if s := strings.TrimSpace(c); s != "" {
+			fc = append(fc, s)
+		}
+	}
+	if len(fc) > 0 {
+		out := make([]string, 0, len(fc))
+		for _, c := range fc {
+			out = append(out, "针对未满足标准修正："+c)
+		}
+		return out
+	}
+	var out []string
+	for _, c := range task.AcceptanceCriteria {
+		if s := strings.TrimSpace(c); s != "" {
+			out = append(out, "复核验收标准是否满足："+s)
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return []string{"对照上面的失败理由，逐条重做未满足的验收标准后再提交"}
 }
 
 // report writes the terminal state transition + channel battle report for a

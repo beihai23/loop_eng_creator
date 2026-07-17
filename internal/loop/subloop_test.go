@@ -1151,3 +1151,79 @@ func TestSubLoopFeedsIssueCommentsToExecute(t *testing.T) {
 		t.Fatalf("execute prompt 缺失 issue 评论（反馈只给了 plan 没给 execute）:\n%s", exec.got)
 	}
 }
+
+// TestVerifyFailComment：verify 驳回评论正文必须同时含「失败理由」+「改进建议」，
+// 且签名 (channel.Task, int, verify.VerifyResult) 的调用与定义对齐（修历轮编译失败）。
+// 三条分支：FailingCriteria 非空 → 针对性修正；空 → 回退验收标准；皆空 → 兜底建议。
+func TestVerifyFailComment(t *testing.T) {
+	task := channel.Task{Ref: "5", AcceptanceCriteria: []string{"通过 go test", "diff 非空"}}
+
+	// 1) FailingCriteria 非空：理由来自 Detail，建议逐条来自未满足标准。
+	got := verifyFailComment(task, 2, verify.VerifyResult{
+		Passed: false, Detail: "tier-2: tests do not cover X",
+		FailingCriteria: []string{"通过 go test", "覆盖边界"},
+	})
+	for _, want := range []string{"VERIFY-FAIL", "第 2 轮", "失败理由", "tier-2: tests do not cover X",
+		"改进建议", "针对未满足标准修正：通过 go test", "针对未满足标准修正：覆盖边界"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("FailingCriteria 分支缺失 %q:\n%s", want, got)
+		}
+	}
+
+	// 2) FailingCriteria 空、验收标准非空（tier-1 这类驳回）：建议回退到验收标准复核。
+	got = verifyFailComment(task, 1, verify.VerifyResult{Passed: false, Detail: "go-test: exit 1"})
+	for _, want := range []string{"失败理由", "go-test: exit 1", "改进建议",
+		"复核验收标准是否满足：通过 go test", "复核验收标准是否满足：diff 非空"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("验收标准回退分支缺失 %q:\n%s", want, got)
+		}
+	}
+
+	// 3) 皆空（无标准、无 FailingCriteria、Detail 也空）：理由兜底 + 兜底建议，不留空区。
+	got = verifyFailComment(channel.Task{Ref: "6"}, 3, verify.VerifyResult{Passed: false})
+	for _, want := range []string{"失败理由", "verify 驳回但未给出理由", "改进建议", "对照上面的失败理由"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("兜底分支缺失 %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestSubLoopPostsVerifyFailCommentOnReject：verify 不过时 SubLoop 必须把「失败理由 +
+// 改进建议」作为评论发到 issue（outbox/<ref>.md）。落笔后持久可见、下一轮可读回。
+func TestSubLoopPostsVerifyFailCommentOnReject(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope", FailingCriteria: []string{"criterion-A"}}), // 永远不过
+	})
+	root := t.TempDir()
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(root),
+	}
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "7", Description: "d", AcceptanceCriteria: []string{"criterion-A"}})
+	if out.Status != "blocked" {
+		t.Fatalf("want blocked, got %s", out.Status)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "outbox", "7.md"))
+	if err != nil {
+		t.Fatalf("outbox/7.md 未写入（verify-fail 评论未发）: %v", err)
+	}
+	// 每轮驳回各发一条 VERIFY-FAIL（maxRetries=2 → 2 条），含理由 + 建议。
+	got := string(body)
+	for _, want := range []string{"VERIFY-FAIL", "失败理由", "nope", "改进建议", "针对未满足标准修正：criterion-A"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("verify-fail 评论缺失 %q:\n%s", want, got)
+		}
+	}
+	if c := strings.Count(got, "VERIFY-FAIL"); c != 2 {
+		t.Fatalf("想见 2 条 verify-fail 评论（每轮一条），实际 %d 条", c)
+	}
+}
