@@ -15,6 +15,11 @@ type Store struct{ db *sql.DB }
 type TaskRow struct {
 	ID, IssueRef, Description, TaskType, Source string
 	Criteria                                    []string
+	// CreatedAt is the task's issue-submission time (RFC3339), used to order the
+	// dispatch FIFO by submission time rather than by ingest time. InsertTask
+	// writes it into the existing created_at column; a zero value falls back to
+	// the ingest time (nowISO).
+	CreatedAt string
 }
 
 var schema = []string{
@@ -102,6 +107,13 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 	id := newID("task")
 	crit, _ := json.Marshal(t.Criteria)
 	now := nowISO()
+	// created_at is the issue-submission time (drives the FIFO by submission
+	// order, not ingest order); fall back to ingest time when the channel did
+	// not report one. updated_at is always the ingest time.
+	createdAt := t.CreatedAt
+	if createdAt == "" {
+		createdAt = now
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", err
@@ -109,7 +121,7 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 	if _, err := tx.Exec(
 		`INSERT INTO tasks(id, issue_ref, description, task_type, source, acceptance_criteria_json, created_at, updated_at)
 		 VALUES(?,?,?,?,?,?,?,?)`,
-		id, t.IssueRef, t.Description, t.TaskType, t.Source, string(crit), now, now); err != nil {
+		id, t.IssueRef, t.Description, t.TaskType, t.Source, string(crit), createdAt, now); err != nil {
 		tx.Rollback()
 		return "", err
 	}
@@ -250,11 +262,13 @@ func (s *Store) IssueRefs() (map[string]bool, error) {
 }
 
 // NextReadyTask returns the head of the dispatch FIFO: the oldest task whose
-// status is "new", ordered by created_at (spec §8.7 — FIFO order is by
-// ingested time) with the implicit rowid as a deterministic tiebreak for
-// same-timestamp inserts. The bool is false when no new task is ready (empty
-// queue). This is the daemon's dispatch pick (spec §7.1 step 3): one tick,
-// one task, oldest first.
+// status is "new", ordered by created_at (spec §8.7 — FIFO order is by issue
+// submission time, NOT ingest time) with the implicit rowid as a deterministic
+// tiebreak for same-timestamp inserts. created_at holds the channel-reported
+// submission time (see InsertTask), so a newer issue ingested before an older
+// one still dispatches after it. The bool is false when no new task is ready
+// (empty queue). This is the daemon's dispatch pick (spec §7.1 step 3): one
+// tick, one task, oldest-submitted first.
 func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 	row := s.db.QueryRow(
 		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json

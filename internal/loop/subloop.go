@@ -144,6 +144,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		taskID, err = sl.Store.InsertTask(state.TaskRow{
 			IssueRef: task.Ref, Description: task.Description,
 			TaskType: task.TaskType, Source: "run-once", Criteria: task.AcceptanceCriteria,
+			CreatedAt: task.CreatedAt,
 		})
 		if err != nil {
 			return Outcome{Status: "error"}, err

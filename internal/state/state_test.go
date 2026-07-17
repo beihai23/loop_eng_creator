@@ -30,6 +30,48 @@ func TestInsertAndGetTask(t *testing.T) {
 	}
 }
 
+// TestNextReadyTaskOrdersBySubmissionTime proves the dispatch FIFO is ordered by
+// issue submission time, NOT by ingest order (spec §8.7 FIFO). The daemon
+// ingests via `gh issue list` (newest first), so a newer issue is ingested
+// before an older one. If created_at stored ingest time, the newer issue would
+// get the smallest created_at and be dispatched first = LIFO. By storing the
+// channel-reported submission time (Task.CreatedAt), NextReadyTask must return
+// the earliest-submitted task regardless of the order tasks were ingested.
+func TestNextReadyTaskOrdersBySubmissionTime(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+
+	// #32 was submitted AFTER #31, but `gh issue list` returns newest first, so
+	// #32 is ingested first (smaller rowid). Insert it first to mirror that.
+	later, _ := s.InsertTask(TaskRow{
+		IssueRef: "#32", Description: "newer issue, ingested first",
+		CreatedAt: "2026-07-17T10:00:01Z", // submitted later
+	})
+	// #31 was submitted earlier; it is ingested second (larger rowid).
+	earlier, _ := s.InsertTask(TaskRow{
+		IssueRef: "#31", Description: "older issue, ingested second",
+		CreatedAt: "2026-07-17T09:00:00Z", // submitted earlier
+	})
+
+	got, ok, err := s.NextReadyTask()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected a ready task")
+	}
+	// Earliest-submitted (#31) is the FIFO head even though it was ingested
+	// after #32. Had created_at tracked ingest time, #32 (ingested first →
+	// smaller created_at and smaller rowid) would win and this would fail.
+	if got.ID != earlier {
+		t.Fatalf("NextReadyTask = %q (%s), want earliest-submitted #31 (%q)",
+			got.ID, got.IssueRef, earlier)
+	}
+	if got.ID == later {
+		t.Fatalf("NextReadyTask returned later-submitted #32; FIFO must prefer #31")
+	}
+}
+
 func TestAppendStepAndReplay(t *testing.T) {
 	s, _ := Open(t.TempDir() + "/state.db")
 	defer s.Close()

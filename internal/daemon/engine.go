@@ -224,6 +224,7 @@ func (e *Engine) ingest(ctx context.Context) error {
 			TaskType:    t.TaskType,
 			Source:      "daemon",
 			Criteria:    t.AcceptanceCriteria,
+			CreatedAt:   t.CreatedAt, // #33/#36: 存 issue 提交时间 → NextReadyTask 按 created_at FIFO（不是入库时间）
 		}); err != nil {
 			return err
 		}

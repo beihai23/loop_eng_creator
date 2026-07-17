@@ -10,6 +10,10 @@ type Task struct {
 	Description        string
 	AcceptanceCriteria []string
 	TaskType           string
+	// CreatedAt is the issue/ticket submission time (RFC3339) as reported by the
+	// channel. Carries through to tasks.created_at so the dispatch FIFO orders by
+	// submission time, not by ingest order. Empty when the channel has no value.
+	CreatedAt string
 }
 
 type Reply struct{ Body string }
