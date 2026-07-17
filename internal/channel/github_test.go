@@ -22,6 +22,25 @@ func TestParseIssueJSONAndBody(t *testing.T) {
 	}
 }
 
+// TestParseIssuesJSONCarriesCreatedAt locks in that the issue submission time
+// from `gh issue list --json ...,createdAt` is carried onto Task.CreatedAt —
+// the field InsertTask writes into tasks.created_at so the dispatch FIFO orders
+// by submission time, not ingest order. Lists come back newest-first, so without
+// this the FIFO would be LIFO.
+func TestParseIssuesJSONCarriesCreatedAt(t *testing.T) {
+	raw := `[{"number":42,"title":"add X","body":"add X","createdAt":"2026-07-15T10:00:00Z"}]`
+	tasks, err := parseIssuesJSON([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("got %d tasks", len(tasks))
+	}
+	if tasks[0].CreatedAt != "2026-07-15T10:00:00Z" {
+		t.Fatalf("CreatedAt not carried from gh createdAt: got %q", tasks[0].CreatedAt)
+	}
+}
+
 // TestParseIssueCommentsJSON feeds a trimmed `gh issue view <ref> --json comments`
 // blob and asserts each comment maps to one Reply whose body is verbatim.
 func TestParseIssueCommentsJSON(t *testing.T) {

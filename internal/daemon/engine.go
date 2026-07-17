@@ -87,13 +87,13 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 // tick is one daemon pass (spec §7.1). Steps:
-// 1. Ingest new tasks from the channel (dedup against persisted tasks).
-// 2. Reconcile: read channel-side state for terminal tasks (done/blocked) and
-//    detect human-driven reversals — done issue reopened → re-queue as new;
-//    blocked issue had its label removed → re-queue as new.
-// 3. Poll signals: check needs-review + blocked tasks for new human replies
-//    since the daemon's last comment; re-queue any that got a reply.
-// 4. Dispatch the FIFO head (single-active synchronous, spec §12).
+//  1. Ingest new tasks from the channel (dedup against persisted tasks).
+//  2. Reconcile: read channel-side state for terminal tasks (done/blocked) and
+//     detect human-driven reversals — done issue reopened → re-queue as new;
+//     blocked issue had its label removed → re-queue as new.
+//  3. Poll signals: check needs-review + blocked tasks for new human replies
+//     since the daemon's last comment; re-queue any that got a reply.
+//  4. Dispatch the FIFO head (single-active synchronous, spec §12).
 func (e *Engine) tick(ctx context.Context) error {
 	tasks, err := e.Channel.ListNewTasks(ctx)
 	if err != nil {
@@ -116,6 +116,7 @@ func (e *Engine) tick(ctx context.Context) error {
 			TaskType:    t.TaskType,
 			Source:      "daemon",
 			Criteria:    t.AcceptanceCriteria,
+			CreatedAt:   t.CreatedAt,
 		}); err != nil {
 			return err
 		}

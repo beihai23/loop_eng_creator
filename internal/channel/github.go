@@ -27,9 +27,10 @@ func NewGitHub(repo, taskLabel string) *GitHub {
 }
 
 type ghIssue struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
+	Number    int    `json:"number"`
+	Title     string `json:"title"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"createdAt"`
 }
 
 // ghComment is the slice of `gh issue view <ref> --json comments`; only body
@@ -54,6 +55,7 @@ func parseIssuesJSON(raw []byte) ([]Task, error) {
 	for _, is := range issues {
 		t := parseLocalTask(is.Body) // 复用 M1 的 body 解析（## 任务/type:/- [ ]）
 		t.Ref = strconv.Itoa(is.Number)
+		t.CreatedAt = is.CreatedAt // issue 提交时间（RFC3339），驱动 FIFO 按提交时间排序
 		if t.Description == "" {
 			t.Description = is.Title // body 没解析出 desc 则回落 title
 		}
@@ -89,7 +91,7 @@ func parseIssueCommentsJSON(raw []byte, since time.Time) ([]Reply, error) {
 func (g *GitHub) ListNewTasks(ctx context.Context) ([]Task, error) {
 	out, err := g.gh(ctx, "issue", "list", "--repo", g.Repo,
 		"--label", g.TaskLabel, "--state", "open",
-		"--json", "number,title,body", "--limit", "50")
+		"--json", "number,title,body,createdAt", "--limit", "50")
 	if err != nil {
 		return nil, err
 	}

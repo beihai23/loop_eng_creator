@@ -20,6 +20,11 @@ func TestLocalListAndComment(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].Description != "fix login" {
 		t.Fatalf("got %+v", tasks)
 	}
+	// CreatedAt is filled from the inbox file's mtime (drives FIFO by submission
+	// time, not ingest order); empty would mean the channel forgot to set it.
+	if tasks[0].CreatedAt == "" {
+		t.Fatalf("CreatedAt empty: %+v", tasks[0])
+	}
 	if err := c.PostComment(nil, tasks[0].Ref, "战报 round1: done"); err != nil {
 		t.Fatal(err)
 	}

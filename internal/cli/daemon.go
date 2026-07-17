@@ -69,6 +69,7 @@ func NewDaemonCmd() *cobra.Command {
 					Description:        task.Description,
 					TaskType:           task.TaskType,
 					AcceptanceCriteria: task.Criteria,
+					CreatedAt:          task.CreatedAt,
 				}
 				out, err := sl.Run(ctx, ct)
 				if err != nil {

@@ -32,6 +32,12 @@ func (l *Local) ListNewTasks(_ context.Context) ([]Task, error) {
 		}
 		t := parseLocalTask(string(raw))
 		t.Ref = strings.TrimSuffix(e.Name(), ".md")
+		// 提交时间用 inbox 文件的 mtime（回落 now）——驱动 FIFO 按提交时间排序，
+		// 与 ingest 顺序解耦（和 github 通道用 issue.createdAt 对齐）。
+		t.CreatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		if fi, err := e.Info(); err == nil {
+			t.CreatedAt = fi.ModTime().UTC().Format(time.RFC3339Nano)
+		}
 		tasks = append(tasks, t)
 	}
 	return tasks, nil
@@ -81,4 +87,6 @@ func (l *Local) UpdateStatus(_ context.Context, ref, status string) error {
 
 func (l *Local) CloseIssue(_ context.Context, _ string) error { return nil }
 
-func (l *Local) GetTaskStates(_ context.Context, _ []string) (map[string]TaskState, error) { return nil, nil }
+func (l *Local) GetTaskStates(_ context.Context, _ []string) (map[string]TaskState, error) {
+	return nil, nil
+}
