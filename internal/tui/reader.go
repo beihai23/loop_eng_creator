@@ -15,6 +15,7 @@ type Snapshot struct {
 // RunningInfo 是当前活跃子 loop 的展示信息。
 type RunningInfo struct {
 	TaskID, Phase, StartedAt, RunID string
+	Retry int // 当前 attempt（budget_ledger 最后一条 retry 行的 amount；1=首次，>1=重试中）
 }
 
 // ReadSnapshot 从 Store 读一次全量视图。running 任务（in_flight）从 TasksByStatus
@@ -39,6 +40,16 @@ func ReadSnapshot(st *state.Store, cfg *config.Config) (*Snapshot, error) {
 		ri := &RunningInfo{TaskID: ifl.TaskID, Phase: ifl.Phase, StartedAt: startedAt}
 		if rok {
 			ri.RunID = runID
+			// retry：budget_ledger 最后一条 retry 行的 amount = 当前 attempt（>1 即重试中）。
+			// 与 detail.go 同源，best-effort：读失败/无行 → Retry 留 0（总览按「首次」渲染）。
+			if rows, e := st.BudgetLedger(runID); e == nil {
+				for i := len(rows) - 1; i >= 0; i-- {
+					if rows[i].Kind == "retry" {
+						ri.Retry = rows[i].Amount
+						break
+					}
+				}
+			}
 		}
 		snap.Running = ri
 		// 把 running 任务挪到列表最前

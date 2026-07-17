@@ -2,17 +2,19 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
 // 列宽（显示单元格）。num/status 列固定宽，description 吃剩余宽度。
-// marker 列宽 2（▶ / 空格），num 列容 "#999"，status 列容 "● needs-review"。
+// marker 列宽 2（▶ / 空格），num 列容 "#999"，status 列容 running 行的
+// "● execute · retry 9"（phase + 可选 retry；非 running 行只占 "needs-review"）。
 const (
 	ovMarkerW = 2
 	ovNumW    = 6
-	ovStatusW = 14
+	ovStatusW = 20
 )
 
 // RenderOverview 渲染 [1] 总览：标题 + 状态计数（符号即 legend）+ 边框表格
@@ -69,7 +71,14 @@ func RenderOverview(snap *Snapshot, selIdx int, animPhase float64, w int) string
 		}
 		sym := statusSymbol(t.Status)
 		numCol := fmt.Sprintf("%-*s", ovNumW, t.IssueRef)
-		statusCol := fmt.Sprintf("%s %-*s", sym, ovStatusW-2, t.Status)
+		// 状态列：running 行显示当前 phase（plan/execute/verify/starting）——呼吸绿 ● 已
+		// 表示「进行中」，故文本聚焦「在哪个阶段」，不进详情即知进度；retry 中附 " · retry N"。
+		// 仅 running 行（与 snap.Running 同 task）有 phase；其它态保持原 status 文本不变。
+		statusText := t.Status
+		if t.Status == "running" && snap.Running != nil && snap.Running.TaskID == t.ID {
+			statusText = runningStatusText(snap.Running)
+		}
+		statusCol := fmt.Sprintf("%s %-*s", sym, ovStatusW-2, statusText)
 		// 描述列：最末列，按显示宽度截断（MaxWidth 兼顾 CJK，不会劈开双宽字符）。
 		descCol := lipgloss.NewStyle().MaxWidth(descW).Render(t.Description)
 
@@ -108,6 +117,22 @@ func RenderOverview(snap *Snapshot, selIdx int, animPhase float64, w int) string
 // countSegment 渲染计数条的一个段：符号 + 中文标签 + 计数，按给定样式（状态色）着色。
 func countSegment(sym, label string, n int, st lipgloss.Style) string {
 	return st.Render(fmt.Sprintf("%s %s %d", sym, label, n))
+}
+
+// runningStatusText 组装 running 行的状态文本：phase（plan/execute/verify/starting），
+// 空时兜底 "running"（与 --watch 视图同约定：dispatched 但尚未落到任一 phase）。
+// retry 中（attempt≥2）附 " · retry N"——N 取自 budget_ledger 的当前 attempt，与详情页
+// retry 行分子一致。绿 ● 呼吸灯已表示「进行中」，故文本不重复 running，聚焦「在哪个阶段」，
+// 数据 tick 刷新即可见 plan→execute→verify 推进。
+func runningStatusText(r *RunningInfo) string {
+	phase := r.Phase
+	if phase == "" {
+		return "running"
+	}
+	if r.Retry > 1 {
+		return phase + " · retry " + strconv.Itoa(r.Retry)
+	}
+	return phase
 }
 
 // hintsLine 渲染底栏按键提示：键名 bold + 描述 faint，段间分隔。
