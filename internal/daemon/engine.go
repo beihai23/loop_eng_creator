@@ -9,8 +9,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"loop-eng/internal/channel"
@@ -46,7 +48,28 @@ type Engine struct {
 	// Tests inject a logger backed by bytes.Buffer to assert on output.
 	Log *log.Logger
 
+	// IngestMin/IngestMax bound the background ingest loop's per-iteration
+	// jittered sleep. When IngestMax > 0, Run starts a goroutine that keeps
+	// ingesting newly-filed issues into the durable FIFO *independently* of the
+	// synchronous main tick — so an issue filed while the single active slot is
+	// busy running a task for minutes still lands in state.db and shows up on the
+	// dashboard (the single-active sync-tick blind spot). When IngestMax <= 0
+	// (the zero value), no background goroutine runs and the main tick alone
+	// ingests (legacy behavior, used by tests that drive tick() directly).
+	IngestMin time.Duration
+	IngestMax time.Duration
+
 	coolUntil time.Time
+
+	// ingestMu serializes ingest() calls (the main tick's step 1 and the
+	// background loop) so the read-IssueRefs-then-InsertTask dedup is atomic
+	// w.r.t. itself — without it two concurrent ingests could both miss a ref
+	// and double-insert it (issue_ref has no UNIQUE index).
+	ingestMu sync.Mutex
+
+	// wg tracks the background ingest goroutine so Run can wait for it to exit
+	// cleanly on ctx cancellation before returning.
+	wg sync.WaitGroup
 }
 
 // logf writes a formatted line to the daemon log (or stderr if Log is nil).
@@ -63,11 +86,23 @@ func (e *Engine) logf(format string, args ...interface{}) {
 // Interval until ctx is cancelled, returning ctx.Err(). A single tick's error
 // is logged to stderr but does NOT halt the loop — a transient channel failure
 // skips this tick and retries next, losing no persisted state (spec §11).
+//
+// Because a tick's dispatch step blocks synchronously inside RunTask (single
+// active sub-loop, spec §12), the loop does NOT advance while a task is
+// running — so a freshly-filed issue would go unseen for the task's whole run.
+// When IngestMax > 0, Run therefore starts a background ingest goroutine that
+// keeps pulling new issues into the FIFO on a jittered 3–10s cadence,
+// independent of the blocked main tick (spec principle: the daemon never
+// blocks on a human; this extends "never blocks" to ingestion during a run).
 func (e *Engine) Run(ctx context.Context) error {
 	if n, err := e.Store.RequeueOrphanedRunning(); err != nil {
 		e.logf("[daemon] orphan recovery failed: %v", err)
 	} else if n > 0 {
 		e.logf("[daemon] recovered %d orphaned running task(s) → new", n)
+	}
+	if e.IngestMax > 0 {
+		e.wg.Add(1)
+		go e.ingestLoop(ctx)
 	}
 	if err := e.tick(ctx); err != nil {
 		e.logf("daemon tick error: %v", err)
@@ -77,6 +112,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			e.wg.Wait() // let the background ingest goroutine exit cleanly
 			return ctx.Err()
 		case <-t.C:
 			if err := e.tick(ctx); err != nil {
@@ -87,43 +123,18 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 // tick is one daemon pass (spec §7.1). Steps:
-// 1. Ingest new tasks from the channel (dedup against persisted tasks).
-// 2. Reconcile: read channel-side state for terminal tasks (done/blocked) and
-//    detect human-driven reversals — done issue reopened → re-queue as new;
-//    blocked issue had its label removed → re-queue as new.
-// 3. Poll signals: check needs-review + blocked tasks for new human replies
-//    since the daemon's last comment; re-queue any that got a reply.
-// 4. Dispatch the FIFO head (single-active synchronous, spec §12).
+//  1. Ingest new tasks from the channel (dedup against persisted tasks).
+//  2. Reconcile: read channel-side state for terminal tasks (done/blocked) and
+//     detect human-driven reversals — done issue reopened → re-queue as new;
+//     blocked issue had its label removed → re-queue as new.
+//  3. Poll signals: check needs-review + blocked tasks for new human replies
+//     since the daemon's last comment; re-queue any that got a reply.
+//  4. Dispatch the FIFO head (single-active synchronous, spec §12).
 func (e *Engine) tick(ctx context.Context) error {
-	tasks, err := e.Channel.ListNewTasks(ctx)
-	if err != nil {
-		return err
-	}
-	seen, err := e.Store.IssueRefs()
-	if err != nil {
-		return err
-	}
-
-	// ---- step 1: ingest new tasks (spec §7.1) ----
-	var ingested int
-	for _, t := range tasks {
-		if seen[t.Ref] {
-			continue
-		}
-		if _, err := e.Store.InsertTask(state.TaskRow{
-			IssueRef:    t.Ref,
-			Description: t.Description,
-			TaskType:    t.TaskType,
-			Source:      "daemon",
-			Criteria:    t.AcceptanceCriteria,
-		}); err != nil {
-			return err
-		}
-		seen[t.Ref] = true
-		ingested++
-	}
-	if ingested > 0 {
-		e.logf("[daemon] tick ingest: %d new task(s)", ingested)
+	// ---- step 1: ingest new tasks (non-fatal: a flaky channel must not block
+	// dispatch of already-ingested ready tasks) ----
+	if err := e.ingest(ctx); err != nil {
+		e.logf("[daemon] ingest error: %v", err)
 	}
 
 	// ---- step 2: reconcile terminal tasks against channel-side state ----
@@ -177,6 +188,91 @@ func (e *Engine) tick(ctx context.Context) error {
 		e.logf("[daemon] tick done: task %s → %s", shortTaskID(ready.ID), status)
 	}
 	return e.Store.AppendTransition(ready.ID, "running", status, "ran")
+}
+
+// ingest pulls new tasks from the channel into the durable FIFO, deduped by
+// issue_ref against already-persisted tasks (spec §7.1 step 1). It is called
+// both from the synchronous tick (step 1) and from the background ingestLoop
+// goroutine, so it serializes on ingestMu: without the lock, two concurrent
+// ingests could both read IssueRefs before either inserts, and each would
+// double-insert the same ref (issue_ref has no UNIQUE index).
+//
+// Ingest is INSERT-only: it inserts tasks at status="new" and touches nothing
+// else. It never occupies the active slot, flips in_flight, or mutates a
+// running task — so single-active dispatch (NextReadyTask + one synchronous
+// RunTask per tick) is unaffected by concurrent ingestion.
+func (e *Engine) ingest(ctx context.Context) error {
+	e.ingestMu.Lock()
+	defer e.ingestMu.Unlock()
+
+	tasks, err := e.Channel.ListNewTasks(ctx)
+	if err != nil {
+		return err
+	}
+	seen, err := e.Store.IssueRefs()
+	if err != nil {
+		return err
+	}
+	var ingested int
+	for _, t := range tasks {
+		if seen[t.Ref] {
+			continue
+		}
+		if _, err := e.Store.InsertTask(state.TaskRow{
+			IssueRef:    t.Ref,
+			Description: t.Description,
+			TaskType:    t.TaskType,
+			Source:      "daemon",
+			Criteria:    t.AcceptanceCriteria,
+		}); err != nil {
+			return err
+		}
+		seen[t.Ref] = true
+		ingested++
+	}
+	if ingested > 0 {
+		e.logf("[daemon] ingest: %d new task(s)", ingested)
+	}
+	return nil
+}
+
+// ingestLoop is the background ingest goroutine started by Run when IngestMax >
+// 0. It keeps pulling new issues into the FIFO on a jittered cadence so an
+// issue filed while the single active slot is busy running a long task still
+// lands in state.db (and on the dashboard) — the synchronous tick is blocked
+// inside RunTask and would otherwise not poll again until that task finishes.
+//
+// Each iteration sleeps a random delay in [IngestMin, IngestMax) (3–10s by
+// default). A ListNewTasks / Store failure is logged and retried on the next
+// jitter; it never propagates to or halts the main tick (spec §11 resilience).
+// The loop exits when ctx is cancelled; Run's wg.Wait() awaits it on shutdown.
+func (e *Engine) ingestLoop(ctx context.Context) {
+	defer e.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(e.nextIngestDelay()):
+		}
+		if err := e.ingest(ctx); err != nil {
+			e.logf("[daemon] background ingest error: %v", err)
+		}
+	}
+}
+
+// nextIngestDelay returns the next randomized ingest interval in [IngestMin,
+// IngestMax). Randomizing the cadence (jitter) spreads channel polls off a
+// fixed beat — avoiding synchronized bursts against a rate-limited upstream and
+// making the loop's timing unobservable.
+func (e *Engine) nextIngestDelay() time.Duration {
+	min, max := e.IngestMin, e.IngestMax
+	if min < 0 {
+		min = 0
+	}
+	if max <= min {
+		return min
+	}
+	return min + time.Duration(rand.Int64N(int64(max-min)))
 }
 
 // shortTaskID returns a truncated task ID for log lines (first 12 chars).

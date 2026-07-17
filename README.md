@@ -153,6 +153,8 @@ type: feature
 
 `daemon` 是常驻引擎：同一时刻只有 **1 个子循环**在真正跑代码（单活跃），其余在队列里按 **FIFO** 排队（v1 不做并发 / 优先级 / 依赖调度）。轮询到需要人审（第三层）的任务时，它不干等——把任务 **park** 起来、释放活跃位、去跑队列里下一个；之后轮询到人的回复再 **resume**。daemon 崩溃重启后能从磁盘上的状态重建（含把残留的 `running` 任务收敛回来）。
 
+> **派发是同步的，但摄入不是。** 一个 tick 的派发步骤会阻塞在 `RunTask` 里直到任务跑完（单活跃），所以主循环在一个任务运行期间不会再次 tick——这期间新建的 issue 会进不了 `state.db`、dashboard 也看不见。daemon 因此另起一条**后台摄入 goroutine**，按 3~10s 随机 jitter 独立地 `ListNewTasks → insert`，任务运行中也能把新 issue 落盘（摄入只 insert `new` 任务、绝不占活跃位，所以单活跃派发不破）。`state.db` 开了 WAL + `busy_timeout`，dashboard 用自己那条连接实时读到这些新任务。
+
 ### 任务生命周期
 
 `new | running | needs-review | blocked | needs-info | needs-human-decision | done | error`——全落盘，只有 `running` 占活跃位。
