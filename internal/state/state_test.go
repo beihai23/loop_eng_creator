@@ -1,7 +1,9 @@
 package state
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -452,5 +454,180 @@ func TestStepsOfTask(t *testing.T) {
 	got, err := s.StepsOfTask(tid)
 	if err != nil || len(got) != 2 {
 		t.Fatalf("StepsOfTask=%+v err=%v want 2", got, err)
+	}
+}
+
+// TestOpenSetsWALAndBusyTimeout pins the concurrency pragmas Open configures.
+// WAL is what lets the dashboard's read connection coexist with the daemon's
+// writes; busy_timeout is what lets concurrent writers wait instead of erroring
+// "database is locked". If a future change drops these, the concurrent-write
+// tests below and the dashboard's live view silently regress.
+func TestOpenSetsWALAndBusyTimeout(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("read journal_mode: %v", err)
+	}
+	if strings.ToLower(mode) != "wal" {
+		t.Fatalf("journal_mode=%q want wal", mode)
+	}
+
+	var bt int
+	if err := s.db.QueryRow("PRAGMA busy_timeout").Scan(&bt); err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	if bt <= 0 {
+		t.Fatalf("busy_timeout=%d want >0", bt)
+	}
+}
+
+// TestConcurrentInsertsNoLock is the M3 concurrency acceptance test: many
+// goroutines hammering InsertTask must all succeed under `go test -race` — no
+// "database is locked" (busy_timeout + WAL) and no data race (the driver owns
+// all shared memory). The daemon's background-ingest goroutine and synchronous
+// tick share one Store, so concurrent writes are the production reality.
+func TestConcurrentInsertsNoLock(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const goroutines, perG = 16, 25
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines*perG)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				if _, err := s.InsertTask(TaskRow{
+					IssueRef:    fmt.Sprintf("ref-%d-%d", g, i),
+					Description: "concurrent insert",
+					TaskType:    "feat",
+				}); err != nil {
+					errCh <- fmt.Errorf("goroutine %d insert %d: %w", g, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	refs, err := s.IssueRefs()
+	if err != nil {
+		t.Fatalf("issue refs: %v", err)
+	}
+	if want := goroutines * perG; len(refs) != want {
+		t.Fatalf("expected %d persisted refs, got %d", want, len(refs))
+	}
+}
+
+// TestConcurrentMixedWritesNoLock stresses several write paths (different
+// tables / transactions) concurrently: SetInFlight, AppendTransition,
+// AppendStep. Each is a short transaction; under WAL + busy_timeout they
+// serialize without "database is locked".
+func TestConcurrentMixedWritesNoLock(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	tid, err := s.InsertTask(TaskRow{IssueRef: "seed", Description: "d", TaskType: "feat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runID := newID("run")
+
+	const iters = 100
+	var wg sync.WaitGroup
+	errCh := make(chan error, 3)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if err := s.SetInFlight(tid, "plan"); err != nil {
+				errCh <- fmt.Errorf("SetInFlight: %w", err)
+				return
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if err := s.AppendTransition(tid, "new", "running", "stress"); err != nil {
+				errCh <- fmt.Errorf("AppendTransition: %w", err)
+				return
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if err := s.AppendStep(StepRow{RunID: runID, Seq: i, Role: "plan", Status: "ok"}); err != nil {
+				errCh <- fmt.Errorf("AppendStep: %w", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	// Spot-check the writers actually wrote.
+	if got, _ := s.Replay(runID); len(got) != iters {
+		t.Fatalf("steps persisted=%d want %d", len(got), iters)
+	}
+	ifl, ok, _ := s.InFlight()
+	if !ok || ifl.TaskID != tid {
+		t.Fatalf("in_flight after churn = %+v ok=%v, want task %s", ifl, ok, tid)
+	}
+}
+
+// TestSeparateConnectionSeesCommittedWrite proves cross-connection visibility —
+// the dashboard opens its own Store (own *sql.DB / connection pool, often its
+// own process) and must see tasks the daemon just committed. WAL readers see the
+// latest committed snapshot without blocking on the writer, so this holds even
+// while the daemon is mid-write.
+func TestSeparateConnectionSeesCommittedWrite(t *testing.T) {
+	path := t.TempDir() + "/state.db"
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	reader, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	if _, err := writer.InsertTask(TaskRow{
+		IssueRef: "R1", Description: "reader-visible", TaskType: "feat",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := reader.TasksByStatus()
+	if err != nil {
+		t.Fatalf("reader TasksByStatus: %v", err)
+	}
+	if len(views) != 1 || views[0].IssueRef != "R1" {
+		t.Fatalf("reader did not see committed write: %+v", views)
 	}
 }

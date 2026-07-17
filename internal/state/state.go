@@ -53,8 +53,31 @@ var schema = []string{
 	`CREATE INDEX IF NOT EXISTS idx_commands_pending ON commands(applied_at)`,
 }
 
+// Open opens (creating if absent) the durable state DB at path and migrates its
+// schema. The connection is configured for safe multi-reader/single-writer
+// concurrency:
+//
+//   - journal_mode=WAL — readers (the dashboard process, `status --watch`) never
+//     block the writer and vice-versa, and a reader sees the latest committed
+//     snapshot. This is what makes a long daemon write (or a task being run)
+//     transparent to the dashboard's 2s data tick.
+//   - busy_timeout=5000ms — on writer contention (two writers, or a checkpoint)
+//     SQLite waits up to 5s for the lock instead of erroring "database is
+//     locked". The daemon's background-ingest goroutine shares this Store with
+//     the synchronous tick; quick single-row writes serialize within that window.
+//   - synchronous=NORMAL — the WAL-safe compromise. FULL would fsync every
+//     commit (slowest, survives power loss); NORMAL skips the per-commit fsync
+//     and only risks corruption on a power loss *mid-commit* (a crash/kill is
+//     still safe — WAL is replayed). For an append-only per-task trace store
+//     whose lifecycle is re-derivable from the transitions table (principle 4),
+//     that risk is acceptable for the throughput gain.
+//
+// These run as DSN pragmas so the modernc driver applies them on *every* pooled
+// connection at open (busy_timeout / synchronous are per-connection; WAL is also
+// persistent in the DB header). See modernc.org/sqlite applyQueryParams.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}

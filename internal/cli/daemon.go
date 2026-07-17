@@ -107,11 +107,13 @@ func NewDaemonCmd() *cobra.Command {
 				interval = cfg.Daemon.PollInterval
 			}
 			eng := &daemon.Engine{
-				Channel:  ch,
-				Store:    st,
-				Interval: interval,
-				Cooldown: cooldown,
-				RunTask:  runTask,
+				Channel:   ch,
+				Store:     st,
+				Interval:  interval,
+				Cooldown:  cooldown,
+				RunTask:   runTask,
+				IngestMin: 3 * time.Second,
+				IngestMax: 10 * time.Second,
 			}
 
 			ctx, cancel := context.WithCancel(context.Background())
