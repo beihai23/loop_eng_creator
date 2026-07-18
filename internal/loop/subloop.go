@@ -185,6 +185,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	if fb, err := sl.Store.PopResumeFeedback(taskID); err == nil && fb != "" {
 		priorFailure = fb
 	}
+	// lastCompileError 携带「上一轮 verify 驳回若是编译/构建类错误」的原始 detail，作为
+	// 结构化的一手信号喂给下一轮 execute prompt 的独立显眼段（#46）：编译错误原本要绕
+	// verify detail → issue 评论 → collectIssueComments → 战报散文 才到 execute，信号被
+	// 稀释到 execute 连续多轮不修。空串表示上一轮无编译错误（首次或语义驳回）。
+	lastCompileError := ""
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
 		if ok, _ := sl.Store.CancelRequested(taskID); ok {
@@ -288,6 +293,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 知道「为什么改」才能不在被删除/改写的条款上浪费力气或自作主张补回。
 		if criteriaRevised && planOut.CriteriaNotes != "" {
 			execPrompt += "（以上验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）\n"
+		}
+		// 编译错误特化（#46）：上一轮 verify 驳回若是编译/构建类错误，作为独立且显眼的段
+		// 直达 execute prompt——不埋进下面的战报散文（issue 评论）。这是确定性、可机械判定
+		// 的杠杆：字符串特征命中 + prompt 拼装，直接命中 #46「execute 连续多轮不修编译错误」
+		// 的失败模式。非编译错误（如 tier-2 语义驳回）compileErrorSection 返回空串，不触发。
+		if sec := compileErrorSection(lastCompileError); sec != "" {
+			execPrompt += sec
 		}
 		// 全文保留：issue 原文（背景/约束/上下文）也喂给 execute——「任务」行只是
 		// 首行蒸馏，实现细节往往藏在正文其余段落里。
@@ -413,6 +425,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 发评论失败只记日志、不 gate loop（与 report 的 PostComment 容错一致）。
 		if cErr := sl.Channel.PostComment(ctx, task.Ref, verifyFailComment(effTask, attempt, res)); cErr != nil {
 			sl.logf("[subloop] %s verify-fail comment post failed: %v", sid, cErr)
+		}
+		// 编译错误信号更新（#46）：本轮驳回是编译/构建类 → 把原始 detail 存为下一轮 execute
+		// 的结构化一手信号；非编译错误（如 tier-2 语义驳回）→ 清空，避免上一轮已修好的编译
+		// 错误作为陈旧信号残留、误导下一轮 execute。lastCompileError 永远反映「最近一轮驳回
+		// 是否为编译错误」。
+		if looksLikeCompileError(res.Detail) {
+			lastCompileError = res.Detail
+		} else {
+			lastCompileError = ""
 		}
 		priorFailure = res.Detail
 		isolation.Discard(sl.Repo, wt)
