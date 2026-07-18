@@ -27,7 +27,8 @@ type Model struct {
 	tab           tab
 	width, height int
 	quit          bool
-	selIdx        int       // 总览列表选中索引
+	selIdx        int       // 总览列表选中索引（全局，跨滚动窗口）
+	offset        int       // 总览滚动窗口起点（tasks[offset] 是首个可见行）
 	selTask       string    // 当前选中的 task id（详情/轨迹用）
 	snap          *Snapshot // 数据 tick 刷新
 	animPhase     float64   // 动画相位（动画 tick 推进）
@@ -68,10 +69,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		// 高度变化会改可视行数：重新收敛窗口，保证选中行仍可见
+		m.clampScroll()
 
 	case dataTickMsg:
 		snap, _ := ReadSnapshot(m.store, m.cfg)
 		m.snap = snap
+		m.clampScroll()      // 列表可能变长/变短：selIdx 与 offset 重新收敛
 		return m, dataTick() // 继续
 
 	case animTickMsg:
@@ -109,10 +113,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selIdx > 0 {
 				m.selIdx--
 			}
+			m.clampScroll()
 		case "down", "j":
 			if m.snap != nil && m.selIdx < len(m.snap.Tasks)-1 {
 				m.selIdx++
 			}
+			m.clampScroll()
 		case "enter":
 			if m.snap != nil && m.selIdx < len(m.snap.Tasks) {
 				m.selTask = m.snap.Tasks[m.selIdx].ID
@@ -135,6 +141,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// clampScroll 收敛 selIdx 与 offset：selIdx 限到列表范围内，offset 按
+// visibleRowsFor(m.height) 调整，保证选中行始终落在可视窗内（上/下越界自动滚动）。
+func (m *Model) clampScroll() {
+	total := 0
+	if m.snap != nil {
+		total = len(m.snap.Tasks)
+	}
+	if m.selIdx >= total {
+		m.selIdx = total - 1
+	}
+	if m.selIdx < 0 {
+		m.selIdx = 0
+	}
+	m.offset = adjustOffset(m.selIdx, m.offset, visibleRowsFor(m.height), total)
+}
+
 // View 按当前 tab 渲染一帧。首屏数据未到时先读一次。
 func (m Model) View() string {
 	if m.quit {
@@ -146,7 +168,9 @@ func (m Model) View() string {
 	}
 	switch m.tab {
 	case tabOverview:
-		return RenderOverview(m.snap, m.selIdx, m.animPhase, m.width)
+		visible := visibleRowsFor(m.height)
+		off := adjustOffset(m.selIdx, m.offset, visible, len(m.snap.Tasks))
+		return RenderOverview(m.snap, m.selIdx, off, visible, m.animPhase, m.width)
 	case tabDetail:
 		if m.selTask == "" {
 			return "（未选中任务）\n"

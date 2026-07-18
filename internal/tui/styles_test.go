@@ -30,14 +30,14 @@ func TestNoColorDegradesToText(t *testing.T) {
 	// 控制：彩色 profile 下 RenderOverview 确实上色（含 ANSI 转义）。
 	// 这证明未降级时颜色存在——即降级前 RED 状态。
 	lipgloss.SetColorProfile(termenv.TrueColor)
-	colored := RenderOverview(snap, 0, 0.0, 80)
+	colored := RenderOverview(snap, 0, 0, 50, 0.0, 80)
 	if !strings.Contains(colored, "\x1b[") {
 		t.Fatalf("control: TrueColor 下应含 ANSI 颜色转义, got %q", colored)
 	}
 
 	// 降级：Ascii profile 下无任何 ANSI 转义（颜色/bold/faint 全剥离）。
 	lipgloss.SetColorProfile(termenv.Ascii)
-	out := RenderOverview(snap, 0, 0.0, 80)
+	out := RenderOverview(snap, 0, 0, 50, 0.0, 80)
 	if strings.Contains(out, "\x1b[") {
 		t.Fatalf("Ascii 下仍含 ANSI 转义: %q", out)
 	}

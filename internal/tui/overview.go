@@ -15,14 +15,58 @@ const (
 	ovStatusW = 14
 )
 
+// ovOverheadRows 是总览一帧里除任务行之外的固定行数：
+// 标题 1 + 计数条 1 + 空行 1 + 表格上边框 1 + 列头 1 + 分隔线 1 + 下边框 1 +
+// 空行 1 + 底栏按键提示 1 = 9。可视任务行数 = 终端高 - ovOverheadRows。
+const ovOverheadRows = 9
+
+// visibleRowsFor 按终端高度算可视任务行数（至少 1，保证选中行总能被渲染）。
+func visibleRowsFor(height int) int {
+	v := height - ovOverheadRows
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+// adjustOffset 调整滚动窗口起点，让 selIdx 落在 [offset, offset+visible) 内：
+// selIdx 越过窗口上沿则上滚到 selIdx，越过下沿则下滚到 selIdx 贴底；
+// 最后 clamp 到 [0, max(0, total-visible)]。纯函数，供 Update/View 共用。
+func adjustOffset(selIdx, offset, visible, total int) int {
+	if visible < 1 {
+		visible = 1
+	}
+	if selIdx < offset {
+		offset = selIdx
+	}
+	if selIdx >= offset+visible {
+		offset = selIdx - visible + 1
+	}
+	maxOffset := total - visible
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset > maxOffset {
+		offset = maxOffset
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return offset
+}
+
 // RenderOverview 渲染 [1] 总览：标题 + 状态计数（符号即 legend）+ 边框表格
 // （列头 №/状态/任务 + 分隔线 + 任务行）。纯函数（无 Store/终端/真时间）。
 //
 // 设计取舍（spec §6 + 可读性）：颜色只是锦上添花——边框/列头/分隔线/▶ 选中标记
 // 这些**结构性**元素在 NO_COLOR/非 TTY 降级（Ascii profile）下也立得住，这才是
-// 让「表格看起来可交互、字段不靠猜」的根。selIdx 是光标所在行；animPhase 进行中
-// 呼吸灯；w 终端宽度（列宽/盒宽/截断据此对齐）。
-func RenderOverview(snap *Snapshot, selIdx int, animPhase float64, w int) string {
+// 让「表格看起来可交互、字段不靠猜」的根。selIdx 是光标所在行（全局索引）；
+// animPhase 进行中呼吸灯；w 终端宽度（列宽/盒宽/截断据此对齐）。
+//
+// 滚动：只渲染可视窗 snap.Tasks[offset:offset+visibleRows]（visibleRows 由
+// visibleRowsFor(m.height) 算出）；offset/visibleRows 越界时在此兜底 clamp，
+// 保证不传「渲染不出来」的参数也能得到合法窗口。
+func RenderOverview(snap *Snapshot, selIdx, offset, visibleRows int, animPhase float64, w int) string {
 	if w < 40 {
 		w = 40 // 极窄终端兜底，保证列头不挤
 	}
@@ -60,8 +104,25 @@ func RenderOverview(snap *Snapshot, selIdx int, animPhase float64, w int) string
 	// 分隔线：宽 = innerW，是表格里最宽的行 → lipgloss 据此把整盒定到 innerW+2 = w。
 	sep := strings.Repeat("─", innerW)
 
+	// 可视窗：clamp 后只渲染 tasks[offset:end]（i 仍是全局索引，选中判定不受滚动影响）。
+	total := len(snap.Tasks)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := offset + visibleRows
+	if end > total {
+		end = total
+	}
+	if end < offset {
+		end = offset
+	}
+
 	var rows []string
-	for i, t := range snap.Tasks {
+	for i := offset; i < end; i++ {
+		t := snap.Tasks[i]
 		sel := i == selIdx
 		marker := strings.Repeat(" ", ovMarkerW)
 		if sel {
