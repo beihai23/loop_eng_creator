@@ -170,3 +170,59 @@ daemon: { poll_interval: 90s }
 		t.Fatalf("poll_interval = %v, want 90s", cfg.Daemon.PollInterval)
 	}
 }
+
+// TestSaveLoadRoundTrip covers the `loop-eng config` write path: Save must
+// emit YAML that Load reads back field-for-field, for both the linear block
+// (Project/Team/StatusMap) and the local inbox field — and Load's validation
+// must accept what Save wrote.
+func TestSaveLoadRoundTrip(t *testing.T) {
+	mk := func() ModelRef { return ModelRef{Via: "claude-p", Binary: "claude"} }
+	cfg := &Config{
+		Models: Models{Triage: mk(), Plan: mk(), Execute: mk(), Verify: mk()},
+		Budget: Budget{PerCallTokens: 1, PerTaskTokens: 2, MaxRetries: 3},
+		Channel: Channel{
+			Provider: "linear",
+			Linear:   &LinearChannel{Project: "proj", Team: "ENG", StatusMap: map[string]string{"started": "started"}},
+		},
+	}
+	p := filepath.Join(t.TempDir(), "config.yaml")
+	if err := Save(p, cfg); err != nil {
+		t.Fatalf("Save(linear): %v", err)
+	}
+	got, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load(linear): %v", err)
+	}
+	if got.Channel.Provider != "linear" || got.Channel.Linear == nil ||
+		got.Channel.Linear.Project != "proj" || got.Channel.Linear.Team != "ENG" ||
+		got.Channel.Linear.StatusMap["started"] != "started" {
+		t.Fatalf("linear round-trip mismatch: %+v", got.Channel)
+	}
+
+	cfg.Channel = Channel{Provider: "local", Inbox: "todo/"}
+	if err := Save(p, cfg); err != nil {
+		t.Fatalf("Save(local): %v", err)
+	}
+	got2, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load(local): %v", err)
+	}
+	if got2.Channel.Provider != "local" || got2.Channel.Inbox != "todo/" || got2.Channel.Linear != nil {
+		t.Fatalf("local round-trip mismatch: %+v", got2.Channel)
+	}
+}
+
+func TestLoadRejectsLinearWithoutProject(t *testing.T) {
+	p := writeFile(t, `
+models:
+  triage: { binary: c }
+  plan: { binary: c }
+  execute: { binary: c }
+  verify: { binary: c }
+budget: { per_call_tokens: 1, per_task_tokens: 1, max_retries: 1 }
+channel: { provider: linear }
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("expected error for linear provider without project")
+	}
+}

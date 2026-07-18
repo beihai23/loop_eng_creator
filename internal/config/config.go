@@ -19,9 +19,23 @@ type Config struct {
 }
 
 type Channel struct {
-	Provider  string `yaml:"provider"`   // "" | "local" | "github"
+	Provider  string `yaml:"provider"`   // "" | "local" | "github" | "linear"
 	Repo      string `yaml:"repo"`       // "owner/name"（github 必填）
 	TaskLabel string `yaml:"task_label"` // issue 过滤标签（github 必填）
+	// Inbox 是 local provider 的 inbox 路径（相对 repo 根），空 = 默认 "inbox"。
+	Inbox string `yaml:"inbox,omitempty"`
+	// Linear 是 linear provider 的配置块；指针为 nil 时整块省略。
+	// API key 不进 config.yaml（#24 决定 A）——走 env LOOP_ENG_LINEAR_API_KEY
+	// 或 gitignore 的 .loop/linear.key。
+	Linear *LinearChannel `yaml:"linear,omitempty"`
+}
+
+// LinearChannel carries the linear provider config (see
+// docs/superpowers/specs/linear-channel-mapping.md §9).
+type LinearChannel struct {
+	Project   string            `yaml:"project"`              // name 或 uuid（按 project 过滤，linear 必填）
+	Team      string            `yaml:"team,omitempty"`       // team key（如 ENG），可空
+	StatusMap map[string]string `yaml:"status_map,omitempty"` // loop status / state type → Linear WorkflowState
 }
 
 type Models struct {
@@ -102,6 +116,24 @@ func (c *Config) validate() error {
 	}
 	if c.Channel.Provider == "github" && (c.Channel.Repo == "" || c.Channel.TaskLabel == "") {
 		return fmt.Errorf("channel: github provider 需 repo 与 task_label")
+	}
+	if c.Channel.Provider == "linear" && (c.Channel.Linear == nil || c.Channel.Linear.Project == "") {
+		return fmt.Errorf("channel: linear provider 需 linear.project")
+	}
+	return nil
+}
+
+// Save writes c as YAML to path (0644), replacing the file wholesale. It does
+// NOT validate — Load is the validation gate (a half-edited config can still
+// be written; it just won't load). Save/Load round-trip is guaranteed for
+// every field, including daemon.poll_interval (time.Duration: 60s ↔ 1m0s).
+func Save(path string, c *Config) error {
+	raw, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		return fmt.Errorf("write config: %w", err)
 	}
 	return nil
 }

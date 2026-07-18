@@ -112,9 +112,17 @@ func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
 	}
 	switch prov {
 	case "local":
-		return channel.NewLocal(repo), nil
+		ch := channel.NewLocal(repo)
+		if cfg.Channel.Inbox != "" {
+			ch.InboxDir = cfg.Channel.Inbox
+		}
+		return ch, nil
 	case "github":
 		return channel.NewGitHub(cfg.Channel.Repo, cfg.Channel.TaskLabel), nil
+	case "linear":
+		// `loop-eng config` 已能写 linear 配置，但 linear channel 实现不在
+		// 本任务范围——给明确错误而非笼统的 unknown provider。
+		return nil, fmt.Errorf("channel provider linear 配置已就绪，但 linear channel 尚未实现（见 #30）")
 	default:
 		return nil, fmt.Errorf("unknown channel provider: %s", prov)
 	}

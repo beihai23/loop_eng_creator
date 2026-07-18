@@ -42,56 +42,66 @@ daemon: { poll_interval: 60s }
 // so that .loop/worktrees/ and friends don't pollute git status (裁决 H).
 const gitignoreMarker = ".loop/"
 
-// NewInitCmd builds `loop-eng init`: scaffolds <repo>/.loop/ (config.yaml +
-// copied default skills + state.db + worktrees/) and appends `.loop/` to the
-// repo's .gitignore when absent.
+// NewInitCmd builds `loop-eng init`: a backward-compatible alias of
+// `loop-eng config` (issue: config 合并 init — 一条命令搞定脚手架 + 配置).
+// It prints a deprecation hint, then runs the exact same path as config:
+// scaffold .loop/ when missing, then the interactive provider walkthrough.
+// Non-interactive callers (scripts/CI with stdin at EOF) get EOF at the
+// provider prompt → "keep current config" → scaffold-only, exit 0 — i.e. the
+// old init behavior plus one deprecation line. Do NOT delete this command:
+// README/docs/scripts still reference it.
 func NewInitCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "在当前仓库生成 .loop/（配置 + skill + state.db）",
+		Short: "（deprecated，请改用 config）在当前仓库生成 .loop/ 并交互式配置",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if repo == "" {
 				repo, _ = os.Getwd()
 			}
-			loopDir := filepath.Join(repo, ".loop")
-			for _, sub := range []string{"skills", "worktrees"} {
-				if err := os.MkdirAll(filepath.Join(loopDir, sub), 0755); err != nil {
-					return err
-				}
-			}
-			if err := os.WriteFile(filepath.Join(loopDir, "config.yaml"), []byte(defaultConfig), 0644); err != nil {
-				return err
-			}
-			entries, err := skillFiles.ReadDir("embed/skills")
-			if err != nil {
-				return fmt.Errorf("read embedded skills: %w", err)
-			}
-			for _, e := range entries {
-				raw, err := skillFiles.ReadFile("embed/skills/" + e.Name())
-				if err != nil {
-					return fmt.Errorf("read embedded skill %s: %w", e.Name(), err)
-				}
-				if err := os.WriteFile(filepath.Join(loopDir, "skills", e.Name()), raw, 0644); err != nil {
-					return err
-				}
-			}
-			st, err := state.Open(filepath.Join(loopDir, "state.db"))
-			if err != nil {
-				return err
-			}
-			if err := st.Close(); err != nil {
-				return err
-			}
-			if err := ensureGitignore(repo); err != nil {
-				return err
-			}
-			fmt.Println("loop-eng initialized at", loopDir)
-			return nil
+			fmt.Fprintln(cmd.ErrOrStderr(), "注意：'loop-eng init' 已并入 'loop-eng config'；init 为 deprecated alias，请改用 config")
+			return runConfigInteractive(cmd.InOrStdin(), cmd.OutOrStdout(), repo)
 		},
 	}
 	cmd.Flags().StringVar(&repo, "repo", "", "目标仓库路径（默认当前目录）")
 	return cmd
+}
+
+// scaffoldLoop scaffolds <repo>/.loop/ (default config.yaml + copied embedded
+// skills + state.db + worktrees/) and appends `.loop/` to the repo's
+// .gitignore when absent (裁决 H). The success banner is printed by callers
+// (runConfigInteractive), not here.
+func scaffoldLoop(repo string) error {
+	loopDir := filepath.Join(repo, ".loop")
+	for _, sub := range []string{"skills", "worktrees"} {
+		if err := os.MkdirAll(filepath.Join(loopDir, sub), 0755); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(loopDir, "config.yaml"), []byte(defaultConfig), 0644); err != nil {
+		return err
+	}
+	entries, err := skillFiles.ReadDir("embed/skills")
+	if err != nil {
+		return fmt.Errorf("read embedded skills: %w", err)
+	}
+	for _, e := range entries {
+		raw, err := skillFiles.ReadFile("embed/skills/" + e.Name())
+		if err != nil {
+			return fmt.Errorf("read embedded skill %s: %w", e.Name(), err)
+		}
+		if err := os.WriteFile(filepath.Join(loopDir, "skills", e.Name()), raw, 0644); err != nil {
+			return err
+		}
+	}
+	st, err := state.Open(filepath.Join(loopDir, "state.db"))
+	if err != nil {
+		return err
+	}
+	if err := st.Close(); err != nil {
+		return err
+	}
+	return ensureGitignore(repo)
 }
 
 // ensureGitignore appends `.loop/` to <repo>/.gitignore, creating the file if
