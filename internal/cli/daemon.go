@@ -14,6 +14,7 @@ import (
 	"loop-eng/internal/channel"
 	"loop-eng/internal/daemon"
 	"loop-eng/internal/loop"
+	"loop-eng/internal/skill"
 	"loop-eng/internal/state"
 	"loop-eng/internal/verify"
 )
@@ -104,6 +105,20 @@ func NewDaemonCmd() *cobra.Command {
 				return out.Status, out.Detail, nil
 			}
 
+			// Triage 门：派发前对 FIFO 队首分诊（spec triage/gate）。buildModels 需要
+			// 一个 Enforcer，但 triage 本身不走 budget（per-run 作用域，triage 在 run
+			// 之前；一次小调用/次派发）——只为构建 skill 传一个独立的 Enforcer。
+			_, _, _, triageSkill := buildModels(cfg, models, budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries))
+			triageFn := func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error) {
+				out, _, err := triageSkill.Run(ctx, skill.TriageInput{
+					TaskDescription:    task.Description,
+					AcceptanceCriteria: task.Criteria,
+					TaskType:           task.TaskType,
+					Body:               task.Body, // 全文：判断「缺不缺信息」以全文为准
+				})
+				return out, err
+			}
+
 			interval := pollInterval
 			if cfg.Daemon.PollInterval > 0 {
 				interval = cfg.Daemon.PollInterval
@@ -114,6 +129,7 @@ func NewDaemonCmd() *cobra.Command {
 				Interval:  interval,
 				Cooldown:  cooldown,
 				RunTask:   runTask,
+				Triage:    triageFn,
 				IngestMin: 3 * time.Second,
 				IngestMax: 10 * time.Second,
 			}

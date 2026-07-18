@@ -43,6 +43,9 @@ type TriageInput struct {
 	TaskDescription    string
 	AcceptanceCriteria []string
 	TaskType           string
+	// Body is the full raw issue text (背景/约束/上下文)。TaskDescription 只是
+	// 正文首行的蒸馏——判断「缺不缺信息」恰恰要看全文，不能只凭首行。
+	Body string
 }
 type TriageOutput struct {
 	Startable          bool     `json:"startable"`

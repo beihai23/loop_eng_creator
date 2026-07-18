@@ -360,6 +360,21 @@ func (s *Store) BlockedTasks() ([]TaskRow, error) {
 	return s.listTasksByStatus("blocked")
 }
 
+// NeedsInfoTasks returns every task parked by the triage gate for missing
+// information (status="needs-info"), oldest first. The daemon polls these for
+// human replies — a reply supplies the missing info and re-queues the task
+// (→ new), where the next dispatch re-triages with the fresh context.
+func (s *Store) NeedsInfoTasks() ([]TaskRow, error) {
+	return s.listTasksByStatus("needs-info")
+}
+
+// NeedsHumanDecisionTasks returns every task parked by the triage gate for a
+// human decision (status="needs-human-decision"), oldest first. Polled like
+// NeedsInfoTasks: a human reply carries the decision and re-queues the task.
+func (s *Store) NeedsHumanDecisionTasks() ([]TaskRow, error) {
+	return s.listTasksByStatus("needs-human-decision")
+}
+
 // TerminalTasks returns every task whose status is "done" or "blocked" — the
 // terminal states that the daemon's reconcile step checks against the channel
 // side for human-driven reversals (reopen, un-label).
@@ -704,6 +719,7 @@ func (s *Store) TasksByStatus() ([]TaskView, error) {
 		 FROM tasks t JOIN task_status ts ON ts.task_id = t.id
 		 ORDER BY CASE ts.status
 		     WHEN 'new' THEN 1 WHEN 'needs-review' THEN 2 WHEN 'needs-info' THEN 3
+		     WHEN 'needs-human-decision' THEN 3
 		     WHEN 'blocked' THEN 4 WHEN 'done' THEN 5 WHEN 'cancelled' THEN 6
 		     ELSE 7 END, CAST(t.issue_ref AS INTEGER) ASC, t.created_at`)
 	if err != nil {

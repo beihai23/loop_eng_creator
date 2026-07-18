@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"loop-eng/internal/channel"
+	"loop-eng/internal/skill"
 	"loop-eng/internal/state"
 )
 
@@ -20,9 +22,10 @@ import (
 // UpdateStatus are no-ops — writeback belongs to the SubLoop, not the daemon
 // tick under test.
 type scriptedChannel struct {
-	batches [][]channel.Task
-	replies map[string][]channel.Reply // human replies per issue ref; nil/empty → none
-	calls   int
+	batches  [][]channel.Task
+	replies  map[string][]channel.Reply // human replies per issue ref; nil/empty → none
+	calls    int
+	comments []string // PostComment 收到的正文（按序），供断言写回内容
 }
 
 func (f *scriptedChannel) ListNewTasks(ctx context.Context) ([]channel.Task, error) {
@@ -46,7 +49,10 @@ func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string, since 
 	}
 	return out, nil
 }
-func (f *scriptedChannel) PostComment(ctx context.Context, ref, body string) error    { return nil }
+func (f *scriptedChannel) PostComment(ctx context.Context, ref, body string) error {
+	f.comments = append(f.comments, body)
+	return nil
+}
 func (f *scriptedChannel) UpdateStatus(ctx context.Context, ref, status string) error { return nil }
 func (f *scriptedChannel) CloseIssue(ctx context.Context, ref string) error           { return nil }
 func (f *scriptedChannel) GetTaskStates(ctx context.Context, refs []string) (map[string]channel.TaskState, error) {
@@ -920,5 +926,133 @@ func TestIngestResyncsBodyOnlyEdit(t *testing.T) {
 	specs, _ := st.TaskSpecsByRef()
 	if specs["A"].Body != "task A\n\n背景 v2（补充了约束）" {
 		t.Fatalf("body-only 编辑未触发重新摄入: %q", specs["A"].Body)
+	}
+}
+
+// TestTriageGate 钉死 triage 派发门的三条分支 + 唤醒回路：
+//  1. !startable → needs-info：不占活跃位（RunTask 未被调用），issue 收到缺信息评论；
+//  2. 人补充信息（评论）→ pollSignals 唤醒 → 重新分诊（这次 startable）→ 正常派发；
+//  3. needs_human_decision → needs-human-decision 挂起。
+// 同时断言 TriageFunc 拿到全文 Body（分诊判断「缺不缺信息」的输入）。
+func TestTriageGate(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{
+		batches: [][]channel.Task{
+			{{Ref: "A", Description: "首行描述", TaskType: "feat", Body: "首行描述\n\n## 背景\n全文要到达分诊"}},
+			nil, nil, // 后续 tick 无新任务
+		},
+		replies: map[string][]channel.Reply{},
+	}
+	var ran bool
+	var triageCalls int
+	var triageBody string
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
+			ran = true
+			return "done", "", nil
+		},
+		Triage: func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error) {
+			triageCalls++
+			triageBody = task.Body
+			if triageCalls == 1 {
+				return skill.TriageOutput{
+					Startable: false, MissingInfo: []string{"要改哪个接口"}, Reason: "无法定位改动点",
+				}, nil
+			}
+			return skill.TriageOutput{Startable: true, LoopDoable: true, Difficulty: "low"}, nil
+		},
+	}
+
+	// tick 1：分诊拦下 → needs-info，RunTask 未被调用，评论含缺信息清单。
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if ran {
+		t.Fatal("!startable 时 RunTask 不应被调用")
+	}
+	statuses, _ := st.ListStatuses()
+	if len(statuses) != 1 || statuses[0].Status != "needs-info" {
+		t.Fatalf("task 应为 needs-info, got %+v", statuses)
+	}
+	if len(ch.comments) != 1 || !strings.Contains(ch.comments[0], "要改哪个接口") || !strings.Contains(ch.comments[0], "NEEDS-INFO") {
+		t.Fatalf("缺信息评论未发出或内容不对: %+v", ch.comments)
+	}
+	if triageBody != "首行描述\n\n## 背景\n全文要到达分诊" {
+		t.Fatalf("TriageFunc 未拿到全文 Body: %q", triageBody)
+	}
+
+	// 人补充信息 → tick 2：pollSignals 唤醒（needs-info → new）→ 重新分诊 startable → 派发跑完。
+	ch.replies["A"] = []channel.Reply{{Body: "改 channel.Linear 接口"}}
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if !ran {
+		t.Fatal("唤醒+分诊通过后 RunTask 应被调用")
+	}
+	statuses, _ = st.ListStatuses()
+	if statuses[0].Status != "done" {
+		t.Fatalf("唤醒后应跑完 done, got %s", statuses[0].Status)
+	}
+	if triageCalls != 2 {
+		t.Fatalf("唤醒后应重新分诊, triageCalls=%d", triageCalls)
+	}
+}
+
+// TestTriageGateHumanDecision：needs_human_decision → needs-human-decision 挂起，
+// 不占活跃位；分诊器报错不 gate（照跑，可用性优先）。
+func TestTriageGateHumanDecision(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{{Ref: "A", Description: "deploy to prod", TaskType: "deploy"}},
+		{{Ref: "B", Description: "task B", TaskType: "feat"}},
+	}}
+	var ran []string
+	triageN := 0
+	eng := &Engine{
+		Channel: ch, Store: st, Interval: time.Second,
+		RunTask: func(ctx context.Context, task state.TaskRow) (string, string, error) {
+			ran = append(ran, task.IssueRef)
+			return "done", "", nil
+		},
+		Triage: func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error) {
+			triageN++
+			if task.IssueRef == "A" {
+				return skill.TriageOutput{Startable: true, LoopDoable: true, NeedsHumanDecision: true, Reason: "生产部署需人批准"}, nil
+			}
+			return skill.TriageOutput{}, errors.New("triage backend down")
+		},
+	}
+
+	// tick 1：A 被挂起到 needs-human-decision。
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	statusOf := func(ref string) string {
+		specs, _ := st.TaskSpecsByRef()
+		rows, _ := st.ListStatuses()
+		for _, r := range rows {
+			if r.ID == specs[ref].ID {
+				return r.Status
+			}
+		}
+		return ""
+	}
+	if s := statusOf("A"); s != "needs-human-decision" {
+		t.Fatalf("A 应为 needs-human-decision, got %s", s)
+	}
+	if len(ran) != 0 {
+		t.Fatalf("挂起任务不应运行, ran=%v", ran)
+	}
+	if len(ch.comments) != 1 || !strings.Contains(ch.comments[0], "NEEDS-HUMAN-DECISION") {
+		t.Fatalf("人审评论未发出: %+v", ch.comments)
+	}
+
+	// tick 2：B 的分诊器报错 → 不 gate，照常派发。
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if len(ran) != 1 || ran[0] != "B" {
+		t.Fatalf("triage 报错不应阻塞派发, ran=%v", ran)
 	}
 }
