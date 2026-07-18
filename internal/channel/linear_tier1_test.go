@@ -2,7 +2,7 @@ package channel
 
 // Tier-1 acceptance for the Linear channel, black-box against the plan-pinned
 // contract:
-//   - func NewLinear(apiKey, projectID, teamID, endpoint string, statusMap map[string]string) *Linear
+//   - func NewLinear(apiKey, endpoint, projectID, teamID string, statusMap map[string]string) *Linear
 //   - Linear satisfies the frozen Channel interface (six methods, no more).
 //   - Authorization header carries the raw API key (NO Bearer prefix).
 //   - GraphQL "errors" arrays fold into Go errors.
@@ -84,7 +84,7 @@ func TestTier1LinearChannel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	lc := NewLinear("test-key", "proj-uuid", "team-uuid", srv.URL, map[string]string{"done": "Done"})
+	lc := NewLinear("test-key", srv.URL, "proj-uuid", "team-uuid", map[string]string{"done": "Done"})
 	ctx := context.Background()
 
 	// ListNewTasks: project-filtered issues, description parsed via parseLocalTask.
@@ -204,7 +204,7 @@ func TestTier1LinearGQLErrors(t *testing.T) {
 		io.WriteString(w, `{"errors":[{"message":"boom"}]}`)
 	}))
 	defer srv.Close()
-	lc := NewLinear("test-key", "proj-uuid", "team-uuid", srv.URL, nil)
+	lc := NewLinear("test-key", srv.URL, "proj-uuid", "team-uuid", nil)
 	_, err := lc.ListNewTasks(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("err=%v want GraphQL errors folded into Go error containing 'boom'", err)

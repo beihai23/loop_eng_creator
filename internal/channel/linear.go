@@ -77,48 +77,23 @@ type linearState struct {
 	Type string `json:"type"`
 }
 
-// NewLinear 构造 Linear 通道。签名是容忍式的：第一个参数之后的参数按
-// 「字符串 + map[string]string」收集——含 "://" 的字符串视为 endpoint，
-// 其余字符串按顺序依次是 apiKey、projectID、teamID，map 视为 statusMap。
-// 因此以下两种调用等价可用：
+// NewLinear 构造 Linear 通道，参数按显式位置语义命名（不再按内容猜测）：
 //
-//	NewLinear(apiKey, projectID, teamID, statusMap)            // 走默认/环境
-//	NewLinear(apiKey, endpoint, projectID, teamID, statusMap)  // 显式 endpoint
+//	NewLinear(apiKey, endpoint, projectID, teamID, statusMap)
 //
-// apiKey 为空（或未给）时，每次请求回落读环境变量 LOOP_ENG_LINEAR_API_KEY。
-func NewLinear(first string, rest ...any) *Linear {
+//   - apiKey 为空时，每次请求回落读环境变量 LOOP_ENG_LINEAR_API_KEY。
+//   - endpoint 为空时，由 gqlEndpoint() 回落 DefaultLinearEndpoint。
+//   - statusMap 为 loop status → Linear WorkflowState name 的可配映射（可为 nil）。
+//
+// 导出与未导出字段同步写入：导出字段供包外（如 cli 层）读取配置，
+// 未导出字段供包内测试直接替换 endpoint/key 指向 mock server。
+func NewLinear(apiKey, endpoint, projectID, teamID string, statusMap map[string]string) *Linear {
 	lc := &Linear{}
-	var strs []string
-	if first != "" {
-		strs = append(strs, first)
-	}
-	for _, a := range rest {
-		switch v := a.(type) {
-		case string:
-			if v != "" {
-				strs = append(strs, v)
-			}
-		case map[string]string:
-			lc.statusMap, lc.StatusMap = v, v
-		}
-	}
-	var ids []string
-	for _, s := range strs {
-		if strings.Contains(s, "://") {
-			lc.endpoint, lc.Endpoint = s, s
-			continue
-		}
-		ids = append(ids, s)
-	}
-	if len(ids) > 0 {
-		lc.apiKey, lc.APIKey = ids[0], ids[0]
-	}
-	if len(ids) > 1 {
-		lc.projectID, lc.ProjectID = ids[1], ids[1]
-	}
-	if len(ids) > 2 {
-		lc.teamID, lc.TeamID = ids[2], ids[2]
-	}
+	lc.apiKey, lc.APIKey = apiKey, apiKey
+	lc.endpoint, lc.Endpoint = endpoint, endpoint
+	lc.projectID, lc.ProjectID = projectID, projectID
+	lc.teamID, lc.TeamID = teamID, teamID
+	lc.statusMap, lc.StatusMap = statusMap, statusMap
 	return lc
 }
 
