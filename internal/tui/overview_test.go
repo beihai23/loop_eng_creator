@@ -66,7 +66,7 @@ func TestRenderOverviewRunningPhase(t *testing.T) {
 		Tasks:   tasks(),
 		Running: &RunningInfo{TaskID: "t_run", Phase: "execute"},
 		Counts:  map[string]int{"new": 1, "running": 1},
-	}, 0, 0.0, 80)
+	}, 0, 0, 50, 0.0, 80)
 	if !strings.Contains(out, "execute") {
 		t.Fatalf("running row should show phase execute: %q", out)
 	}
@@ -79,7 +79,7 @@ func TestRenderOverviewRunningPhase(t *testing.T) {
 		Tasks:   tasks(),
 		Running: &RunningInfo{TaskID: "t_run", Phase: ""},
 		Counts:  map[string]int{"new": 1, "running": 1},
-	}, 0, 0.0, 80)
+	}, 0, 0, 50, 0.0, 80)
 	if !strings.Contains(out, "running") {
 		t.Fatalf("empty phase should fall back to running: %q", out)
 	}
@@ -89,7 +89,7 @@ func TestRenderOverviewRunningPhase(t *testing.T) {
 		Tasks:   tasks(),
 		Running: &RunningInfo{TaskID: "t_run", Phase: "verify", Retry: 3},
 		Counts:  map[string]int{"new": 1, "running": 1},
-	}, 0, 0.0, 80)
+	}, 0, 0, 50, 0.0, 80)
 	if !strings.Contains(out, "verify") || !strings.Contains(out, "retry 3") {
 		t.Fatalf("running row should show phase + retry 3: %q", out)
 	}
@@ -104,7 +104,7 @@ func TestRenderOverviewNoRunningKeepsStatus(t *testing.T) {
 		},
 		Running: nil,
 		Counts:  map[string]int{"running": 1},
-	}, 0, 0.0, 80)
+	}, 0, 0, 50, 0.0, 80)
 	if !strings.Contains(out, "running") {
 		t.Fatalf("stale running row without Running info should show running: %q", out)
 	}

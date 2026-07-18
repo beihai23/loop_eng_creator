@@ -16,7 +16,7 @@ func TestTier1OverviewRunningPhase(t *testing.T) {
 		Running: &RunningInfo{TaskID: "t1", Phase: "execute"},
 		Counts:  map[string]int{"running": 1},
 	}
-	out := RenderOverview(snap, 0, 0.5, 80)
+	out := RenderOverview(snap, 0, 0, 50, 0.5, 80)
 	if !strings.Contains(out, "execute") {
 		t.Fatalf("running 行必须显示当前 phase=execute, got: %q", out)
 	}
@@ -28,7 +28,7 @@ func TestTier1OverviewRunningPhase(t *testing.T) {
 		},
 		Counts: map[string]int{"done": 1},
 	}
-	out2 := RenderOverview(done, 0, 0.0, 80)
+	out2 := RenderOverview(done, 0, 0, 50, 0.0, 80)
 	if !strings.Contains(out2, "done") {
 		t.Fatalf("done 行应仍渲染自身 status=done, got: %q", out2)
 	}
