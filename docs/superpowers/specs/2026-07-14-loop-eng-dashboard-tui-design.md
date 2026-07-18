@@ -119,7 +119,7 @@ append-only。TUI `INSERT`（`applied_at=NULL`）；daemon `drainCommands` 取 `
 - `CancelRequested(taskID string) (bool, error)` —— SubLoop phase 前自查（`verb='cancel' AND applied_at IS NULL LIMIT 1`）。
 
 **读侧（TUI reader）：**
-- `TasksByStatus() ([]TaskView, error)` —— 一次 join `tasks`+`task_status`，带回 `id/issue_ref/description/task_type/status/created_at`，避免 N+1。按「进行中→new→needs-review→blocked→done/cancelled」排序。
+- `TasksByStatus() ([]TaskView, error)` —— 一次 join `tasks`+`task_status`，带回 `id/issue_ref/description/task_type/status/created_at`，避免 N+1。按「进行中→new→needs-review→blocked→done/cancelled」排序；同状态组内按 `created_at` 倒序（新 → 旧，最新任务在最上面），同刻按 rowid 倒序兜底。纯展示层排序，不影响派发 FIFO（`NextReadyTask` 仍按 `created_at` 升序、最老优先）。
 - `ActiveRun(taskID string) (runID, startedAt string, ok bool)` —— 进行中任务的当前 run + 启动时间（`ended_at IS NULL`）。
 - `RunsOfTask(taskID string) ([]RunRow, error)` —— 轨迹按 run 分组用。
 - `StepsOfTask(taskID string) ([]StepRow, error)` —— 轨迹跨 run 视图用（已有 `Replay(runID)` / `BudgetLedger(runID)` 按 run 取）。

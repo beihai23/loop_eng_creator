@@ -105,6 +105,10 @@ func TestOverviewScrollsWithSelection(t *testing.T) {
 		if _, err := st.InsertTask(state.TaskRow{
 			IssueRef:    fmt.Sprintf("%d", i+1),
 			Description: fmt.Sprintf("task-%02d", i),
+			// 总览组内按 created_at 倒序（新 → 旧）：让 task-00 最新、task-29
+			// 最旧，展示序 = 入库序，下面的下标断言才有确定性（created_at 相同
+			// 时按 rowid 倒序兜底，会把列表整个反过来）。
+			CreatedAt: fmt.Sprintf("2026-07-%02dT00:00:00Z", 30-i),
 		}); err != nil {
 			t.Fatal(err)
 		}
