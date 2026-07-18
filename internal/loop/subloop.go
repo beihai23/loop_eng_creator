@@ -152,6 +152,17 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	}
 	sl.Store.AppendTransition(taskID, "", "running", "dispatched")
 
+	// →running 即在 channel 上标出「正在处理」（loop:running）。SubLoop.Run 是所有
+	// 执行路径（daemon 派发 + cli run-once）的漏斗，在这里打标覆盖 run-once——它
+	// 绕过 daemon，daemon 派发点的打标不会触发。daemon 路径下这会与派发点的打标
+	// 重复，但幂等（标签互斥后只是 no-op 的 remove+add）。失败只记日志、不翻转
+	// 任务结局（与 report 的写回容错一致）。
+	if sl.Channel != nil {
+		if err := sl.Channel.UpdateStatus(ctx, task.Ref, "running"); err != nil {
+			sl.logf("[subloop] %s running mark failed: %v", shortID(taskID), err)
+		}
+	}
+
 	// 开一行 run（spec §4.1）：每次 Run 用 StartRun 拿真 runID 透传给 steps/budget。
 	// 修 resume 后 replay 交错 bug——修前 run_id 都是 taskID，同任务两次 run 的 step seq
 	// 撞车后 Replay 串在一起。defer 引用命名返回 out：每条终态路径都自动 EndRun，

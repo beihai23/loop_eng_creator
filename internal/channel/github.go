@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -103,9 +104,68 @@ func (g *GitHub) PostComment(ctx context.Context, ref, body string) error {
 	return err
 }
 
+// statusLabelsToRemove 算出 UpdateStatus 需要先摘掉的旧状态标签：labels 中所有
+// 带 "loop:" 前缀、既不等于 taskLabel（loop:task 是任务身份证，永不动）也不等于
+// "loop:"+newStatus（正要打上的新标签）的标签。状态标签互斥——任意时刻一个 issue
+// 最多一个 loop:<status>（修 #30 同时挂 loop:done + loop:blocked 的可信度问题）。
+// 纯函数，便于 tier-1 直接钉互斥语义；签名固定，测试与之对齐。
+func statusLabelsToRemove(labels []string, newStatus, taskLabel string) []string {
+	keep := "loop:" + newStatus
+	var out []string
+	for _, l := range labels {
+		if !strings.HasPrefix(l, "loop:") {
+			continue // 非 loop 体系的标签（人打的、仓库自有的）一律不碰
+		}
+		if l == taskLabel || l == keep {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out
+}
+
+// UpdateStatus 把 issue 的状态标签换成 loop:<status>：先读现有标签，用
+// statusLabelsToRemove 算出要摘的旧状态标签，--add-label 与 --remove-label 一次
+// edit 完成（互斥：任意时刻最多一个 loop:<status>；loop:task 保留不动）。
+//
+// 容错（与写回容错一致，不翻转任务结局）：
+//   - 读标签失败 → 退化为只加不摘（旧行为），打标成功优先于互斥洁癖；
+//   - edit 带 --remove-label 失败（gh 对「已不在 issue 上的标签」报错，view→edit
+//     之间标签被人摘掉即此竞态）→ 退化为只加不摘重试一次。
 func (g *GitHub) UpdateStatus(ctx context.Context, ref, status string) error {
-	_, err := g.gh(ctx, "issue", "edit", ref, "--repo", g.Repo, "--add-label", "loop:"+status)
-	return err
+	add := "loop:" + status
+	remove := g.currentStatusLabelsToRemove(ctx, ref, status)
+	args := []string{"issue", "edit", ref, "--repo", g.Repo, "--add-label", add}
+	for _, l := range remove {
+		args = append(args, "--remove-label", l)
+	}
+	if _, err := g.gh(ctx, args...); err != nil {
+		if len(remove) == 0 {
+			return err
+		}
+		if _, fallbackErr := g.gh(ctx, "issue", "edit", ref, "--repo", g.Repo, "--add-label", add); fallbackErr != nil {
+			return err // 回报原始错误（带 remove 上下文，更可诊断）
+		}
+	}
+	return nil
+}
+
+// currentStatusLabelsToRemove 读 issue 现有标签并算出该摘的旧状态标签。读失败
+// 返回 nil（调用方退化为只加不摘）——读标签是互斥的优化，不是打标的前置门槛。
+func (g *GitHub) currentStatusLabelsToRemove(ctx context.Context, ref, status string) []string {
+	raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "labels")
+	if err != nil {
+		return nil
+	}
+	var v ghIssueView
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil
+	}
+	labels := make([]string, 0, len(v.Labels))
+	for _, l := range v.Labels {
+		labels = append(labels, l.Name)
+	}
+	return statusLabelsToRemove(labels, status, g.TaskLabel)
 }
 
 func (g *GitHub) CloseIssue(ctx context.Context, ref string) error {
