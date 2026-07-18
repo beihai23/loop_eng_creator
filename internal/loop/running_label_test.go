@@ -34,7 +34,7 @@ func TestRunningLabelOnDispatch(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})

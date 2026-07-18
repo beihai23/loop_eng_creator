@@ -207,7 +207,14 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
-			Body: task.Body, // 全文保留：issue 原文（背景/约束）也喂给 plan
+			Body:         task.Body, // 全文保留：issue 原文（背景/约束）也喂给 plan
+			// 重试诊断（attempt≥2 + 当轮 priorFailure 非空时注入）：引用当轮驳回原文，
+			// 要求 plan 诊断 loop 数据流的结构性不可满足、行使 revised_criteria 把证据要求
+			// 翻译成 tier-1 可机械判定的退出码/编译期判据。attempt=1 或无 priorFailure 时为空串，
+			// 不干扰首次规划。承载在独立字段（不进 BattleReport）：这是「如何规划」的元指令，
+			// 与「发生了什么」的战报分离——经 plan embed 的 {{.RetryDiagnosis}} 条件块渲染进
+			// planPrompt，落进 plan step 的 input_json（attempt≥2 的 seq≥20 行）可审计。
+			RetryDiagnosis: retryDiagnosisFor(attempt, priorFailure),
 		}
 		// 把喂给 plan 的原始提示词落进 step trace（input_json）——dashboard 详情页
 		// 的「初始提示词」读它。RenderPrompt 与 Plan.Run 内部渲染同一模板+输入，
@@ -215,15 +222,27 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.Run(ctx, planIn)
 		sl.Budget.AfterCall(u)
+		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
+		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
+		// 可重试失败——不进 execute（否则 execute 只能靠战报上下文瞎续，浪费整轮
+		// plan→execute→verify）。与 plan error 路径同构：记 plan step status=fail、设
+		// priorFailure、continue 重试，MaxRetries 耗尽 → blocked（detail 含「plan 产出空计划」）。
+		emptyPlan := err == nil && len(planOut.Plan) == 0
 		// plan 产出也落 trace（output_json）：含 plan 步骤、verify_script 及
 		// 修订后的验收标准——修订权的审计轨迹（dashboard 详情页/人审可查）。
+		// 空计划也落 output_json（plan 到底返回了啥可审计），只把 step 的 status/error 标 fail。
 		var planOutJSON string
 		if err == nil {
 			if jb, mErr := json.Marshal(planOut); mErr == nil {
 				planOutJSON = string(jb)
 			}
 		}
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), InputJSON: planPrompt, OutputJSON: planOutJSON, Error: errStr(err)})
+		// step 的 status/error：调用级 err 优先；调用成功但空计划记 fail + "empty plan"。
+		planStatus, planStepErr := statusOf(err), errStr(err)
+		if emptyPlan {
+			planStatus, planStepErr = "fail", "empty plan"
+		}
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr})
 		if err != nil {
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
@@ -231,6 +250,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "plan error: " + err.Error()
+			sl.logRetry(sid, attempt, priorFailure)
+			continue
+		}
+		if emptyPlan {
+			// priorFailure 用中文锚点「plan 产出空计划」：MaxRetries 耗尽时 blocked
+			// detail = "retries exhausted: " + priorFailure，故含此字样；下一轮 plan 的
+			// 重试诊断也会逐字引用它，提示「上一轮你给了空计划」。
+			sl.logf("[subloop] %s phase=plan fail: plan 产出空计划 (empty plan)", sid)
+			priorFailure = "plan 产出空计划"
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
@@ -493,6 +521,51 @@ func joinNonEmpty(parts ...string) string {
 		}
 	}
 	return strings.Join(out, "\n\n")
+}
+
+// retryDiagnosisFor builds the retry-diagnosis meta-instruction SubLoop injects
+// into PlanInput on retries. It is the automation of the human-written diagnosis
+// that #47's second run proved is the actual trigger for plan exercising
+// revised_criteria: a vague "you may revise criteria" nudge produced 0 revisions
+// across 3 rounds, while a concrete unsatisfiability diagnosis + revision
+// direction produced a (higher-quality) revision that passed first try.
+//
+// Gating (deliberate, never relax): injected ONLY when attempt ≥ 2 AND this
+// round's priorFailure is non-empty. attempt=1 has nothing failed yet to
+// diagnose, so the first plan is left undisturbed. attempt ≥ 2 with an empty
+// priorFailure is a defensive clause — a retry only fires after a failure, so
+// priorFailure is in practice always non-empty by attempt ≥ 2.
+//
+// The instruction is a "how to plan" meta-directive, carried in its own
+// PlanInput.RetryDiagnosis field — NOT folded into BattleReport. BattleReport is
+// "what happened" (history/context); this is "how to plan" (meta). Mixing them
+// would make it hard for plan to tell a past battle log apart from a directive.
+//
+// Returned text is rendered verbatim by the plan embed's {{.RetryDiagnosis}}
+// conditional block, so it lands in the plan step's input_json (steps table,
+// seq ≥ 20 for attempt ≥ 2) — auditable in the dashboard detail / Replay. By
+// design the dashboard's "初始提示词" panel reads the first round (attempt=1,
+// seq LIMIT 1), where this is empty, so the diagnosis is not shown there; it is
+// auditable in attempt ≥ 2 plan steps + Replay.
+func retryDiagnosisFor(attempt int, priorFailure string) string {
+	if attempt < 2 || strings.TrimSpace(priorFailure) == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## 重试诊断（attempt=" + fmt.Sprint(attempt) + " 的元指令：如何规划，不是战报）\n\n")
+	b.WriteString("本轮 priorFailure 原文（逐字引用，请据此诊断）：\n")
+	b.WriteString("<<<\n" + priorFailure + "\n>>>\n\n")
+	b.WriteString("诊断要求：判断上述驳回理由是否属于 loop 数据流的**结构性不可满足**——即证据要求本身" +
+		"在 loop 的数据流里拿不到，与实现质量无关。典型形态：\n")
+	b.WriteString("- 要求 diff/battle-report 附某条命令的输出，但 execute 在 worktree 里跑，其 stdout 不进战报" +
+		"（战报只有 diff + verify 判定），这条标准对 loop 永远不可满足。\n")
+	b.WriteString("- 要求 diff 出现某文件，而调用面已兼容该场景、合法地无需改动（空 diff 即正确）。\n")
+	b.WriteString("- 要求出现某运行时产物，而该产物只在 execute 沙箱内短暂存在、不落进可验收的 diff。\n\n")
+	b.WriteString("若判定属于结构性不可满足：行使 **revised_criteria**，把那条「拿不到的证据要求」翻译成" +
+		"tier-1 可机械判定的退出码/编译期判据（例如把「报告附 build 输出」改写为「退出码 0 = 编译通过」、" +
+		"或用编译期钉子 `var _ T = expr` 锁定签名），使验收能真正在 worktree 里判定通过与否。\n")
+	b.WriteString("若不属于结构性不可满足（驳回指向真实未完成的实现）→ **不要**修订标准，按 priorFailure 修正实现。\n")
+	return b.String()
 }
 
 // landCommitMessage builds the commit subject for a done task's auto-land: the

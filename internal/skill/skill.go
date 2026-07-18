@@ -65,6 +65,18 @@ type PlanInput struct {
 	// Body is the full raw issue text (背景/约束/上下文)。Description 只是正文
 	// 首行的蒸馏；plan 评审验收标准、规划实现时应能看到全文。
 	Body string
+	// RetryDiagnosis is a "how to plan" meta-instruction SubLoop injects on retries
+	// (attempt ≥ 2 with a non-empty priorFailure): it quotes this round's
+	// priorFailure and asks plan to diagnose whether the verify rejection is a
+	// structural unsatisfiability of the loop's data flow (e.g. demanding command
+	// output in a diff/battle-report that execute's worktree stdout never enters),
+	// and if so to exercise revised_criteria by translating the evidence
+	// requirement into a tier-1 mechanically-checkable exit-code/compile-time
+	// predicate. Empty on attempt=1 / no prior failure — first-time planning is
+	// left undisturbed. This is meta (how to plan), deliberately kept OUT of
+	// BattleReport (which is "what happened" history/context); rendering it through
+	// its own {{.RetryDiagnosis}} block keeps the two separable for plan.
+	RetryDiagnosis string
 }
 type PlanStep struct {
 	Step     string   `json:"step"`

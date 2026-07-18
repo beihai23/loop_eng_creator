@@ -139,3 +139,33 @@ func renderTemplate(t *testing.T, tmpl string, in any) string {
 	}
 	return buf.String()
 }
+
+// TestPlanEmbedRendersRetryDiagnosis 钉死 plan embed（embed/skills/plan.md）含
+// {{.RetryDiagnosis}} 条件块且能正确渲染：非空时整段渲染进 prompt、空时整段省略。
+// 这保证 SubLoop 注入的 retryDiagnosisFor 产出能经生产用 plan 模板到达模型 +
+// 落进 plan step input_json（dashboard 详情/Replay 可审计），而非只在测试用自定义模板里生效。
+func TestPlanEmbedRendersRetryDiagnosis(t *testing.T) {
+	tmpl := mustSkillPrompt("plan")
+
+	// 非空 RetryDiagnosis → 必渲染进 prompt（条件块为真）。
+	with := renderTemplate(t, tmpl, skill.PlanInput{
+		Task:               "t",
+		AcceptanceCriteria: []string{"c"},
+		RetryDiagnosis:     "## 重试诊断\nSENTINEL_DIAG_42",
+	})
+	if !strings.Contains(with, "SENTINEL_DIAG_42") {
+		t.Fatalf("plan embed 未渲染 RetryDiagnosis 字段（缺 {{.RetryDiagnosis}} 条件块？）:\n%s", with)
+	}
+
+	// 空 RetryDiagnosis → 条件块整段省略；诊断标识与 sentinel 都不得出现。
+	without := renderTemplate(t, tmpl, skill.PlanInput{
+		Task:               "t",
+		AcceptanceCriteria: []string{"c"},
+	})
+	if strings.Contains(without, "SENTINEL_DIAG_42") {
+		t.Fatalf("空 RetryDiagnosis 时 plan embed 不应渲染 sentinel:\n%s", without)
+	}
+	if strings.Contains(without, "重试诊断") {
+		t.Fatalf("空 RetryDiagnosis 时 plan embed 不应渲染诊断块:\n%s", without)
+	}
+}
