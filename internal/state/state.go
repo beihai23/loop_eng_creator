@@ -710,8 +710,10 @@ type TaskView struct {
 
 // TasksByStatus 返回全部 task 及其当前 status，按 TUI 概览优先级排序：
 // new → needs-review → needs-info → blocked → done → cancelled（其余垫底），
-// 组内按 issue 号数值升序（CAST(issue_ref AS INTEGER)，列表显示 10,11,13…
-// 而非入库序 11,10,14,13）；非数字 ref CAST 得 0，并列时按 created_at 兜底。
+// 组内按 created_at 倒序（新 → 旧，最新任务排在同状态组最上面；created_at 是
+// channel 上报的 issue 提交时间，见 InsertTask），同刻按 rowid 倒序兜底保证
+// 确定性。这只是展示层排序——daemon 的派发 FIFO（NextReadyTask，created_at
+// 升序、最老优先）不受影响。
 // 正在 running 的 task 由 ActiveRun 单独透出，不在此列表里参与 status 分组。
 func (s *Store) TasksByStatus() ([]TaskView, error) {
 	rows, err := s.db.Query(
@@ -721,7 +723,7 @@ func (s *Store) TasksByStatus() ([]TaskView, error) {
 		     WHEN 'new' THEN 1 WHEN 'needs-review' THEN 2 WHEN 'needs-info' THEN 3
 		     WHEN 'needs-human-decision' THEN 3
 		     WHEN 'blocked' THEN 4 WHEN 'done' THEN 5 WHEN 'cancelled' THEN 6
-		     ELSE 7 END, CAST(t.issue_ref AS INTEGER) ASC, t.created_at`)
+		     ELSE 7 END, t.created_at DESC, t.rowid DESC`)
 	if err != nil {
 		return nil, err
 	}

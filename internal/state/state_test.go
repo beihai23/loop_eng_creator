@@ -454,6 +454,52 @@ func TestTasksByStatusJoinsAndOrders(t *testing.T) {
 	}
 }
 
+// TestTasksByStatusNewestFirstWithinGroup 钉死总览展示排序：状态分组优先级
+// 不变（new → needs-review → needs-info → blocked → done → cancelled），
+// 同状态组内按 created_at 倒序（新 → 旧，最新任务在最上面）。同时证明这次
+// 展示层倒序不影响派发 FIFO——NextReadyTask 仍返回最老提交的 new 任务。
+func TestTasksByStatusNewestFirstWithinGroup(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+
+	// 两个 new：old-new 提交更早，new-new 提交更晚。
+	oldNew, _ := s.InsertTask(TaskRow{IssueRef: "#31", Description: "older new",
+		CreatedAt: "2026-07-17T09:00:00Z"})
+	newNew, _ := s.InsertTask(TaskRow{IssueRef: "#32", Description: "newer new",
+		CreatedAt: "2026-07-18T09:00:00Z"})
+	// 一个 done，提交时间夹在中间——用来验证分组优先级压过时间序。
+	doneTask, _ := s.InsertTask(TaskRow{IssueRef: "#33", Description: "done",
+		CreatedAt: "2026-07-17T12:00:00Z"})
+	_ = s.AppendTransition(doneTask, "new", "done", "ran")
+
+	got, err := s.TasksByStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len=%d want 3: %+v", len(got), got)
+	}
+	// new 组（新 → 旧）在前，done 组在后——即使 done 的提交时间比 new-new 旧。
+	wantIDs := []string{newNew, oldNew, doneTask}
+	wantStatus := []string{"new", "new", "done"}
+	for i := range wantIDs {
+		if got[i].ID != wantIDs[i] || got[i].Status != wantStatus[i] {
+			t.Fatalf("order[%d]=(%s,%s) want (%s,%s); full: %+v",
+				i, got[i].ID, got[i].Status, wantIDs[i], wantStatus[i], got)
+		}
+	}
+
+	// 派发 FIFO 不受展示倒序影响：仍是最老提交的 #31 出队。
+	head, ok, err := s.NextReadyTask()
+	if err != nil || !ok {
+		t.Fatalf("NextReadyTask: ok=%v err=%v", ok, err)
+	}
+	if head.ID != oldNew {
+		t.Fatalf("NextReadyTask = %q (%s), want oldest-submitted #31 (%q); display DESC must not change dispatch FIFO",
+			head.ID, head.IssueRef, oldNew)
+	}
+}
+
 // TestStepsAndTransitionsCarryAt 校验 StepRow.At / TransitionRow.At 在
 // StepsOfTask 和 Transitions 读回时非空（Phase A 终审 I1，trace 时间戳用）。
 func TestStepsAndTransitionsCarryAt(t *testing.T) {

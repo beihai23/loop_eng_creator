@@ -7,15 +7,23 @@ import (
 	"loop-eng/internal/state"
 )
 
-// tier-1: TasksByStatus 组内按 issue 号数值序（不是入库序）。
-func TestTier1TasksByStatusNumericOrder(t *testing.T) {
+// tier-1: TasksByStatus 同状态组内按 created_at 倒序（新 → 旧），与入库序、
+// issue 号都无关。
+func TestTier1TasksByStatusNewestFirst(t *testing.T) {
 	s, err := state.Open(t.TempDir() + "/state.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	for _, ref := range []string{"11", "10", "14", "13"} {
-		if _, err := s.InsertTask(state.TaskRow{IssueRef: ref, Description: "d" + ref}); err != nil {
+	// 故意按「既非时间序也非 issue 号序」的顺序入库。
+	inserts := []struct{ ref, createdAt string }{
+		{"11", "2026-07-17T09:00:00Z"},
+		{"10", "2026-07-18T08:00:00Z"}, // 最新
+		{"14", "2026-07-16T09:00:00Z"}, // 最旧
+		{"13", "2026-07-17T10:00:00Z"},
+	}
+	for _, in := range inserts {
+		if _, err := s.InsertTask(state.TaskRow{IssueRef: in.ref, Description: "d" + in.ref, CreatedAt: in.createdAt}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -23,7 +31,7 @@ func TestTier1TasksByStatusNumericOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"10", "11", "13", "14"}
+	want := []string{"10", "13", "11", "14"} // 新 → 旧
 	if len(got) != len(want) {
 		t.Fatalf("len=%d want %d: %+v", len(got), len(want), got)
 	}
