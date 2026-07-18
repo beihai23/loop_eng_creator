@@ -102,7 +102,9 @@ func NewRunOnceCmd() *cobra.Command {
 
 // buildChannel picks the channel.Channel by cfg.Channel.Provider: "" or
 // "local" → channel.Local (reads <repo>/inbox, writes <repo>/outbox);
-// "github" → channel.GitHub backed by the authenticated `gh` CLI. Unknown
+// "github" → channel.GitHub backed by the authenticated `gh` CLI;
+// "linear" → channel.Linear backed by the Linear GraphQL API (key from env
+// LOOP_ENG_LINEAR_API_KEY, per #24 决定 A — never from config.yaml). Unknown
 // providers error. This is the M2-6 wiring point that replaces the M1
 // hard-coded channel.NewLocal(repo).
 func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
@@ -115,6 +117,13 @@ func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
 		return channel.NewLocal(repo), nil
 	case "github":
 		return channel.NewGitHub(cfg.Channel.Repo, cfg.Channel.TaskLabel), nil
+	case "linear":
+		key := os.Getenv(channel.LinearAPIKeyEnv)
+		if key == "" {
+			return nil, fmt.Errorf("linear provider: 环境变量 %s 未设置", channel.LinearAPIKeyEnv)
+		}
+		lc := cfg.Channel.Linear
+		return channel.NewLinear(key, "", lc.Project, lc.Team, lc.StatusMap), nil
 	default:
 		return nil, fmt.Errorf("unknown channel provider: %s", prov)
 	}

@@ -19,9 +19,18 @@ type Config struct {
 }
 
 type Channel struct {
-	Provider  string `yaml:"provider"`   // "" | "local" | "github"
+	Provider  string `yaml:"provider"`   // "" | "local" | "github" | "linear"
 	Repo      string `yaml:"repo"`       // "owner/name"（github 必填）
 	TaskLabel string `yaml:"task_label"` // issue 过滤标签（github 必填）
+	Linear    Linear `yaml:"linear"`     // linear provider 专属配置
+}
+
+// Linear 是 channel.linear 子配置（映射文档 §9；API key 走环境变量
+// LOOP_ENG_LINEAR_API_KEY，不进 config.yaml）。
+type Linear struct {
+	Project   string            `yaml:"project"`    // 任务发现过滤的 project UUID（linear 必填）
+	Team      string            `yaml:"team"`       // 可选；限定 workflowStates 解析范围的 team UUID/key
+	StatusMap map[string]string `yaml:"status_map"` // 可选：loop status → WorkflowState name（缺省按 type 兜底）
 }
 
 type Models struct {
@@ -102,6 +111,9 @@ func (c *Config) validate() error {
 	}
 	if c.Channel.Provider == "github" && (c.Channel.Repo == "" || c.Channel.TaskLabel == "") {
 		return fmt.Errorf("channel: github provider 需 repo 与 task_label")
+	}
+	if c.Channel.Provider == "linear" && c.Channel.Linear.Project == "" {
+		return fmt.Errorf("channel: linear provider 需 linear.project（API key 走环境变量 LOOP_ENG_LINEAR_API_KEY）")
 	}
 	return nil
 }

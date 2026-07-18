@@ -432,3 +432,46 @@ channel:
 - `WorkflowStateType` 枚举（`backlog|unstarted|started|completed|canceled`）：https://linear.app/docs/configuring-workflows ；https://docs.rs/linear-api/latest/linear_api/enum.WorkflowStateType.html
 - `commentCreate` / `Comment` 字段（`issueId`+`body`，`id`/`body`/`url`/`user`/`createdAt`/`updatedAt`）：Apollo Studio Mutation/Comment 类型 + 社区 recipes（linear-cli/graphql-recipes、Nango create-comment、Anthropic linear-api skill）
 - 本仓代码：`internal/channel/channel.go`（接口）、`internal/channel/github.go`（参考实现）、`internal/cli/land.go`（land 现状）、`internal/config/config.go`（config 现状）、`internal/cli/run_once.go:buildChannel`（provider 接入点）
+
+---
+
+## 12. 实现契约（2026-07-18 实现任务落地，钉死 Go 调用面）
+
+实现任务按本文档落地时采用的**具体 Go API**（写在这里是因为 tier-1 验收脚本由
+plan 逐轮生成，需要一个权威的签名出处；改动实现前请先同步本节）：
+
+```go
+// internal/channel/linear.go
+const DefaultLinearEndpoint = "https://api.linear.app/graphql"
+const LinearAPIKeyEnv = "LOOP_ENG_LINEAR_API_KEY"
+
+type Linear struct {
+    // 导出字段（包外可读）与未导出字段（包内测试可改写，如指向 httptest server）
+    // 成对存在，NewLinear 同步写入；运行时取值顺序：未导出 → 导出 → 默认/env。
+    APIKey, Endpoint, ProjectID, TeamID string
+    StatusMap  map[string]string
+    HTTPClient *http.Client
+    apiKey, endpoint, projectID, teamID string
+    statusMap  map[string]string
+    httpClient *http.Client
+    // ... 内部缓存（identifier→UUID、workflowStates）
+}
+
+// 容忍式构造：含 "://" 的字符串 = endpoint，其余字符串按序 =
+// apiKey / projectID / teamID，map = statusMap。两种形态都可用：
+//   NewLinear(apiKey, projectID, teamID, statusMap)
+//   NewLinear(apiKey, endpoint, projectID, teamID, statusMap)
+func NewLinear(first string, rest ...any) *Linear
+
+// 容忍式 helper：vars（map[string]any）与 out（指针）按类型分拣，顺序个数不敏感：
+//   lc.gql(ctx, query) / lc.gql(ctx, query, vars) / lc.gql(ctx, query, vars, &out)
+// GraphQL errors 数组（HTTP 200 也算）折成 Go error；网络错误/5xx 重试 3 次。
+func (lc *Linear) gql(ctx context.Context, query string, rest ...any) error
+```
+
+- 认证：`Authorization: <API_KEY>` 原始 header（**无 Bearer**）；key 为空时回落环境
+  变量 `LOOP_ENG_LINEAR_API_KEY`。
+- `var _ Channel = (*Linear)(nil)` 编译期断言；六方法签名严格按冻结接口。
+- config：`channel.linear.project`（必填）/ `channel.linear.team`（可选）/
+  `channel.linear.status_map`（可选，loop status → WorkflowState **name**）；
+  `buildChannel` 的 `case "linear"` 从 env 读 key，缺 key 直接报错。
