@@ -41,6 +41,8 @@ func statusSymbol(status string) string {
 		return "⏸"
 	case "needs-info":
 		return "ℹ"
+	case "needs-human-decision":
+		return "ℹ"
 	case "blocked":
 		return "✗"
 	case "done":
@@ -60,7 +62,7 @@ func statusStyle(status string) lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("10")) // 亮绿
 	case "needs-review":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // 琥珀黄
-	case "needs-info":
+	case "needs-info", "needs-human-decision":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("12")) // 蓝
 	case "blocked":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")) // 红

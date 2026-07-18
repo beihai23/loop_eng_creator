@@ -328,6 +328,8 @@ func statusVerbCN(status string) string {
 		return "待人审"
 	case "needs-info":
 		return "待补充信息"
+	case "needs-human-decision":
+		return "待人工裁决"
 	case "blocked":
 		return "阻塞"
 	case "done":

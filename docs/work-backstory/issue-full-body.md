@@ -41,6 +41,11 @@ criteria 合同，全文已通过 plan 的修订间接影响 verify；记录为�
 - 「在 channel 层加一个字段」和「字段真正到达模型」之间隔着整条持久化链路：channel →
   InsertTask → tasks 表 → NextReadyTask（daemon）→ channel.Task → SubLoop。改信息契约时
   必须把每一跳都列出来验证（本次靠 TestSubLoopFeedsFullBodyToPlanAndExecute 端到端钉死）。
+- **续（triage-gate arc 抓到的漏网之鱼）**：本 arc 恰恰漏了 ingest 的 InsertTask 那一跳——
+  新任务摄入时 Body 根本没落库，全靠下轮 compare-and-update 的「spec updated」回填，两步
+  才完整且每个新任务多刷一条日志。当时「存量首轮回填属预期」的判断掩盖了它。triage-gate
+  的测试（分诊器拿到的 Body 为空）把它揪了出来，已于 engine.go ingest 补上 `Body: t.Body`。
+  教训：端到端测试要测「字段到达最终消费者」，只测存储层会漏链路中间的重建点。
 
 ## Related
 - internal/channel/{channel,local}.go（Task.Body + parseLocalTask 回填）

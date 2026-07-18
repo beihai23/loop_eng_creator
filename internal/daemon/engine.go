@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"loop-eng/internal/channel"
+	"loop-eng/internal/skill"
 	"loop-eng/internal/state"
 )
 
@@ -27,6 +28,12 @@ import (
 // step 3/4); RunTask just does the work and reports the outcome — it must NOT
 // mutate task_status itself, so the daemon is the single writer of the lifecycle.
 type RunTaskFunc func(ctx context.Context, task state.TaskRow) (status, detail string, err error)
+
+// TriageFunc runs the triage gate on one task about to be dispatched and
+// returns the triage verdict. Injected like RunTaskFunc so the Engine stays
+// decoupled from model wiring (cli/daemon.go wires the triage skill). nil on
+// the Engine means "no gate" (legacy behavior, used by tests).
+type TriageFunc func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error)
 
 // Engine is the resident M3 daemon. It polls Channel every Interval, ingesting
 // new tasks into Store (the durable FIFO) deduped by issue_ref, resuming parked
@@ -42,6 +49,15 @@ type Engine struct {
 	Interval time.Duration
 	Cooldown time.Duration
 	RunTask  RunTaskFunc
+
+	// Triage is the dispatch gate: when non-nil, every FIFO head is triaged
+	// before it occupies the active slot. !Startable → parked as needs-info
+	// (missing info posted to the issue; a human reply re-queues it and the
+	// next dispatch re-triages); NeedsHumanDecision or !LoopDoable → parked as
+	// needs-human-decision; otherwise dispatched normally. A triage error does
+	// NOT gate: it is logged and the task dispatches anyway — a broken triager
+	// must not stall the whole FIFO.
+	Triage TriageFunc
 
 	// Log is the observability sink for daemon tick events (ingest, dispatch,
 	// park, resume). When nil, defaults to os.Stderr with a "[daemon]" prefix.
@@ -167,6 +183,29 @@ func (e *Engine) tick(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
+	// ---- triage 门（just-in-time：队首才分诊，看到的是 spec re-ingest 热更新后
+	// 的最新正文）——不占活跃位；挂起的任务等人回复后由 pollSignals 唤醒、下次
+	// 派发重新分诊。triage 出错不 gate，记日志照跑。
+	if e.Triage != nil {
+		gate, terr := e.Triage(ctx, ready)
+		switch {
+		case terr != nil:
+			e.logf("[daemon] triage error for task %s (%s): %v — dispatching anyway",
+				shortTaskID(ready.ID), ready.IssueRef, terr)
+		case !gate.Startable:
+			return e.parkByTriage(ctx, ready, "needs-info",
+				"triage: 缺信息——"+strings.Join(gate.MissingInfo, "；"),
+				needsInfoComment(gate))
+		case gate.NeedsHumanDecision || !gate.LoopDoable:
+			return e.parkByTriage(ctx, ready, "needs-human-decision",
+				"triage: 需人工裁决——"+gate.Reason,
+				"NEEDS-HUMAN-DECISION: 分诊判断此任务需要人来拍板，暂不由 loop 自动执行。\n\n原因: "+gate.Reason+
+					"\n\n请在本 issue 回复你的决定；daemon 会拾起回复并重新分诊/派发。")
+		default:
+			e.logf("[daemon] triage: task %s (%s) startable (difficulty=%s)",
+				shortTaskID(ready.ID), ready.IssueRef, gate.Difficulty)
+		}
+	}
 	if err := e.Store.AppendTransition(ready.ID, "new", "running", "dispatched"); err != nil {
 		return err
 	}
@@ -239,6 +278,7 @@ func (e *Engine) ingest(ctx context.Context) error {
 			TaskType:    t.TaskType,
 			Source:      "daemon",
 			Criteria:    t.AcceptanceCriteria,
+			Body:        t.Body, // 全文：摄入即落库，不靠下轮 compare-and-update 回填
 			CreatedAt:   t.CreatedAt, // #33/#36: 存 issue 提交时间 → NextReadyTask 按 created_at FIFO（不是入库时间）
 		}
 		if _, err := e.Store.InsertTask(row); err != nil {
@@ -432,17 +472,69 @@ func (e *Engine) statusOf(taskID string) (string, bool) {
 	return "", false
 }
 
-// pollSignals checks every parked (needs-review) and blocked task for new human
-// replies since the daemon's last comment. A task that has been replied to is
-// re-queued (→ new) with the human feedback recorded in the transition reason.
-// The daemon never blocks here: ListReplies is a non-blocking poll, and a
-// transient channel error is logged but does not halt the tick (spec §10/§11).
+// parkByTriage 把 triage 拦下的任务挂起到 needs-info / needs-human-decision：
+// 状态迁移 + issue 评论（缺什么/要人拍什么板，人可见——人的回复会被 pollSignals
+// 拾起重新排队，下次派发重新分诊）。评论/打标失败不翻转挂起结果（记日志，
+// 与 SubLoop.report 的写回容错一致）。
+func (e *Engine) parkByTriage(ctx context.Context, task state.TaskRow, status, reason, comment string) error {
+	if err := e.Store.AppendTransition(task.ID, "new", status, reason); err != nil {
+		return err
+	}
+	e.logf("[daemon] triage park: task %s (%s) → %s (%s)",
+		shortTaskID(task.ID), task.IssueRef, status, truncRunes(reason, 80))
+	if err := e.Channel.PostComment(ctx, task.IssueRef, comment); err != nil {
+		e.logf("[daemon] triage park comment failed for %s: %v", task.IssueRef, err)
+	} else {
+		_ = e.Store.SetLastCommentAt(task.ID, time.Now())
+	}
+	if err := e.Channel.UpdateStatus(ctx, task.IssueRef, status); err != nil {
+		e.logf("[daemon] triage park status mark failed for %s: %v", task.IssueRef, err)
+	}
+	return nil
+}
+
+// needsInfoComment 构造「缺信息」的 issue 评论正文：逐条列出缺什么（人要照着
+// 补的清单）+ 分诊理由 + 回复指引。
+func needsInfoComment(g skill.TriageOutput) string {
+	var b strings.Builder
+	b.WriteString("NEEDS-INFO: 分诊判断任务信息不足，暂不开工。\n\n缺少的信息:\n")
+	for _, mi := range g.MissingInfo {
+		b.WriteString("- " + mi + "\n")
+	}
+	if strings.TrimSpace(g.Reason) != "" {
+		b.WriteString("\n分诊理由: " + g.Reason + "\n")
+	}
+	b.WriteString("\n请在本 issue 补充；daemon 会拾起回复并重新分诊/派发。")
+	return b.String()
+}
+
+// truncRunes 截断到 n 个字符（超出加 …）——日志行用。
+func truncRunes(s string, n int) string {
+	rs := []rune(s)
+	if len(rs) <= n {
+		return s
+	}
+	return string(rs[:n]) + "…"
+}
+
+// pollSignals checks every parked (needs-review / needs-info /
+// needs-human-decision) and blocked task for new human replies since the
+// daemon's last comment. A task that has been replied to is re-queued (→ new)
+// with the human feedback recorded in the transition reason. The daemon never
+// blocks here: ListReplies is a non-blocking poll, and a transient channel
+// error is logged but does not halt the tick (spec §10/§11).
 func (e *Engine) pollSignals(ctx context.Context) error {
 	if err := e.pollTaskReplies(ctx, e.Store.ParkedTasks, "needs-review"); err != nil {
 		e.logf("poll signals (needs-review): %v", err)
 	}
 	if err := e.pollTaskReplies(ctx, e.Store.BlockedTasks, "blocked"); err != nil {
 		e.logf("poll signals (blocked): %v", err)
+	}
+	if err := e.pollTaskReplies(ctx, e.Store.NeedsInfoTasks, "needs-info"); err != nil {
+		e.logf("poll signals (needs-info): %v", err)
+	}
+	if err := e.pollTaskReplies(ctx, e.Store.NeedsHumanDecisionTasks, "needs-human-decision"); err != nil {
+		e.logf("poll signals (needs-human-decision): %v", err)
 	}
 	return nil
 }
@@ -531,7 +623,7 @@ func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
 	cur, _ := e.statusOf(c.TaskID)
 	switch c.Verb {
 	case "resume":
-		if cur == "needs-review" || cur == "blocked" {
+		if cur == "needs-review" || cur == "blocked" || cur == "needs-info" || cur == "needs-human-decision" {
 			if err := e.Store.SetResumeFeedback(c.TaskID, c.Payload); err != nil {
 				return err
 			}
@@ -539,7 +631,7 @@ func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
 		}
 	case "cancel":
 		switch cur {
-		case "new", "needs-info", "needs-review", "blocked":
+		case "new", "needs-info", "needs-human-decision", "needs-review", "blocked":
 			return e.Store.AppendTransition(c.TaskID, cur, "cancelled", "cancelled by TUI")
 		}
 		// running → SubLoop 自查处理；done/cancelled → 已终态
