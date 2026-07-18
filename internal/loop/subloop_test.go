@@ -49,7 +49,7 @@ func TestSubLoopDoneOnFirstPass(t *testing.T) {
 	tri := model.NewFake(map[string]string{"TRIAGE:": mustJSON(skill.TriageOutput{Startable: true, LoopDoable: true})})
 	// 单个 fake 给 plan/verify/execute 用前缀区分
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -78,7 +78,7 @@ func TestSubLoopBlockedAfterRetries(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope"}), // 永远不过
 	})
@@ -103,7 +103,7 @@ func TestSubLoopTier1FailBlocks(t *testing.T) {
 	// plan 产出一个永远失败的 tier-1 验收脚本（run=false）→ tier-1 挂、短路 → blocked。
 	// tier-1 完全来自 plan，无静态 config 列表。
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"false"}}}),
+		"PLAN:":    mustJSON(skill.PlanOutput{Plan: validPlanSteps(), VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"false"}}}),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}), // tier-2 本会过，但 tier-1 先短路
 	})
@@ -136,7 +136,7 @@ func TestSubLoopPlanScriptRunsTier1(t *testing.T) {
 		Run:   []string{"sh", "verify_tier1.sh"},
 	}
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: script}),
+		"PLAN:":    mustJSON(skill.PlanOutput{Plan: validPlanSteps(), VerifyScript: script}),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -183,7 +183,7 @@ func TestSubLoopNoPlanScriptSkipsTier1(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}), // 无 VerifyScript —— 不可脚本化
+		"PLAN:":    validPlanJSON(), // 无 VerifyScript —— 不可脚本化
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -217,7 +217,7 @@ func TestSubLoopInvalidPlanScriptSkipsTier1(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "bad"}}), // 无 Run
+		"PLAN:":    mustJSON(skill.PlanOutput{Plan: validPlanSteps(), VerifyScript: &skill.PlanVerifyScript{Label: "bad"}}), // 无 Run
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -323,7 +323,7 @@ func TestSubLoopWritesBudgetLedger(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -379,7 +379,7 @@ func TestSubLoopWritesStatusDone(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -415,7 +415,7 @@ func TestSubLoopWritesStatusBlocked(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"false"}}}), // tier-1 永失败
+		"PLAN:":    mustJSON(skill.PlanOutput{Plan: validPlanSteps(), VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"false"}}}), // tier-1 永失败
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -450,7 +450,7 @@ func TestSubLoopUpdateStatusErrorSurfaced(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -484,7 +484,7 @@ func TestSubLoopNeedsHumanRoutesToNeedsReview(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}), // tier1/2 过 → chain 走到 tier-3
 	})
@@ -539,6 +539,23 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
+// validPlanSteps is a non-empty plan-step slice — the minimum plan content SubLoop
+// now requires. An empty plan (nil or len 0) is a retryable failure (see
+// plan-execute-contract-drift): plan's whole job is to plan, so an empty output
+// means the model bailed, and SubLoop must not descend into execute on an empty
+// plan. Happy-path tests that exercise plan→execute→verify use this so the empty-
+// plan guard does not trip.
+func validPlanSteps() []skill.PlanStep {
+	return []skill.PlanStep{{Step: "实现任务以满足验收标准", Files: []string{"x.go"}, Expected: "全部验收标准通过"}}
+}
+
+// validPlanJSON marshals a plan output carrying a non-empty plan (no verify script,
+// no revised criteria) — the happy-path default for tests that only care about the
+// plan→execute→verify flow, not plan's tier-1/revision output.
+func validPlanJSON() string {
+	return mustJSON(skill.PlanOutput{Plan: validPlanSteps()})
+}
+
 func mkSkill[I any, O any](prefix string, m model.Client) skill.Skill[I, O] {
 	return skill.Skill[I, O]{
 		Name: "x", PromptTmpl: prefix,
@@ -572,7 +589,7 @@ func TestSubLoopDoneCommitsWorktree(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":   mustJSON(skill.PlanOutput{}),
+		"PLAN:":   validPlanJSON(),
 		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
 	})
 	sl := &SubLoop{
@@ -620,7 +637,7 @@ func TestSubLoopPhaseLogsAsserts(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -667,7 +684,7 @@ func TestSubLoopRetryLogs(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "reject reason here"}),
 	})
@@ -713,7 +730,7 @@ func TestSubLoopInFlightClearedOnDone(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -747,7 +764,7 @@ func TestSubLoopInFlightClearedOnBlocked(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope"}),
 	})
@@ -777,7 +794,7 @@ func TestSubLoopInFlightClearedOnNeedsReview(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -814,7 +831,7 @@ func TestCooperativeCancel(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -891,7 +908,7 @@ func TestReplayNoInterleaveAfterResume(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -1008,7 +1025,7 @@ func TestSubLoopFeedsIssueCommentsToPlan(t *testing.T) {
 	defer st.Close()
 
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -1067,7 +1084,7 @@ func TestSubLoopCapturesExecuteOutput(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":   mustJSON(skill.PlanOutput{}),
+		"PLAN:":   validPlanJSON(),
 		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
 	})
 	sl := &SubLoop{
@@ -1126,7 +1143,7 @@ func TestSubLoopFeedsIssueCommentsToExecute(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":   mustJSON(skill.PlanOutput{}),
+		"PLAN:":   validPlanJSON(),
 		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
 	})
 	exec := &captureExec{}
@@ -1195,7 +1212,7 @@ func TestSubLoopPostsVerifyFailCommentOnReject(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope", FailingCriteria: []string{"criterion-A"}}), // 永远不过
 	})
@@ -1237,7 +1254,7 @@ func TestSubLoopRecordsPlanPrompt(t *testing.T) {
 	defer st.Close()
 
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 	})
@@ -1305,6 +1322,7 @@ func TestSubLoopPlanRevisedCriteria(t *testing.T) {
 	revised := []string{"PLAN修订后的唯一标准"}
 	fake := model.NewFake(map[string]string{
 		"PLAN:": mustJSON(skill.PlanOutput{
+			Plan:            validPlanSteps(),
 			RevisedCriteria: &revised,
 			CriteriaNotes:   "原标准不可判定，改写为可判定条款",
 		}),
@@ -1385,7 +1403,7 @@ func TestSubLoopFeedsFullBodyToPlanAndExecute(t *testing.T) {
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	defer st.Close()
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
 		"EXECUTE:": "ok",
 	})
@@ -1487,7 +1505,7 @@ func TestSubLoopRetryDiagnosisOnRetry(t *testing.T) {
 	// verify 永远驳回——理由是典型的「结构性不可满足」措辞，断言它被逐字引用进 attempt=2 诊断。
 	const failReason = "STRUCTURAL_UNSAT_PROBE: diff must include go build output"
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: failReason}),
 	})
@@ -1559,4 +1577,130 @@ func seqSet(m map[int]string) []int {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+// ---- 空 plan 防护（plan-execute-contract-drift：空计划 = 可重试失败）----
+
+// countingExec 记录 Exec 被调用的次数——空 plan 防护的核心断言就是「不进 execute」：
+// plan 产出空计划时 SubLoop 必须停在 plan、不把 execute 拉进来靠战报瞎续。
+type countingExec struct{ calls int }
+
+func (c *countingExec) Exec(_ context.Context, _ string, _ string) (string, model.Usage, error) {
+	c.calls++
+	return "ok", model.Usage{}, nil
+}
+
+// TestSubLoopEmptyPlanBlocks 钉死空 plan 防护：plan 调用成功（err==nil）但 Plan 为空
+// （nil 或 len 0，即 JSON `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，SubLoop 必须视为
+// 可重试失败——
+//   - 不调 execute（execute 计数恒为 0）；
+//   - 记 plan step status=fail + error="empty plan"（产出级失败，非调用级 err）；
+//   - 设 priorFailure="plan 产出空计划"、continue 重试；
+//   - 连续到 MaxRetries 耗尽 → blocked，detail 含「plan 产出空计划」。
+//
+// 两种空形态都覆盖：JSON null（nil slice）与空数组（len 0 非 nil slice）——len 判定同构。
+func TestSubLoopEmptyPlanBlocks(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		planJSON string
+	}{
+		{"nil Plan 字段 (JSON null)", mustJSON(skill.PlanOutput{})},                // Plan nil → {"plan":null}
+		{"空 plan slice (JSON [])", mustJSON(skill.PlanOutput{Plan: []skill.PlanStep{}})}, // len 0 → {"plan":[]}
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := initRepo(t)
+			st, _ := state.Open(t.TempDir() + "/s.db")
+			defer st.Close()
+			fake := model.NewFake(map[string]string{
+				"PLAN:":    tc.planJSON,
+				"EXECUTE:": "ok",
+				"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}), // 即便会过也根本到不了 execute/verify
+			})
+			exec := &countingExec{}
+			sl := &SubLoop{
+				Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+				Execute:    exec,
+				Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+				VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+				Tier3Human: true,
+				Channel:    channel.NewLocal(t.TempDir()),
+			}
+			out, err := sl.Run(context.Background(), channel.Task{Ref: "1", Description: "d", AcceptanceCriteria: []string{"c"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 终态 blocked（MaxRetries=2 连续空计划耗尽）。
+			if out.Status != "blocked" {
+				t.Fatalf("want blocked (empty plan exhausts retries), got %s (%s)", out.Status, out.Detail)
+			}
+			// detail 必含「plan 产出空计划」字样。
+			if !strings.Contains(out.Detail, "plan 产出空计划") {
+				t.Fatalf("blocked detail 缺「plan 产出空计划」字样: %q", out.Detail)
+			}
+			// 核心：execute 从未被调用——空 plan 必须停在 plan，不进 execute 瞎续。
+			if exec.calls != 0 {
+				t.Fatalf("execute 不应被调用（空 plan 必须停在 plan），实际调用 %d 次", exec.calls)
+			}
+			// 每个 plan step 记 status=fail + error="empty plan"。
+			views, _ := st.TasksByStatus()
+			runs, _ := st.RunsOfTask(views[0].ID)
+			steps, _ := st.Replay(runs[0].ID)
+			var planFails int
+			for _, s := range steps {
+				if s.Role == "plan" && s.Status == "fail" && s.Error == "empty plan" {
+					planFails++
+				}
+				// 空 plan step 的 output_json 仍落盘（plan 到底返回了啥，audit 轨迹不丢）。
+				if s.Role == "plan" && s.OutputJSON == "" {
+					t.Fatalf("空 plan step 的 output_json 不应为空（audit 轨迹）: %+v", s)
+				}
+			}
+			if planFails == 0 {
+				t.Fatalf("缺 plan step status=fail+error=\"empty plan\": %+v", steps)
+			}
+		})
+	}
+}
+
+// TestSubLoopValidPlanNoRegression 是空 plan 防护的反向护栏：plan 返回非空 Plan 时
+// SubLoop 照常进 execute + verify → done，plan step status=ok、execute 被调用恰好 1 次。
+// 确保防护只拦空计划、不误伤正常产出（acceptance ③：有效 plan → 正常流程不回归）。
+func TestSubLoopValidPlanNoRegression(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    validPlanJSON(), // 非空 plan
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	exec := &countingExec{}
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    exec,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "2", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("有效 plan 应正常 done，got %s (%s)", out.Status, out.Detail)
+	}
+	// 有效 plan 进 execute 恰好 1 次（首过，无重试）。
+	if exec.calls != 1 {
+		t.Fatalf("有效 plan 应进 execute 恰好 1 次，实际 %d 次", exec.calls)
+	}
+	// plan step status=ok（非空 plan 不被空 plan 防护误拦）。
+	views, _ := st.TasksByStatus()
+	runs, _ := st.RunsOfTask(views[0].ID)
+	steps, _ := st.Replay(runs[0].ID)
+	for _, s := range steps {
+		if s.Role == "plan" && s.Status != "ok" {
+			t.Fatalf("有效 plan 的 plan step 应 status=ok，got status=%q error=%q", s.Status, s.Error)
+		}
+	}
 }

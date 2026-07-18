@@ -222,15 +222,27 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.Run(ctx, planIn)
 		sl.Budget.AfterCall(u)
+		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
+		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
+		// 可重试失败——不进 execute（否则 execute 只能靠战报上下文瞎续，浪费整轮
+		// plan→execute→verify）。与 plan error 路径同构：记 plan step status=fail、设
+		// priorFailure、continue 重试，MaxRetries 耗尽 → blocked（detail 含「plan 产出空计划」）。
+		emptyPlan := err == nil && len(planOut.Plan) == 0
 		// plan 产出也落 trace（output_json）：含 plan 步骤、verify_script 及
 		// 修订后的验收标准——修订权的审计轨迹（dashboard 详情页/人审可查）。
+		// 空计划也落 output_json（plan 到底返回了啥可审计），只把 step 的 status/error 标 fail。
 		var planOutJSON string
 		if err == nil {
 			if jb, mErr := json.Marshal(planOut); mErr == nil {
 				planOutJSON = string(jb)
 			}
 		}
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), InputJSON: planPrompt, OutputJSON: planOutJSON, Error: errStr(err)})
+		// step 的 status/error：调用级 err 优先；调用成功但空计划记 fail + "empty plan"。
+		planStatus, planStepErr := statusOf(err), errStr(err)
+		if emptyPlan {
+			planStatus, planStepErr = "fail", "empty plan"
+		}
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr})
 		if err != nil {
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
@@ -238,6 +250,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "plan error: " + err.Error()
+			sl.logRetry(sid, attempt, priorFailure)
+			continue
+		}
+		if emptyPlan {
+			// priorFailure 用中文锚点「plan 产出空计划」：MaxRetries 耗尽时 blocked
+			// detail = "retries exhausted: " + priorFailure，故含此字样；下一轮 plan 的
+			// 重试诊断也会逐字引用它，提示「上一轮你给了空计划」。
+			sl.logf("[subloop] %s phase=plan fail: plan 产出空计划 (empty plan)", sid)
+			priorFailure = "plan 产出空计划"
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}

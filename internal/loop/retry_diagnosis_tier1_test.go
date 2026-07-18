@@ -51,7 +51,7 @@ func TestTier1RetryDiagnosisAttemptGatePersisted(t *testing.T) {
 	defer st.Close()
 	planTmpl := "PLAN:\n{{if .RetryDiagnosis}}{{.RetryDiagnosis}}{{end}}"
 	fake := model.NewFake(map[string]string{
-		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"PLAN:":    validPlanJSON(),
 		"EXECUTE:": "ok",
 		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: "nope"}),
 	})

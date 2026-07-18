@@ -40,7 +40,7 @@ func TestHelloWorldEndToEnd(t *testing.T) {
 	defer st.Close()
 
 	m := model.NewFake(map[string]string{
-		"PLAN:":    j(skill.PlanOutput{}),
+		"PLAN:":    j(skill.PlanOutput{Plan: []skill.PlanStep{{Step: "创建 greet.txt 写入 hello"}}}),
 		"EXECUTE:": "done",
 		"VERIFY:":  j(skill.VerifyOutput{Passed: true, Reason: "file created"}),
 	})

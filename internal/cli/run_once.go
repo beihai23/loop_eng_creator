@@ -157,7 +157,7 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	if mode == "fake" {
 		f := model.NewFake(map[string]string{
 			"TRIAGE:":  jsonStr(skill.TriageOutput{Startable: true, LoopDoable: true}),
-			"PLAN:":    jsonStr(skill.PlanOutput{}),
+			"PLAN:":    jsonStr(skill.PlanOutput{Plan: []skill.PlanStep{{Step: "实现任务以满足验收标准"}}}),
 			"EXECUTE:": "ok",
 			"VERIFY:":  jsonStr(skill.VerifyOutput{Passed: true}),
 		})
