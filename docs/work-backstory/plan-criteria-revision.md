@@ -49,6 +49,14 @@ OutputJSON 使修订可审计。
 4. done 战报的修订说明是否真的被人读到（人审流程是否覆盖）。
 5. 首个样本：task #31（2026-07-18 重触发，新二进制首轮实战）。
 
+**第一批数据（2026-07-18，#46/#47 实战）**：
+- **修订权零行使**：两个任务的 plan 输出（共 5 轮）均无 revised_criteria。尤其 #47——
+  verify 按字面死磕「buildChannel 必须出 diff」（其实调用已兼容、合法为空），这是
+  修订权的标准使用场景，plan 三轮都没用。目前落在「无害死代码」分支，样本仍少。
+- 已在 #47 的 issue 评论里**显式提示** plan 可行使 revised_criteria，看重触发后是否
+  行使——这能区分「模型不知道有这个权力」vs「知道但不用」。
+- 详见 [[plan-execute-contract-drift]]。
+
 ## Decisions
 - **RevisedCriteria 用 \*[]string 而非 []string**：nil=「未修订」（沿用 issue 原版）与
   「修订成空清单」必须可区分——encoding/json 下裸切片做不到。
