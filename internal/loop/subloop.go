@@ -196,6 +196,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
+			Body: task.Body, // 全文保留：issue 原文（背景/约束）也喂给 plan
 		}
 		// 把喂给 plan 的原始提示词落进 step trace（input_json）——dashboard 详情页
 		// 的「初始提示词」读它。RenderPrompt 与 Plan.Run 内部渲染同一模板+输入，
@@ -269,6 +270,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 知道「为什么改」才能不在被删除/改写的条款上浪费力气或自作主张补回。
 		if criteriaRevised && planOut.CriteriaNotes != "" {
 			execPrompt += "（以上验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）\n"
+		}
+		// 全文保留：issue 原文（背景/约束/上下文）也喂给 execute——「任务」行只是
+		// 首行蒸馏，实现细节往往藏在正文其余段落里。
+		if task.Body != "" {
+			execPrompt += "Issue 全文（背景/约束，实现时以全文为准）:\n" + task.Body + "\n"
 		}
 		// 战报/反馈也喂给 execute（不只是 plan）：否则 execute 只对照验收标准、看不见
 		// issue 里的反馈，对「已实现但需按反馈精修」的任务会反复产出空 diff（#20 即此）。

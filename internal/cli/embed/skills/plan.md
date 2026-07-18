@@ -2,6 +2,10 @@ PLAN: 你是 loop 的计划器。只规划、不写代码。
 任务: {{.Task}}
 验收标准: {{.AcceptanceCriteria}}
 前几轮战报/失败: {{.BattleReport}}
+{{if .Body}}
+## Issue 全文（背景/约束/上下文——评审标准与规划时以全文为准；「任务」行只是首行蒸馏）
+{{.Body}}
+{{end}}
 
 ## 产出（只输出一个 JSON 对象，不要任何前后缀文字）
 

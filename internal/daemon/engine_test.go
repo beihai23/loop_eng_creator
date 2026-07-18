@@ -899,3 +899,26 @@ func TestIngestResyncsEditedSpec(t *testing.T) {
 		t.Fatalf("正文未变不应回写: updated_at %s → %s", updatedAtBefore, specs3["A"].UpdatedAt)
 	}
 }
+
+// TestIngestResyncsBodyOnlyEdit 钉死「仅叙述文字变更也触发重新摄入」：desc/criteria
+// 不变、只改了正文的背景段落（全文 body 变）→ 照样回写。全文保留后，plan/execute
+// 吃 body，只比对蒸馏字段会漏掉这类编辑。
+func TestIngestResyncsBodyOnlyEdit(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{{Ref: "A", Description: "task A", TaskType: "feat", Body: "task A\n\n背景 v1"}},
+		{{Ref: "A", Description: "task A", TaskType: "feat", Body: "task A\n\n背景 v2（补充了约束）"}},
+	}}
+	eng := &Engine{Channel: ch, Store: st, Interval: time.Second}
+
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	specs, _ := st.TaskSpecsByRef()
+	if specs["A"].Body != "task A\n\n背景 v2（补充了约束）" {
+		t.Fatalf("body-only 编辑未触发重新摄入: %q", specs["A"].Body)
+	}
+}

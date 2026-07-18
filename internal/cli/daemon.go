@@ -69,6 +69,7 @@ func NewDaemonCmd() *cobra.Command {
 					Description:        task.Description,
 					TaskType:           task.TaskType,
 					AcceptanceCriteria: task.Criteria,
+					Body:               task.Body, // 全文保留：plan/execute 的背景上下文
 					CreatedAt:          task.CreatedAt,
 				}
 				out, err := sl.Run(ctx, ct)

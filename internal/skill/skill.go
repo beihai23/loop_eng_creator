@@ -59,6 +59,9 @@ type PlanInput struct {
 	AcceptanceCriteria []string
 	BattleReport       string
 	RepoStateSummary   string
+	// Body is the full raw issue text (背景/约束/上下文)。Description 只是正文
+	// 首行的蒸馏；plan 评审验收标准、规划实现时应能看到全文。
+	Body string
 }
 type PlanStep struct {
 	Step     string   `json:"step"`

@@ -716,14 +716,14 @@ func TestInitialPrompts(t *testing.T) {
 	}
 }
 
-// TestUpdateTaskSpec 钉死 spec 快照的回写语义：description + criteria 被替换、
-// updated_at 被刷新；TaskSpecsByRef 能读回新值。
+// TestUpdateTaskSpec 钉死 spec 快照的回写语义：description + criteria + 全文 body
+// 被替换、updated_at 被刷新；TaskSpecsByRef 能读回新值。
 func TestUpdateTaskSpec(t *testing.T) {
 	st, _ := Open(t.TempDir() + "/state.db")
 	defer st.Close()
-	id, _ := st.InsertTask(TaskRow{IssueRef: "9", Description: "v1", Criteria: []string{"a"}})
+	id, _ := st.InsertTask(TaskRow{IssueRef: "9", Description: "v1", Criteria: []string{"a"}, Body: "正文 v1 全文"})
 
-	if err := st.UpdateTaskSpec(id, "v2 edited", []string{"a", "b"}); err != nil {
+	if err := st.UpdateTaskSpec(id, "v2 edited", []string{"a", "b"}, "正文 v2 全文"); err != nil {
 		t.Fatal(err)
 	}
 	specs, err := st.TaskSpecsByRef()
@@ -734,10 +734,36 @@ func TestUpdateTaskSpec(t *testing.T) {
 	if got.Description != "v2 edited" || len(got.Criteria) != 2 || got.Criteria[1] != "b" {
 		t.Fatalf("spec 未回写: %+v", got)
 	}
+	if got.Body != "正文 v2 全文" {
+		t.Fatalf("body 未回写: %q", got.Body)
+	}
 	if got.UpdatedAt == "" {
 		t.Fatalf("updated_at 未填充: %+v", got)
 	}
 	if got.ID != id {
 		t.Fatalf("TaskSpecsByRef 应携带 id: got %q want %q", got.ID, id)
+	}
+}
+
+// TestTaskBodyRoundTrip 钉死「全文保留」的读写回路：InsertTask 带 Body →
+// GetTask / NextReadyTask 读回同一全文；旧库（body 列为 NULL）读成空串不报错。
+func TestTaskBodyRoundTrip(t *testing.T) {
+	st, _ := Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	id, _ := st.InsertTask(TaskRow{IssueRef: "10", Description: "首行", Body: "首行\n\n## 背景\n这段叙述不能丢"})
+
+	got, err := st.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "首行\n\n## 背景\n这段叙述不能丢" {
+		t.Fatalf("GetTask body 未读回: %q", got.Body)
+	}
+	next, ok, err := st.NextReadyTask()
+	if err != nil || !ok {
+		t.Fatalf("NextReadyTask: ok=%v err=%v", ok, err)
+	}
+	if next.Body != got.Body {
+		t.Fatalf("NextReadyTask body 未读回: %q", next.Body)
 	}
 }

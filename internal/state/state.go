@@ -24,6 +24,9 @@ type TaskRow struct {
 	// TaskSpecsByRef — readers that need "did the spec snapshot change" (e.g.
 	// the daemon's no-op-write guard in tests) get it there.
 	UpdatedAt string
+	// Body is the full raw issue text (背景/约束/上下文), preserved alongside
+	// the distilled Description+Criteria and fed to the plan/execute prompts.
+	Body string
 }
 
 var schema = []string{
@@ -102,6 +105,8 @@ func Open(path string) (*Store, error) {
 	db.Exec(`ALTER TABLE task_status ADD COLUMN last_comment_at TEXT`)
 	// Best-effort: add run_id to verifications for Task 6 的 per-run 分组。
 	db.Exec(`ALTER TABLE verifications ADD COLUMN run_id TEXT`)
+	// Best-effort: add body to tasks — 全文保留（issue 原文，plan/execute 的上下文）。
+	db.Exec(`ALTER TABLE tasks ADD COLUMN body TEXT`)
 	return &Store{db: db}, nil
 }
 
@@ -123,9 +128,9 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 		return "", err
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO tasks(id, issue_ref, description, task_type, source, acceptance_criteria_json, created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		id, t.IssueRef, t.Description, t.TaskType, t.Source, string(crit), createdAt, now); err != nil {
+		`INSERT INTO tasks(id, issue_ref, description, task_type, source, acceptance_criteria_json, created_at, updated_at, body)
+		 VALUES(?,?,?,?,?,?,?,?,?)`,
+		id, t.IssueRef, t.Description, t.TaskType, t.Source, string(crit), createdAt, now, t.Body); err != nil {
 		tx.Rollback()
 		return "", err
 	}
@@ -143,10 +148,10 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 
 func (s *Store) GetTask(id string) (TaskRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, issue_ref, description, task_type, source, acceptance_criteria_json FROM tasks WHERE id=?`, id)
+		`SELECT id, issue_ref, description, task_type, source, acceptance_criteria_json, COALESCE(body,'') FROM tasks WHERE id=?`, id)
 	var t TaskRow
 	var critJSON string
-	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON); err != nil {
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body); err != nil {
 		return t, err
 	}
 	_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
@@ -273,7 +278,7 @@ func (s *Store) IssueRefs() (map[string]bool, error) {
 // edited specs with zero extra channel reads.
 func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at FROM tasks`)
+		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at, COALESCE(body,'') FROM tasks`)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +287,7 @@ func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 	for rows.Next() {
 		var t TaskRow
 		var critJSON string
-		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt, &t.Body); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
@@ -292,16 +297,16 @@ func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 }
 
 // UpdateTaskSpec re-ingests an edited issue body: replaces the stored spec
-// snapshot (description + acceptance criteria) and bumps updated_at. Called by
-// the daemon's ingest only when the polled body actually differs from the
-// snapshot — never a no-op write. Runs already dispatched keep their snapshot
-// (channel.Task was built at dispatch); the new spec takes effect on the next
-// dispatch/resume.
-func (s *Store) UpdateTaskSpec(id, description string, criteria []string) error {
+// snapshot (description + acceptance criteria + full body) and bumps
+// updated_at. Called by the daemon's ingest only when the polled body actually
+// differs from the snapshot — never a no-op write. Runs already dispatched
+// keep their snapshot (channel.Task was built at dispatch); the new spec takes
+// effect on the next dispatch/resume.
+func (s *Store) UpdateTaskSpec(id, description string, criteria []string, body string) error {
 	crit, _ := json.Marshal(criteria)
 	_, err := s.db.Exec(
-		`UPDATE tasks SET description=?, acceptance_criteria_json=?, updated_at=? WHERE id=?`,
-		description, string(crit), nowISO(), id)
+		`UPDATE tasks SET description=?, acceptance_criteria_json=?, body=?, updated_at=? WHERE id=?`,
+		description, string(crit), body, nowISO(), id)
 	return err
 }
 
@@ -315,7 +320,7 @@ func (s *Store) UpdateTaskSpec(id, description string, criteria []string) error 
 // tick, one task, oldest-submitted first.
 func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status = 'new'
@@ -323,7 +328,7 @@ func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 		 LIMIT 1`)
 	var t TaskRow
 	var critJSON string
-	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON); err != nil {
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TaskRow{}, false, nil
 		}
@@ -360,7 +365,7 @@ func (s *Store) BlockedTasks() ([]TaskRow, error) {
 // side for human-driven reversals (reopen, un-label).
 func (s *Store) TerminalTasks() ([]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status IN ('done', 'blocked')
@@ -374,7 +379,7 @@ func (s *Store) TerminalTasks() ([]TaskRow, error) {
 
 func (s *Store) listTasksByStatus(status string) ([]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status = ?
@@ -391,7 +396,7 @@ func scanTaskRows(rows *sql.Rows) ([]TaskRow, error) {
 	for rows.Next() {
 		var t TaskRow
 		var critJSON string
-		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON); err != nil {
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)

@@ -10,6 +10,12 @@ type Task struct {
 	Description        string
 	AcceptanceCriteria []string
 	TaskType           string
+	// Body is the full raw issue/ticket text. parseLocalTask only distills the
+	// first line (Description) and `- [ ]` items (AcceptanceCriteria) — the
+	// background/constraints/context prose lives here and flows to the plan and
+	// execute prompts. Empty for tasks ingested before this field existed
+	// (their first spec re-ingest backfills it).
+	Body string
 	// CreatedAt is the issue/ticket submission time (RFC3339) as reported by the
 	// channel. Carries through to tasks.created_at so the dispatch FIFO orders by
 	// submission time, not by ingest order. Empty when the channel has no value.

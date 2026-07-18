@@ -223,10 +223,10 @@ func (e *Engine) ingest(ctx context.Context) error {
 	var ingested int
 	for _, t := range tasks {
 		if known, ok := specs[t.Ref]; ok {
-			// 已知 ref：正文被编辑过才回写（比对解析后的 desc+criteria——与落库
-			// 内容同构，未变时绝不产生 no-op UPDATE）。
-			if known.Description != t.Description || !equalStrings(known.Criteria, t.AcceptanceCriteria) {
-				if err := e.Store.UpdateTaskSpec(known.ID, t.Description, t.AcceptanceCriteria); err != nil {
+			// 已知 ref：正文被编辑过才回写（比对解析后的 desc+criteria+全文 body——
+			// 与落库内容同构，未变时绝不产生 no-op UPDATE）。
+			if known.Description != t.Description || !equalStrings(known.Criteria, t.AcceptanceCriteria) || known.Body != t.Body {
+				if err := e.Store.UpdateTaskSpec(known.ID, t.Description, t.AcceptanceCriteria, t.Body); err != nil {
 					return err
 				}
 				e.logf("[daemon] ingest: task %s spec updated (issue body edited)", t.Ref)

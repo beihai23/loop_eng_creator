@@ -45,6 +45,7 @@ func (l *Local) ListNewTasks(_ context.Context) ([]Task, error) {
 
 func parseLocalTask(raw string) Task {
 	var t Task
+	t.Body = raw // 全文保留：解析出的 desc/criteria 是蒸馏，原文（背景/约束）不丢
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
 		switch {

@@ -1377,3 +1377,51 @@ func TestSubLoopPlanRevisedCriteria(t *testing.T) {
 		t.Fatalf("plan step output_json 缺 revised_criteria（审计轨迹）:\n%s", planOut)
 	}
 }
+
+// TestSubLoopFeedsFullBodyToPlanAndExecute 钉死「全文保留」：issue 原文（Body）必须
+// 同时进 plan 与 execute 的 prompt——正文其余段落的背景/约束不再在摄入时丢失。
+func TestSubLoopFeedsFullBodyToPlanAndExecute(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+		"EXECUTE:": "ok",
+	})
+	prec := &recorder{Client: fake}
+	exec := &captureExec{}
+
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute: exec,
+		Plan: skill.Skill[skill.PlanInput, skill.PlanOutput]{
+			Name:       "plan",
+			PromptTmpl: "PLAN:\n{{if .Body}}全文: {{.Body}}{{end}}",
+			ParseJSON: func(b []byte) (skill.PlanOutput, error) {
+				var o skill.PlanOutput
+				return o, json.Unmarshal(b, &o)
+			},
+			Model: prec,
+		},
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{
+		Ref: "11", Description: "首行", AcceptanceCriteria: []string{"c"},
+		Body: "首行\n\n## 背景\n这段叙述必须到达模型",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+	if len(prec.got) == 0 || !strings.Contains(prec.got[0], "这段叙述必须到达模型") {
+		t.Fatalf("plan prompt 缺 issue 全文:\n%v", prec.got)
+	}
+	if !strings.Contains(exec.got, "这段叙述必须到达模型") {
+		t.Fatalf("execute prompt 缺 issue 全文:\n%s", exec.got)
+	}
+}
