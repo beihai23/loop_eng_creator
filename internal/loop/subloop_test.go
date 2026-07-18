@@ -1425,3 +1425,138 @@ func TestSubLoopFeedsFullBodyToPlanAndExecute(t *testing.T) {
 		t.Fatalf("execute prompt 缺 issue 全文:\n%s", exec.got)
 	}
 }
+
+// ---- 重试诊断（revised_criteria 修订权自动化；plan-criteria-revision 第二批数据）----
+
+// TestRetryDiagnosisForGating 钉死 retryDiagnosisFor 的门控与文本锚点（均可机械判定）：
+//   - 门控：attempt<2（含 attempt=1）或 priorFailure 空/纯空白 → 返回空串（不注入，避免
+//     干扰首次规划）。attempt≥2 + 非空 priorFailure → 返回非空诊断。
+//   - 文本锚点：诊断必含「重试诊断」「结构性不可满足」「revised_criteria」，并逐字引用
+//     当轮 priorFailure 原文（这是 #47 实证出的触发条件——「给具体诊断」才让 plan 行使
+//     修订权，这里把人写的诊断自动化）。
+func TestRetryDiagnosisForGating(t *testing.T) {
+	const fail = "tier-2: diff 未附 go build 输出（execute 在 worktree 跑，stdout 不进战报）"
+
+	// 门控：attempt<2 或空 priorFailure → 空串。
+	for _, tc := range []struct {
+		name         string
+		attempt      int
+		priorFailure string
+	}{
+		{"attempt=1 首次不注入", 1, fail},
+		{"attempt=0 不注入", 0, fail},
+		{"attempt=2 但 priorFailure 空 → 不注入", 2, ""},
+		{"attempt=3 但 priorFailure 纯空白 → 不注入", 3, "   \n\t "},
+	} {
+		got := retryDiagnosisFor(tc.attempt, tc.priorFailure)
+		if got != "" {
+			t.Fatalf("%s: want 空串, got non-empty 诊断:\n%s", tc.name, got)
+		}
+	}
+
+	// 注入分支：attempt≥2 + 非空 priorFailure → 含全部锚点 + 原文。
+	got := retryDiagnosisFor(2, fail)
+	if got == "" {
+		t.Fatal("attempt=2 + 非空 priorFailure: want 非空诊断, got 空串")
+	}
+	for _, anchor := range []string{"重试诊断", "结构性不可满足", "revised_criteria", fail} {
+		if !strings.Contains(got, anchor) {
+			t.Fatalf("诊断缺失锚点 %q:\n%s", anchor, got)
+		}
+	}
+
+	// attempt 更大（如 3）同样注入——只要 priorFailure 非空。
+	if retryDiagnosisFor(3, fail) == "" {
+		t.Fatal("attempt=3 + 非空 priorFailure 应注入诊断")
+	}
+}
+
+// TestSubLoopRetryDiagnosisOnRetry 钉死 SubLoop 在重试时把 retryDiagnosisFor 的产出
+// 经 {{.RetryDiagnosis}} 渲染进 planPrompt、落进 plan step 的 input_json（attempt≥2 的
+// seq≥20 行可审计）。构造 verify 连续驳回（MaxRetries=2 → attempt 1/2 各跑一次 plan）：
+//   - attempt=1（seq=11）plan input_json 不得含诊断标识「重试诊断」——首次不注入。
+//   - attempt=2（seq=21）plan input_json 必含「重试诊断」+ 当轮 priorFailure 原文（verify 驳回理由）。
+//
+// tier-1 验收只断言结构性落点（指令文本存在、attempt 门控、input_json 落点）——不断言
+// plan 在真实 LLM 调用中行使了 revised_criteria（非确定性、无法机械判定，#47 教训）。
+func TestSubLoopRetryDiagnosisOnRetry(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+
+	// verify 永远驳回——理由是典型的「结构性不可满足」措辞，断言它被逐字引用进 attempt=2 诊断。
+	const failReason = "STRUCTURAL_UNSAT_PROBE: diff must include go build output"
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: false, Reason: failReason}),
+	})
+	// Plan 用带 {{.RetryDiagnosis}} 条件块的模板（与 plan embed 的条件块同构），
+	// 验证 SubLoop 把 planIn.RetryDiagnosis 渲染进 prompt。
+	plan := skill.Skill[skill.PlanInput, skill.PlanOutput]{
+		Name:       "plan",
+		PromptTmpl: "PLAN:\n{{if .RetryDiagnosis}}{{.RetryDiagnosis}}\n{{end}}任务: {{.Task}}",
+		ParseJSON: func(b []byte) (skill.PlanOutput, error) {
+			var o skill.PlanOutput
+			return o, json.Unmarshal(b, &o)
+		},
+		Model: fake,
+	}
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 2),
+		Execute:    fake,
+		Plan:       plan,
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, _ := sl.Run(context.Background(), channel.Task{Ref: "88", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if out.Status != "blocked" {
+		t.Fatalf("want blocked (verify 连续驳回), got %s", out.Status)
+	}
+
+	views, _ := st.TasksByStatus()
+	if len(views) != 1 {
+		t.Fatalf("want 1 task, got %d", len(views))
+	}
+	runs, _ := st.RunsOfTask(views[0].ID)
+	if len(runs) != 1 {
+		t.Fatalf("want 1 run, got %d", len(runs))
+	}
+	steps, err := st.Replay(runs[0].ID)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	// 收集 plan step 的 input_json，按 seq 升序（attempt=1→seq=11，attempt=2→seq=21）。
+	planInputs := map[int]string{}
+	for _, s := range steps {
+		if s.Role == "plan" {
+			planInputs[s.Seq] = s.InputJSON
+		}
+	}
+	if _, ok := planInputs[11]; !ok {
+		t.Fatalf("缺 attempt=1 plan step (seq=11): got seq set %v", seqSet(planInputs))
+	}
+	if _, ok := planInputs[21]; !ok {
+		t.Fatalf("缺 attempt=2 plan step (seq=21): got seq set %v", seqSet(planInputs))
+	}
+	// attempt=1：不得含诊断标识（首次不注入）。
+	if strings.Contains(planInputs[11], "重试诊断") {
+		t.Fatalf("attempt=1 plan input_json 不得含诊断标识（首次不应注入）:\n%s", planInputs[11])
+	}
+	// attempt=2：必含诊断标识 + 当轮 priorFailure 原文（被逐字引用）。
+	for _, want := range []string{"重试诊断", "结构性不可满足", "revised_criteria", failReason} {
+		if !strings.Contains(planInputs[21], want) {
+			t.Fatalf("attempt=2 plan input_json 缺失 %q:\n%s", want, planInputs[21])
+		}
+	}
+}
+
+// seqSet returns the seq keys of planInputs for failure diagnostics.
+func seqSet(m map[int]string) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
