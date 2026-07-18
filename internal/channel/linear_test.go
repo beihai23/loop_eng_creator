@@ -294,5 +294,5 @@ func TestLinearHTTPError(t *testing.T) {
 
 // 编译期接口断言（运行期再确认一次，防止断言被误删）。
 func TestLinearChannelConformance(t *testing.T) {
-	var _ Channel = NewLinear("k", "p", "", nil)
+	var _ Channel = NewLinear("k", "", "p", "", nil)
 }
