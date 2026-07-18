@@ -1293,3 +1293,87 @@ func TestSubLoopRecordsPlanPrompt(t *testing.T) {
 		t.Fatalf("InitialPrompts execute missing EXECUTE: prefix:\n%s", exec)
 	}
 }
+
+// TestSubLoopPlanRevisedCriteria 钉死「plan 可修订验收标准」（plan-criteria-revision）：
+// plan 输出 revised_criteria 时——execute 按修订版实现、verify 按修订版判、issue 原始
+// 标准不再出现；done 战报带修订说明（人审可审计）；plan step 落 output_json（trace 可查）。
+func TestSubLoopPlanRevisedCriteria(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+
+	revised := []string{"PLAN修订后的唯一标准"}
+	fake := model.NewFake(map[string]string{
+		"PLAN:": mustJSON(skill.PlanOutput{
+			RevisedCriteria: &revised,
+			CriteriaNotes:   "原标准不可判定，改写为可判定条款",
+		}),
+		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	vrec := &recorder{Client: fake}
+	exec := &captureExec{}
+
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute: exec,
+		Plan:    mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM: verify.LLM{Skill: skill.Skill[skill.VerifyInput, skill.VerifyOutput]{
+			Name: "verify", PromptTmpl: "VERIFY: {{.AcceptanceCriteria}}",
+			ParseJSON: func(b []byte) (skill.VerifyOutput, error) {
+				var o skill.VerifyOutput
+				return o, json.Unmarshal(b, &o)
+			},
+			Model: vrec,
+		}},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{
+		Ref: "9", Description: "d", AcceptanceCriteria: []string{"原始标准不应再出现"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+
+	// execute 按修订版实现：含修订标准 + 修订理由；不含原始标准。
+	if !strings.Contains(exec.got, "PLAN修订后的唯一标准") {
+		t.Fatalf("execute prompt 缺修订后标准:\n%s", exec.got)
+	}
+	if !strings.Contains(exec.got, "原标准不可判定") {
+		t.Fatalf("execute prompt 缺修订理由:\n%s", exec.got)
+	}
+	if strings.Contains(exec.got, "原始标准不应再出现") {
+		t.Fatalf("execute prompt 仍含 issue 原始标准:\n%s", exec.got)
+	}
+
+	// verify 按修订版判。
+	vprompts := strings.Join(vrec.got, "\n")
+	if !strings.Contains(vprompts, "PLAN修订后的唯一标准") {
+		t.Fatalf("verify prompt 缺修订后标准:\n%s", vprompts)
+	}
+	if strings.Contains(vprompts, "原始标准不应再出现") {
+		t.Fatalf("verify prompt 仍含 issue 原始标准:\n%s", vprompts)
+	}
+
+	// done 战报带修订说明（人审/审计线索）。
+	if !strings.Contains(out.Detail, "验收标准经 plan 评审修订") {
+		t.Fatalf("done detail 缺修订说明: %q", out.Detail)
+	}
+
+	// plan step 落 output_json：修订可审计。
+	views, _ := st.TasksByStatus()
+	runs, _ := st.RunsOfTask(views[0].ID)
+	steps, _ := st.Replay(runs[0].ID)
+	var planOut string
+	for _, s := range steps {
+		if s.Role == "plan" {
+			planOut = s.OutputJSON
+		}
+	}
+	if !strings.Contains(planOut, "revised_criteria") {
+		t.Fatalf("plan step output_json 缺 revised_criteria（审计轨迹）:\n%s", planOut)
+	}
+}

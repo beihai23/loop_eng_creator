@@ -74,6 +74,17 @@ type PlanOutput struct {
 	// plan. nil (or invalid) ⇒ tier-1 absent ⇒ the verify chain falls straight
 	// to tier-2 (LLM). No static/fallback list anywhere.
 	VerifyScript *PlanVerifyScript `json:"verify_script,omitempty"`
+	// RevisedCriteria is the acceptance-criteria contract the planner commits
+	// to after critically reviewing the issue's raw criteria (clarify / rewrite
+	// / drop with justification). nil ⇒ 未修订 ⇒ downstream falls back to the
+	// issue's raw criteria; non-nil (even empty) ⇒ plan 修订版，execute 按它
+	// 实现、verify 按它判。防放水约束写在 plan.md：修订必须忠于任务意图，
+	// 删除必须给理由（CriteriaNotes），由 tier-3 人审兜底。
+	RevisedCriteria *[]string `json:"revised_criteria,omitempty"`
+	// CriteriaNotes is the planner's justification for the revision (why each
+	// criterion was clarified/rewritten/dropped) — the audit trail surfaced in
+	// the run trace and battle reports. Empty when nothing was revised.
+	CriteriaNotes string `json:"criteria_notes,omitempty"`
 }
 
 // PlanVerifyScript is the plan-produced tier-1 acceptance script: a runnable

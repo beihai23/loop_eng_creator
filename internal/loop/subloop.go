@@ -203,7 +203,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.Run(ctx, planIn)
 		sl.Budget.AfterCall(u)
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), InputJSON: planPrompt, Error: errStr(err)})
+		// plan 产出也落 trace（output_json）：含 plan 步骤、verify_script 及
+		// 修订后的验收标准——修订权的审计轨迹（dashboard 详情页/人审可查）。
+		var planOutJSON string
+		if err == nil {
+			if jb, mErr := json.Marshal(planOut); mErr == nil {
+				planOutJSON = string(jb)
+			}
+		}
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), InputJSON: planPrompt, OutputJSON: planOutJSON, Error: errStr(err)})
 		if err != nil {
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
@@ -219,6 +227,17 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// plan 未产出是正常分支（判定不可脚本化 → tier-2），不算异常，不打 warning。
 		if vs := planOut.VerifyScript; vs != nil && !vs.Valid() {
 			sl.logf("[subloop] %s plan verify_script invalid (run command missing?) — skip tier-1, fall to tier-2", sid)
+		}
+
+		// 有效验收标准：plan 行使评审权（RevisedCriteria 非 nil）时以 plan 承诺的
+		// 版本为准——execute 按它实现、verify 按它判；未修订（nil）沿用 issue 原版。
+		// effTask 仅替换标准（verifyFailComment 的签名被测试钉死，从调用点喂修订版）。
+		effTask := task
+		criteriaRevised := planOut.RevisedCriteria != nil
+		if criteriaRevised {
+			effTask.AcceptanceCriteria = *planOut.RevisedCriteria
+			sl.logf("[subloop] %s plan revised acceptance criteria: %d → %d 条 (%s)",
+				sid, len(task.AcceptanceCriteria), len(*planOut.RevisedCriteria), truncateStr(planOut.CriteriaNotes, 80))
 		}
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
@@ -245,7 +264,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
-			"验收标准:\n" + criteriaBlock(task.AcceptanceCriteria) + "\n"
+			"验收标准:\n" + criteriaBlock(effTask.AcceptanceCriteria) + "\n"
+		// plan 修订过标准时把修订理由也告诉 execute——它实现的是 plan 承诺的合同，
+		// 知道「为什么改」才能不在被删除/改写的条款上浪费力气或自作主张补回。
+		if criteriaRevised && planOut.CriteriaNotes != "" {
+			execPrompt += "（以上验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）\n"
+		}
 		// 战报/反馈也喂给 execute（不只是 plan）：否则 execute 只对照验收标准、看不见
 		// issue 里的反馈，对「已实现但需按反馈精修」的任务会反复产出空 diff（#20 即此）。
 		if issueContext != "" {
@@ -290,7 +314,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- verify (Chain of tiers; independent judgment) ----
 		sl.logf("[subloop] %s phase=verify start", sid)
 		_ = sl.Store.SetInFlight(taskID, "verify")
-		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut), diff, task.AcceptanceCriteria, priorFailure)
+		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut), diff, effTask.AcceptanceCriteria, priorFailure)
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
 		// 且 failing_criteria 随行落库——修 #10 黑箱（旧 trace 只剩空的 detail=）。
@@ -347,7 +371,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 					" [land: worktree commit failed: "+cerr.Error()+"; worktree preserved at "+wt+"]"), nil
 			}
 			_ = sl.Store.ClearInFlight()
-			out := sl.report(ctx, taskID, task, "done", res.Detail)
+			// plan 修订过验收标准时，在 done 战报里留人可见的审计线索（tier-3 人审
+			// 与 issue 读者能看到「按修订版判过」及理由）。
+			doneDetail := res.Detail
+			if criteriaRevised {
+				doneDetail += "\n（验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）"
+			}
+			out := sl.report(ctx, taskID, task, "done", doneDetail)
 			out.Worktree = wt
 			out.Branch = branch
 			return out, nil
@@ -357,7 +387,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// verify 不过必给「失败理由 + 改进建议」，落进 issue 评论：给人看（驳回不再黑箱）
 		// + 作下一轮持久反馈（collectIssueComments 下一轮读回喂 plan/execute）。best-effort——
 		// 发评论失败只记日志、不 gate loop（与 report 的 PostComment 容错一致）。
-		if cErr := sl.Channel.PostComment(ctx, task.Ref, verifyFailComment(task, attempt, res)); cErr != nil {
+		if cErr := sl.Channel.PostComment(ctx, task.Ref, verifyFailComment(effTask, attempt, res)); cErr != nil {
 			sl.logf("[subloop] %s verify-fail comment post failed: %v", sid, cErr)
 		}
 		priorFailure = res.Detail
