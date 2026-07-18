@@ -578,6 +578,36 @@ func (s *Store) RunsOfTask(taskID string) ([]RunRow, error) {
 	return out, rows.Err()
 }
 
+// InitialPrompts 返回某 run 的初始提示词：该 run 里首个带 input_json 的 plan step
+// 与 execute step 的输入——即任务这次启动时喂给两个模型的首轮提示词（dashboard 详情页
+// 的「初始提示词」读它）。无记录时对应返回空串（如 plan 失败未走到 execute，或旧数据
+// 的 step 未落 input_json）。
+func (s *Store) InitialPrompts(runID string) (plan, execute string, err error) {
+	if plan, err = s.firstStepInput(runID, "plan"); err != nil {
+		return "", "", err
+	}
+	if execute, err = s.firstStepInput(runID, "execute"); err != nil {
+		return "", "", err
+	}
+	return plan, execute, nil
+}
+
+// firstStepInput 取 run 内某 role 的首个非空 input_json（按 seq 升序 = attempt 顺序，
+// rowid 兜底同 seq 时的插入序）。
+func (s *Store) firstStepInput(runID, role string) (string, error) {
+	var in string
+	err := s.db.QueryRow(
+		`SELECT input_json FROM steps WHERE run_id=? AND role=? AND input_json != ''
+		 ORDER BY seq, rowid LIMIT 1`, runID, role).Scan(&in)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return in, nil
+}
+
 func (s *Store) Replay(runID string) ([]StepRow, error) {
 	rows, err := s.db.Query(
 		`SELECT run_id, seq, role, skill, model_ref, input_json, output_json,

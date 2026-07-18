@@ -19,6 +19,13 @@ func render(tmpl string, input any) (string, error) {
 	return buf.String(), nil
 }
 
+// RenderPrompt renders a skill prompt template with input. Exported so callers
+// (SubLoop) can persist the exact prompt text into the step trace
+// (steps.input_json) without changing Skill.Run's frozen signature — Skill.Run
+// renders the same template+input internally, so the recorded text is identical
+// to what the model saw.
+func RenderPrompt(tmpl string, input any) (string, error) { return render(tmpl, input) }
+
 // extractJSON finds the first valid JSON object in raw and returns its
 // substring. LLMs often wrap JSON in prose despite "JSON only" instructions
 // (e.g. "所有事实已验证。确认：…\n\n{…}"), which makes a strict json.Unmarshal of

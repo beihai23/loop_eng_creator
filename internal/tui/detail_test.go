@@ -156,3 +156,43 @@ func TestRenderDetailTier1LabelPlanNotProduced(t *testing.T) {
 		t.Fatalf("missing (plan 未产出) tier-1 label when no tier=1 row in:\n%s", out)
 	}
 }
+
+// TestRenderDetailShowsInitialPrompts 钉死详情页的「初始提示词」小节：取最新 run 首轮
+// plan/execute 的 input_json 展示，多行内容保留；无记录时显示占位符而非空白。
+func TestRenderDetailShowsInitialPrompts(t *testing.T) {
+	st, _ := state.Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	tid, _ := st.InsertTask(state.TaskRow{IssueRef: "#41", Description: "提示词可见"})
+	rid, _ := st.StartRun(tid)
+	_ = st.AppendStep(state.StepRow{RunID: rid, Seq: 11, Role: "plan", Status: "ok",
+		InputJSON: "PLAN 提示词第一行\nPLAN 提示词第二行"})
+	_ = st.AppendStep(state.StepRow{RunID: rid, Seq: 12, Role: "execute", Status: "ok",
+		InputJSON: "EXECUTE: 你在一个 git worktree 里"})
+	_ = st.EndRun(rid, "done")
+
+	out := RenderDetail(st, &config.Config{}, tid)
+	for _, want := range []string{"初始提示词", "[plan]", "[execute]",
+		"PLAN 提示词第一行", "PLAN 提示词第二行", "EXECUTE: 你在一个 git worktree 里"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("detail missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderDetailInitialPromptsFallback：run 存在但两个 prompt 都没落盘（旧数据）时，
+// 小节显示（无记录）占位符，不出现半截空白。
+func TestRenderDetailInitialPromptsFallback(t *testing.T) {
+	st, _ := state.Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	tid, _ := st.InsertTask(state.TaskRow{IssueRef: "#42", Description: "旧数据无提示词"})
+	rid, _ := st.StartRun(tid)
+	_ = st.EndRun(rid, "done")
+
+	out := RenderDetail(st, &config.Config{}, tid)
+	if !strings.Contains(out, "初始提示词") {
+		t.Fatalf("detail missing 初始提示词 section in:\n%s", out)
+	}
+	if strings.Count(out, "（无记录）") != 2 {
+		t.Fatalf("want 2 （无记录） placeholders (plan+execute) in:\n%s", out)
+	}
+}

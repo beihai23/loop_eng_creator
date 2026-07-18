@@ -62,6 +62,17 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 		b.WriteString(fmt.Sprintf("启动: %s · 已运行 %s\n", startedAt, elapsedSince(startedAt)))
 	}
 
+	// 初始提示词（最近一次启动 = runID 所指 run 的首轮 plan/execute 输入）。
+	// 内容可能很长（含战报/issue 评论），详情 tab 支持 j/k 滚动查看（model.go）。
+	if runOK {
+		planPrompt, execPrompt, _ := st.InitialPrompts(runID)
+		b.WriteString("\n初始提示词（最近一次启动）:\n")
+		b.WriteString("  [plan]\n")
+		b.WriteString(indentBlock(planPrompt))
+		b.WriteString("  [execute]\n")
+		b.WriteString(indentBlock(execPrompt))
+	}
+
 	// 验收方式（逐 tier 状态扫描内存切片 vers）
 	// 列对齐用 lipgloss Width（tier 号 / label 固定宽截断 / 状态末列），不再空格凑——
 	// CJK label（人审 / plan 未产出）也能对齐；状态按 ✓绿/✗红/—faint 着色（spec §6）。
@@ -97,7 +108,7 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	// 接近上限时黄/红提示——见 budgetLine）
 	used, limit := budgetUsed(st, cfg, taskID, runID)
 	b.WriteString("\n" + budgetLine(used, limit) + "\n")
-	b.WriteString("\n[r] resume   [x] cancel   [t] 看轨迹   [Esc] 回总览\n")
+	b.WriteString("\n[j/k] 滚动   [r] resume   [x] cancel   [t] 看轨迹   [Esc] 回总览\n")
 	return b.String()
 }
 
@@ -111,6 +122,19 @@ const (
 	detailTierW  = 8  // "tier-1".."tier-3"
 	detailLabelW = 24 // label 列：plan 产出标签 / 模型名 / 人审
 )
+
+// indentBlock 把多行文本逐行缩进两格（对齐「验收标准」的 bullet 风格）；
+// 空串（该 run 未落此 prompt）渲染占位符。
+func indentBlock(s string) string {
+	if s == "" {
+		return "    （无记录）\n"
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		b.WriteString("  " + line + "\n")
+	}
+	return b.String()
+}
 
 func statusOfTask(st *state.Store, taskID string) string {
 	for _, r := range mustList(st) {

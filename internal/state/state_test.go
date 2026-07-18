@@ -673,3 +673,45 @@ func TestSeparateConnectionSeesCommittedWrite(t *testing.T) {
 		t.Fatalf("reader did not see committed write: %+v", views)
 	}
 }
+
+// TestInitialPrompts 钉死「run 的初始提示词」读取：取该 run 首个带 input_json 的
+// plan / execute step（dashboard 详情页「初始提示词」的数据源）。要点：
+//   - 多 attempt 时取首轮（seq 升序），不是最后一轮；
+//   - 空 input_json 的 step（旧数据）被跳过；
+//   - 某 role 无记录（如 plan 失败未走到 execute）→ 对应返回空串而非报错。
+func TestInitialPrompts(t *testing.T) {
+	st, _ := Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	tid, _ := st.InsertTask(TaskRow{IssueRef: "#1", Description: "d"})
+	rid, _ := st.StartRun(tid)
+
+	// attempt 1：plan 有输入；execute 未走到（无 step）。
+	_ = st.AppendStep(StepRow{RunID: rid, Seq: 11, Role: "plan", Status: "ok", InputJSON: "PLAN首轮提示词"})
+	// attempt 2：plan 重试（更新的反馈）+ execute 首轮输入。
+	_ = st.AppendStep(StepRow{RunID: rid, Seq: 21, Role: "plan", Status: "ok", InputJSON: "PLAN次轮提示词"})
+	_ = st.AppendStep(StepRow{RunID: rid, Seq: 22, Role: "execute", Status: "ok", InputJSON: "EXECUTE首轮提示词"})
+	// 旧数据：空 input_json 的 execute step 不得抢先命中（seq 更小但为空）。
+	_ = st.AppendStep(StepRow{RunID: rid, Seq: 2, Role: "execute", Status: "ok"})
+
+	plan, exec, err := st.InitialPrompts(rid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != "PLAN首轮提示词" {
+		t.Fatalf("plan prompt = %q, want 首轮", plan)
+	}
+	if exec != "EXECUTE首轮提示词" {
+		t.Fatalf("execute prompt = %q, want 首轮非空记录", exec)
+	}
+
+	// 无 execute 记录的 run → execute 返回空串。
+	rid2, _ := st.StartRun(tid)
+	_ = st.AppendStep(StepRow{RunID: rid2, Seq: 11, Role: "plan", Status: "fail", InputJSON: "P2"})
+	_, exec2, err := st.InitialPrompts(rid2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exec2 != "" {
+		t.Fatalf("execute prompt = %q, want empty (no execute step)", exec2)
+	}
+}

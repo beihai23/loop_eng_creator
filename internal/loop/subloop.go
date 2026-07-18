@@ -193,12 +193,17 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
 		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
-		planOut, u, err := sl.Plan.Run(ctx, skill.PlanInput{
+		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
-		})
+		}
+		// 把喂给 plan 的原始提示词落进 step trace（input_json）——dashboard 详情页
+		// 的「初始提示词」读它。RenderPrompt 与 Plan.Run 内部渲染同一模板+输入，
+		// 文本一致；渲染失败（模板错）时 Plan.Run 同样会报 render 错，这里留空即可。
+		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
+		planOut, u, err := sl.Plan.Run(ctx, planIn)
 		sl.Budget.AfterCall(u)
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), Error: errStr(err)})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: statusOf(err), InputJSON: planPrompt, Error: errStr(err)})
 		if err != nil {
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {

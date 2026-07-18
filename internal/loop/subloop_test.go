@@ -1227,3 +1227,69 @@ func TestSubLoopPostsVerifyFailCommentOnReject(t *testing.T) {
 		t.Fatalf("想见 2 条 verify-fail 评论（每轮一条），实际 %d 条", c)
 	}
 }
+
+// TestSubLoopRecordsPlanPrompt 钉死「plan prompt 落盘」：plan step 的 input_json 必须是
+// 渲染后的 plan 提示词（修前 plan step 只记 status/error，dashboard 无从展示初始提示词）。
+// 同时验证 state.InitialPrompts 能从这次 run 读回 plan + execute 两个初始提示词。
+func TestSubLoopRecordsPlanPrompt(t *testing.T) {
+	repo := initRepo(t)
+	st, _ := state.Open(t.TempDir() + "/s.db")
+	defer st.Close()
+
+	fake := model.NewFake(map[string]string{
+		"PLAN:":    mustJSON(skill.PlanOutput{}),
+		"EXECUTE:": "ok",
+		"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+	})
+	sl := &SubLoop{
+		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+		Execute:    fake,
+		Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+		VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+		Tier3Human: true,
+		Channel:    channel.NewLocal(t.TempDir()),
+	}
+	out, err := sl.Run(context.Background(), channel.Task{Ref: "1", Description: "d", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "done" {
+		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+	}
+
+	views, _ := st.TasksByStatus()
+	if len(views) != 1 {
+		t.Fatalf("want 1 task, got %d", len(views))
+	}
+	runs, _ := st.RunsOfTask(views[0].ID)
+	if len(runs) != 1 {
+		t.Fatalf("want 1 run, got %d", len(runs))
+	}
+
+	// plan step 的 input_json 不再为空（渲染后的模板 "PLAN:"）。
+	var planInput string
+	steps, err := st.Replay(runs[0].ID)
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	for _, s := range steps {
+		if s.Role == "plan" {
+			planInput = s.InputJSON
+		}
+	}
+	if planInput != "PLAN:" {
+		t.Fatalf("plan step input_json = %q, want rendered prompt %q", planInput, "PLAN:")
+	}
+
+	// InitialPrompts 读回两个初始提示词：plan=渲染模板；execute=真实 execPrompt（EXECUTE: 开头）。
+	plan, exec, err := st.InitialPrompts(runs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != "PLAN:" {
+		t.Fatalf("InitialPrompts plan = %q, want %q", plan, "PLAN:")
+	}
+	if !strings.HasPrefix(exec, "EXECUTE:") {
+		t.Fatalf("InitialPrompts execute missing EXECUTE: prefix:\n%s", exec)
+	}
+}
