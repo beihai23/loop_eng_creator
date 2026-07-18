@@ -210,6 +210,16 @@ func (e *Engine) tick(ctx context.Context) error {
 		return err
 	}
 	e.logf("[daemon] tick dispatch: task %s (%s) → running", shortTaskID(ready.ID), ready.IssueRef)
+	// 派发即在 channel 上标出「正在处理」（loop:running）。打标点选 daemon 派发处
+	// 而非只放 SubLoop.Run 入口：daemon 是任务生命周期的唯一写者（RunTask 契约不碰
+	// 状态），→running 的 transition 就发生在这行——且 RunTask 是注入的（测试 stub、
+	// 未来的替代 runner 可能根本不进 SubLoop），派发点打标覆盖所有 runner。SubLoop.Run
+	// 入口也会打一次（覆盖绕过 daemon 的 run-once 路径），重复打标幂等（标签互斥后
+	// 第二次只是 no-op 的 remove+add）。打标失败只记日志、不翻转派发结果（与 report /
+	// parkByTriage 的写回容错一致）。
+	if err := e.Channel.UpdateStatus(ctx, ready.IssueRef, "running"); err != nil {
+		e.logf("[daemon] dispatch running mark failed for %s: %v", ready.IssueRef, err)
+	}
 	status, detail, err := e.RunTask(ctx, ready)
 	if err != nil {
 		e.logf("dispatch: task %s (%s) failed: %v", ready.ID, ready.IssueRef, err)
