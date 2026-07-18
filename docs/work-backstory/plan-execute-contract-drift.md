@@ -17,7 +17,7 @@ triage-gate 上线后的头两个实战任务（#46 running 标签互斥、#47 N
   「签名钉死为：`func statusLabelsToRemove(labels, newStatus, taskLabel string) []string`」），
   但 execute 连续三轮没有实现这个函数，tier-1 测试永远编译失败。根因不是「plan 每轮
   想象不同签名」（旧记忆的模式），而是**合同已传达、执行端不遵守**——新变种。
-- **#47（blocked，3 轮耗尽）**：verify 按验收标准字面（「buildChannel 调用点同步改用
+- **#47 第一次（blocked，3 轮耗尽）**：verify 按验收标准字面（「buildChannel 调用点同步改用
   新签名」）死磕 buildChannel 的 diff——但 main 上的调用 `NewLinear(key, "", lc.Project,
   lc.Team, lc.StatusMap)` 第二参空串即 endpoint 位，**已兼容新签名、合法无需改动**。
   execute 连续产出同一个（正确的）diff，verify 连续驳回并要求「在 diff 里给出可核验
@@ -26,12 +26,21 @@ triage-gate 上线后的头两个实战任务（#46 running 标签互斥、#47 N
 - **意外发现：#47 第 2 轮 plan 产出 `{"plan":null,"risks":null}`**——重试压力下 plan
   模型摆烂给空计划，loop 无任何防护照样往下走（execute 靠战报上下文续命）。
   空 plan 应该被检测并视为可重试失败。
-- 处理：在 #46 评论钉死函数签名+语义；在 #47 评论澄清兼容事实并显式提示 plan 可行使
+- 处理（第一次）：在 #46 评论钉死函数签名+语义；在 #47 评论澄清兼容事实并显式提示 plan 可行使
   revised_criteria（区分「不知道有权」vs「知道不用」的实验）。两评论均在任务 blocked、
   last_comment_at 刷新之后发出（pollSignals 可见性窗口）。
+- **#47 第二次（done，PR #51 已合并）——决定性正向样本**：在 issue 评论里**手把手给出
+  修订示范**（把④⑤的「报告附 grep/build 输出」翻译成 tier-1 退出码判据）后重触发，plan
+  **行使了 revised_criteria**，任务一次过。修订质量高于人给的示范：准确诊断结构性不可
+  满足；**拒绝了人的一条建议并给出更强替代**（人要 grep 断言「非测试调用点为空」，plan
+  指出 buildChannel 是合法非测试调用者、grep 永不为空，改用编译期钉子
+  `var _ func(...)=NewLinear` 兜底——比 grep 更强，编译期抓签名漂移）。这是「防放水」
+  担忧的反例：plan 没降门槛，反而收紧。触发条件关键：泛泛提示不够，要在战报里给出具体
+  的不可满足性诊断+修订方向，plan 才行使。
 
 ## Decisions
-（待后续 arc：空 plan 防护、execute 合同对齐机制、verify 的「证据要求」边界）
+（待后续 arc：空 plan 防护、execute 合同对齐机制、verify 的「证据要求」边界、
+让 plan 自动检测「连续同类结构性不可满足驳回」并提议修订）
 
 ## Lessons
 - 排查 loop 卡死先看三个 plan 落盘字段：plan 步骤本身（有没有内容）、revised_criteria

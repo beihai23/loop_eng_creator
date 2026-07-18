@@ -52,10 +52,27 @@ OutputJSON 使修订可审计。
 **第一批数据（2026-07-18，#46/#47 实战）**：
 - **修订权零行使**：两个任务的 plan 输出（共 5 轮）均无 revised_criteria。尤其 #47——
   verify 按字面死磕「buildChannel 必须出 diff」（其实调用已兼容、合法为空），这是
-  修订权的标准使用场景，plan 三轮都没用。目前落在「无害死代码」分支，样本仍少。
+  修订权的标准使用场景，plan 三轮都没用。此时落在「无害死代码」分支。
 - 已在 #47 的 issue 评论里**显式提示** plan 可行使 revised_criteria，看重触发后是否
   行使——这能区分「模型不知道有这个权力」vs「知道但不用」。
-- 详见 [[plan-execute-contract-drift]]。
+
+**第二批数据（2026-07-18 晚，#47 第二次重触发——决定性正向样本）**：
+在 issue 评论里**手把手给出修订示范**（把④⑤的「报告附 grep/build 输出」翻译成 tier-1
+退出码判据）后重触发。结果：**plan 行使了 revised_criteria，任务 done，PR #51 已合并**。
+且修订质量高于人给的示范——
+- plan 准确诊断了结构性不可满足（execute 的 stdout 不进战报），把证据要求改写成
+  tier-1 退出码判据（go build/test 退出 0）。
+- **拒绝了人的一条建议并给出更强替代**：人建议用 grep 断言「非测试 NewLinear 调用点
+  为空」，plan 指出 buildChannel 本就是合法的非测试调用者、grep 永不为空，改用
+  编译期钉子 `var _ func(string,string,string,string,map[string]string)*Linear = NewLinear`
+  兜底——这比 grep **更强**（编译期就抓签名漂移，早于运行期）。
+- 这是「防放水」担忧的反例：plan 没有降低门槛，反而把标准收紧了。
+
+**修订权结论（更新）**：方向被证明有意义。但触发条件很关键——泛泛提示「可行使」不够，
+plan 要么没意识到、要么不主动；需要在战报里给出**具体的不可满足性诊断 + 修订方向**，
+plan 才会行使并行使得好。暗示一个产品化方向：让 plan 自己检测「verify 连续驳回同一类
+结构性不可满足要求」并自动提议修订，而非靠人评论。
+详见 [[plan-execute-contract-drift]]。
 
 ## Decisions
 - **RevisedCriteria 用 \*[]string 而非 []string**：nil=「未修订」（沿用 issue 原版）与
