@@ -16,7 +16,7 @@ func TestRenderOverviewCountsAndSymbols(t *testing.T) {
 		Running: &RunningInfo{TaskID: "t_running", Phase: "execute"},
 		Counts:  map[string]int{"new": 1, "running": 1},
 	}
-	out := RenderOverview(snap, 0, 0.0, 80)
+	out := RenderOverview(snap, 0, 0, 50, 0.0, 80)
 	// 计数条含待处理/进行中
 	if !strings.Contains(out, "待处理") || !strings.Contains(out, "进行中") {
 		t.Fatalf("counts bar missing: %q", out)
