@@ -835,3 +835,67 @@ func TestNextIngestDelayJitter(t *testing.T) {
 		t.Fatalf("zero range: got %s want 0", got)
 	}
 }
+
+// TestIngestResyncsEditedSpec 钉死「正文重新摄入」：issue 正文被编辑后，下一次 ingest
+// 把新 desc/criteria 回写进 tasks 行（不新增任务、不改 status）；正文未变时不产生
+// 回写（updated_at 不动）。数据来自每次轮询已有的 ListNewTasks 载荷——零额外 channel 读。
+func TestIngestResyncsEditedSpec(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{batches: [][]channel.Task{
+		{
+			{Ref: "A", Description: "task A v1", TaskType: "feat", AcceptanceCriteria: []string{"c1"}},
+			{Ref: "B", Description: "task B", TaskType: "feat"},
+		},
+		{
+			// A 的正文+验收标准被编辑；B 原样。
+			{Ref: "A", Description: "task A v2 (edited)", TaskType: "feat", AcceptanceCriteria: []string{"c1", "c2"}},
+			{Ref: "B", Description: "task B", TaskType: "feat"},
+		},
+		{
+			// 再来一轮原样——确认无 no-op 回写。
+			{Ref: "A", Description: "task A v2 (edited)", TaskType: "feat", AcceptanceCriteria: []string{"c1", "c2"}},
+			{Ref: "B", Description: "task B", TaskType: "feat"},
+		},
+	}}
+	eng := &Engine{Channel: ch, Store: st, Interval: time.Second}
+
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	specs1, _ := st.TaskSpecsByRef()
+	if specs1["A"].Description != "task A v1" {
+		t.Fatalf("前置：A 应为 v1, got %q", specs1["A"].Description)
+	}
+
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	specs2, _ := st.TaskSpecsByRef()
+	// A 被重新摄入：desc + criteria 都换成 v2。
+	if specs2["A"].Description != "task A v2 (edited)" {
+		t.Fatalf("A 正文未刷新: %q", specs2["A"].Description)
+	}
+	if len(specs2["A"].Criteria) != 2 || specs2["A"].Criteria[1] != "c2" {
+		t.Fatalf("A 验收标准未刷新: %+v", specs2["A"].Criteria)
+	}
+	// 刷新不产生重复任务，也不改 status（仍是 new 等派发）。
+	statuses, _ := st.ListStatuses()
+	if len(statuses) != 2 {
+		t.Fatalf("刷新不应新增任务, got %d statuses", len(statuses))
+	}
+	for _, s := range statuses {
+		if s.Status != "new" {
+			t.Fatalf("task %s status=%s, 刷新不应触碰 status", s.ID, s.Status)
+		}
+	}
+
+	// tick 3 内容未变：updated_at 不得再动（无 no-op 回写）。
+	updatedAtBefore := specs2["A"].UpdatedAt
+	if err := eng.tick(context.Background()); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	specs3, _ := st.TaskSpecsByRef()
+	if specs3["A"].UpdatedAt != updatedAtBefore {
+		t.Fatalf("正文未变不应回写: updated_at %s → %s", updatedAtBefore, specs3["A"].UpdatedAt)
+	}
+}

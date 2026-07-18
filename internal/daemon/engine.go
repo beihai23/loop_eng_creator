@@ -197,10 +197,17 @@ func (e *Engine) tick(ctx context.Context) error {
 // ingests could both read IssueRefs before either inserts, and each would
 // double-insert the same ref (issue_ref has no UNIQUE index).
 //
-// Ingest is INSERT-only: it inserts tasks at status="new" and touches nothing
-// else. It never occupies the active slot, flips in_flight, or mutates a
-// running task — so single-active dispatch (NextReadyTask + one synchronous
-// RunTask per tick) is unaffected by concurrent ingestion.
+// New refs are INSERTed at status="new" and never occupy the active slot, flip
+// in_flight, or mutate a running task — single-active dispatch (NextReadyTask +
+// one synchronous RunTask per tick) is unaffected by concurrent ingestion.
+//
+// Known refs are NOT simply skipped: issue bodies get edited after ingest, and
+// ListNewTasks already returns full bodies every poll, so each polled task is
+// diffed against the stored spec snapshot (description + criteria) and
+// re-ingested via UpdateTaskSpec only when it actually changed — zero extra
+// channel reads, zero no-op writes. Runs already dispatched keep their
+// snapshot (channel.Task was built at dispatch); the refreshed spec takes
+// effect on the next dispatch/resume.
 func (e *Engine) ingest(ctx context.Context) error {
 	e.ingestMu.Lock()
 	defer e.ingestMu.Unlock()
@@ -209,32 +216,55 @@ func (e *Engine) ingest(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	seen, err := e.Store.IssueRefs()
+	specs, err := e.Store.TaskSpecsByRef()
 	if err != nil {
 		return err
 	}
 	var ingested int
 	for _, t := range tasks {
-		if seen[t.Ref] {
+		if known, ok := specs[t.Ref]; ok {
+			// 已知 ref：正文被编辑过才回写（比对解析后的 desc+criteria——与落库
+			// 内容同构，未变时绝不产生 no-op UPDATE）。
+			if known.Description != t.Description || !equalStrings(known.Criteria, t.AcceptanceCriteria) {
+				if err := e.Store.UpdateTaskSpec(known.ID, t.Description, t.AcceptanceCriteria); err != nil {
+					return err
+				}
+				e.logf("[daemon] ingest: task %s spec updated (issue body edited)", t.Ref)
+			}
 			continue
 		}
-		if _, err := e.Store.InsertTask(state.TaskRow{
+		row := state.TaskRow{
 			IssueRef:    t.Ref,
 			Description: t.Description,
 			TaskType:    t.TaskType,
 			Source:      "daemon",
 			Criteria:    t.AcceptanceCriteria,
 			CreatedAt:   t.CreatedAt, // #33/#36: 存 issue 提交时间 → NextReadyTask 按 created_at FIFO（不是入库时间）
-		}); err != nil {
+		}
+		if _, err := e.Store.InsertTask(row); err != nil {
 			return err
 		}
-		seen[t.Ref] = true
+		specs[t.Ref] = row // 同批次内重复 ref 不再重复 insert
 		ingested++
 	}
 	if ingested > 0 {
 		e.logf("[daemon] ingest: %d new task(s)", ingested)
 	}
 	return nil
+}
+
+// equalStrings 比较两个 string 切片是否逐项相等（顺序敏感）——验收标准列表的
+// diff 语义：顺序/内容任一不同都视为「正文已编辑」。
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ingestLoop is the background ingest goroutine started by Run when IngestMax >

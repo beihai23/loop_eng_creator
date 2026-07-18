@@ -715,3 +715,29 @@ func TestInitialPrompts(t *testing.T) {
 		t.Fatalf("execute prompt = %q, want empty (no execute step)", exec2)
 	}
 }
+
+// TestUpdateTaskSpec 钉死 spec 快照的回写语义：description + criteria 被替换、
+// updated_at 被刷新；TaskSpecsByRef 能读回新值。
+func TestUpdateTaskSpec(t *testing.T) {
+	st, _ := Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	id, _ := st.InsertTask(TaskRow{IssueRef: "9", Description: "v1", Criteria: []string{"a"}})
+
+	if err := st.UpdateTaskSpec(id, "v2 edited", []string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := st.TaskSpecsByRef()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := specs["9"]
+	if got.Description != "v2 edited" || len(got.Criteria) != 2 || got.Criteria[1] != "b" {
+		t.Fatalf("spec 未回写: %+v", got)
+	}
+	if got.UpdatedAt == "" {
+		t.Fatalf("updated_at 未填充: %+v", got)
+	}
+	if got.ID != id {
+		t.Fatalf("TaskSpecsByRef 应携带 id: got %q want %q", got.ID, id)
+	}
+}

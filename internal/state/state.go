@@ -20,6 +20,10 @@ type TaskRow struct {
 	// writes it into the existing created_at column; a zero value falls back to
 	// the ingest time (nowISO).
 	CreatedAt string
+	// UpdatedAt is the row's last-write time (RFC3339). Only populated by
+	// TaskSpecsByRef — readers that need "did the spec snapshot change" (e.g.
+	// the daemon's no-op-write guard in tests) get it there.
+	UpdatedAt string
 }
 
 var schema = []string{
@@ -259,6 +263,46 @@ func (s *Store) IssueRefs() (map[string]bool, error) {
 		out[ref] = true
 	}
 	return out, rows.Err()
+}
+
+// TaskSpecsByRef returns every known task's spec snapshot (id + description +
+// acceptance criteria) keyed by issue_ref. The daemon's ingest diffs each
+// polled channel.Task against this snapshot: issue bodies get edited after
+// ingest, and the poll payload already carries the fresh body (ListNewTasks
+// fetches full bodies every tick), so a compare-and-update here re-ingests
+// edited specs with zero extra channel reads.
+func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at FROM tasks`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]TaskRow)
+	for rows.Next() {
+		var t TaskRow
+		var critJSON string
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
+		out[t.IssueRef] = t
+	}
+	return out, rows.Err()
+}
+
+// UpdateTaskSpec re-ingests an edited issue body: replaces the stored spec
+// snapshot (description + acceptance criteria) and bumps updated_at. Called by
+// the daemon's ingest only when the polled body actually differs from the
+// snapshot — never a no-op write. Runs already dispatched keep their snapshot
+// (channel.Task was built at dispatch); the new spec takes effect on the next
+// dispatch/resume.
+func (s *Store) UpdateTaskSpec(id, description string, criteria []string) error {
+	crit, _ := json.Marshal(criteria)
+	_, err := s.db.Exec(
+		`UPDATE tasks SET description=?, acceptance_criteria_json=?, updated_at=? WHERE id=?`,
+		description, string(crit), nowISO(), id)
+	return err
 }
 
 // NextReadyTask returns the head of the dispatch FIFO: the oldest task whose
