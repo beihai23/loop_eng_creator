@@ -114,7 +114,11 @@ func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
 	}
 	switch prov {
 	case "local":
-		return channel.NewLocal(repo), nil
+		ch := channel.NewLocal(repo)
+		if cfg.Channel.Inbox != "" {
+			ch.InboxDir = cfg.Channel.Inbox
+		}
+		return ch, nil
 	case "github":
 		return channel.NewGitHub(cfg.Channel.Repo, cfg.Channel.TaskLabel), nil
 	case "linear":
@@ -122,6 +126,8 @@ func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
 		if key == "" {
 			return nil, fmt.Errorf("linear provider: 环境变量 %s 未设置", channel.LinearAPIKeyEnv)
 		}
+		// cfg.Channel.Linear 是指针（config 交互命令的产物）；validate() 已保证
+		// provider=linear 时非 nil。
 		lc := cfg.Channel.Linear
 		return channel.NewLinear(key, "", lc.Project, lc.Team, lc.StatusMap), nil
 	default:

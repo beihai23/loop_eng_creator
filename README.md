@@ -115,7 +115,8 @@ type: feature
 
 | 命令 | 用途 |
 |---|---|
-| `loop-eng init [--repo <path>]` | 在仓库生成 `.loop/`，并把 `.loop/` 加进 `.gitignore`。 |
+| `loop-eng config [--repo <path>]` | **主设置命令**（交互式）：缺 `.loop/` 先脚手架，然后引导选 channel provider（local / github / linear）并走完该 provider 的必要配置，写回 `.loop/config.yaml`。github 流程检测 `gh` 安装与登录；linear 的 API key 不进 config.yaml（env `LOOP_ENG_LINEAR_API_KEY` 或 gitignore 的 `.loop/linear.key`）。 |
+| `loop-eng init [--repo <path>]` | （deprecated alias，内部调 `config`）在仓库生成 `.loop/`，并把 `.loop/` 加进 `.gitignore`。非交互 stdin（EOF）下只脚手架、保持默认配置。 |
 | `loop-eng task new <desc> [--repo <path>] [--type feature\|bugfix\|docs\|refactor]` | 生成 `inbox/<n>.md`，自动检测项目语言（go/node/rust/python/java）并建议验收标准。 |
 | `loop-eng run-once [--repo <path>] [--models real\|fake] [--channel local\|github]` | **同步**：捞 inbox 第一个任务，跑完整 plan→execute→verify→writeback；`done` 自动 land。 |
 | `loop-eng daemon [--repo <path>] [--channel local\|github] [--models real\|fake] [--poll-interval <dur>] [--cooldown <dur>]` | **常驻**：轮询工单、逐个跑、park/resume、崩溃可恢复。`--cooldown` 是上游瞬时阻塞（如限流）后的派发冷却。 |

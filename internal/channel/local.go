@@ -8,12 +8,21 @@ import (
 	"time"
 )
 
-type Local struct{ Root string }
+type Local struct {
+	Root string
+	// InboxDir is the inbox path relative to Root; empty falls back to "inbox"
+	// (zero-value compatible — NewLocal callers and existing tests unchanged).
+	InboxDir string
+}
 
 func NewLocal(root string) *Local { return &Local{Root: root} }
 
 func (l *Local) ListNewTasks(_ context.Context) ([]Task, error) {
-	inbox := filepath.Join(l.Root, "inbox")
+	sub := l.InboxDir
+	if sub == "" {
+		sub = "inbox"
+	}
+	inbox := filepath.Join(l.Root, sub)
 	ents, err := os.ReadDir(inbox)
 	if err != nil {
 		if os.IsNotExist(err) {
