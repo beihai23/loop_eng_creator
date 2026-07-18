@@ -63,13 +63,18 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	}
 
 	// 验收方式（逐 tier 状态扫描内存切片 vers）
-	b.WriteString("\n验收方式:\n")
+	// 列对齐用 lipgloss Width（tier 号 / label 固定宽截断 / 状态末列），不再空格凑——
+	// CJK label（人审 / plan 未产出）也能对齐；状态按 ✓绿/✗红/—faint 着色（spec §6）。
+	b.WriteString("\n" + lipglossBold.Render("验收方式:") + "\n")
 	for _, tv := range verifyTiers(cfg, vers) {
-		b.WriteString(fmt.Sprintf("  tier-%d  %-20s %s\n", tv.Tier, tv.Label, tv.StatusSym))
+		tierCol := lipgloss.NewStyle().Width(detailTierW).Render(fmt.Sprintf("tier-%d", tv.Tier))
+		labelCol := lipgloss.NewStyle().Width(detailLabelW).Render(tv.Label)
+		statusCol := tierStatusStyle(tv.Status).Render(tv.Status)
+		b.WriteString("  " + tierCol + labelCol + statusCol + "\n")
 	}
 
 	// 验收标准
-	b.WriteString("\n验收标准:\n")
+	b.WriteString("\n" + lipglossBold.Render("验收标准:") + "\n")
 	for _, c := range t.Criteria {
 		b.WriteString("  • " + c + "\n")
 	}
@@ -82,15 +87,16 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 				if cfg != nil {
 					retryLimit = cfg.Budget.MaxRetries
 				}
-				b.WriteString(fmt.Sprintf("\nretry: %d/%d\n", budgetRows[i].Amount, retryLimit))
+				b.WriteString("\n" + lipglossBold.Render(fmt.Sprintf("retry: %d/%d", budgetRows[i].Amount, retryLimit)) + "\n")
 				break
 			}
 		}
 	}
 
-	// 预算（I2：used 从 budget_ledger 派生，limit = cfg.Budget.PerTaskTokens）
+	// 预算（I2：used 从 budget_ledger 派生，limit = cfg.Budget.PerTaskTokens；
+	// 接近上限时黄/红提示——见 budgetLine）
 	used, limit := budgetUsed(st, cfg, taskID, runID)
-	b.WriteString(fmt.Sprintf("\n预算: %d / %d tokens\n", used, limit))
+	b.WriteString("\n" + budgetLine(used, limit) + "\n")
 	b.WriteString("\n[r] resume   [x] cancel   [t] 看轨迹   [Esc] 回总览\n")
 	return b.String()
 }
@@ -98,6 +104,13 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 // —— 辅助（同文件）——
 
 var lipglossBold = lipglossNewBold()
+
+// 验收方式 tier 行列宽（显示单元格）：tier 号 / label 固定宽（CJK 友好，超长按显示
+// 宽截断）/ status 为末列不固定宽。用 lipgloss Width 对齐，不再空格凑（spec §6）。
+const (
+	detailTierW  = 8  // "tier-1".."tier-3"
+	detailLabelW = 24 // label 列：plan 产出标签 / 模型名 / 人审
+)
 
 func statusOfTask(st *state.Store, taskID string) string {
 	for _, r := range mustList(st) {
@@ -109,9 +122,9 @@ func statusOfTask(st *state.Store, taskID string) string {
 }
 
 type tierView struct {
-	Tier      int
-	Label     string
-	StatusSym string
+	Tier   int
+	Label  string
+	Status string // "✓ passed" / "✗ <原因>" / "—"（未触发）
 }
 
 func verifyTiers(cfg *config.Config, vers []state.VerificationRow) []tierView {
@@ -142,6 +155,37 @@ func symbolForTier(vers []state.VerificationRow, tier int) string {
 		}
 	}
 	return "—" // 未触发
+}
+
+// tierStatusStyle 按 tier 状态着色（与 overview statusStyle 同源调色板，spec §6）：
+// ✓ passed → 绿、✗ <原因> → 红（同 blocked）、— 未触发 → faint（同 new/cancelled）。
+// Ascii profile 下颜色剥离，符号 + 文本保留，结构/对齐不受影响。
+func tierStatusStyle(status string) lipgloss.Style {
+	switch {
+	case strings.HasPrefix(status, "✓"):
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("2")) // 绿
+	case strings.HasPrefix(status, "✗"):
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")) // 红（同 blocked）
+	default:
+		return lipgloss.NewStyle().Faint(true) // 未触发（同 new/cancelled）
+	}
+}
+
+// budgetLine 渲染预算行：标签 bold；used/limit 按接近上限着色——≥90% 红、≥75% 琥珀黄、
+// 否则默认（同 overview 调色板）。limit=0（未配上限）不着色。Ascii 下颜色剥离，数字保留。
+func budgetLine(used, limit int) string {
+	val := fmt.Sprintf(" %d / %d tokens", used, limit)
+	st := lipgloss.NewStyle()
+	if limit > 0 {
+		ratio := float64(used) / float64(limit)
+		switch {
+		case ratio >= 0.9:
+			st = st.Foreground(lipgloss.Color("9")) // 红
+		case ratio >= 0.75:
+			st = st.Foreground(lipgloss.Color("11")) // 琥珀黄
+		}
+	}
+	return lipglossBold.Render("预算:") + st.Render(val)
 }
 
 // tier1Label 取 tier=1 verification 行 Detail 冒号前的真值——plan 产出的验收标签
