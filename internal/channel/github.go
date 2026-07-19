@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,12 +17,37 @@ import (
 // single transient ListNewTasks/PostComment failure doesn't abort the whole run.
 const ghRetry = 3
 
+// loopStatusNames is the loop:<status> family the engine moves tasks through —
+// the channel-visible outcomes the daemon reports via UpdateStatus / report()
+// (see internal/loop/subloop.go and internal/daemon/engine.go). EnsureLabels
+// prepends "loop:" and creates each as a repo label so UpdateStatus's
+// --add-label never 404s on a missing label (#46/#54). Add a status here when
+// the engine grows a new channel-visible outcome.
+var loopStatusNames = []string{
+	"running",
+	"needs-review",
+	"needs-info",
+	"needs-human-decision",
+	"blocked",
+	"done",
+	"cancelled",
+}
+
 // GitHub is a channel.Channel backed by the authenticated `gh` CLI (no SDK,
 // no stored token — reuses the operator's `gh auth`). Issues with TaskLabel
 // are tasks; comments are battle reports; status moves via labels loop:<status>.
 type GitHub struct {
 	Repo      string // owner/name
 	TaskLabel string // e.g. "loop:task"
+
+	// ghFunc, when non-nil, replaces the real `gh` exec for every call. It is
+	// the test seam — production leaves it nil so gh() runs the real retried
+	// exec (ghExec). Set by tests to record calls and return canned responses.
+	ghFunc func(ctx context.Context, args ...string) ([]byte, error)
+
+	// ensureOnce guards EnsureLabels so the (best-effort) label-create fan-out
+	// runs at most once per GitHub instance — lazily from the first UpdateStatus.
+	ensureOnce sync.Once
 }
 
 func NewGitHub(repo, taskLabel string) *GitHub {
@@ -124,30 +151,63 @@ func statusLabelsToRemove(labels []string, newStatus, taskLabel string) []string
 	return out
 }
 
-// UpdateStatus 把 issue 的状态标签换成 loop:<status>：先读现有标签，用
-// statusLabelsToRemove 算出要摘的旧状态标签，--add-label 与 --remove-label 一次
-// edit 完成（互斥：任意时刻最多一个 loop:<status>；loop:task 保留不动）。
+// EnsureLabels idempotently creates the full loop:<status> label set (plus the
+// task identity label) in the repo via `gh label create --force`. It is
+// best-effort: each create is independent and errors are logged, not returned —
+// a failing create is common when the operator lacks the "labels:write" scope,
+// and in that case UpdateStatus still proceeds and logs its own failure. Runs at
+// most once per GitHub instance (sync.Once); UpdateStatus calls it lazily so a
+// missing label never 404s the add even when no one remembered to seed the repo.
+func (g *GitHub) EnsureLabels(ctx context.Context) {
+	g.ensureOnce.Do(func() {
+		names := make([]string, 0, len(loopStatusNames)+1)
+		for _, s := range loopStatusNames {
+			names = append(names, "loop:"+s)
+		}
+		if g.TaskLabel != "" {
+			names = append(names, g.TaskLabel)
+		}
+		for _, name := range names {
+			if _, err := g.gh(ctx, "label", "create", name, "--repo", g.Repo, "--force"); err != nil {
+				log.Printf("channel/github: ensure label %q on %s failed: %v (continuing; UpdateStatus will still attempt)", name, g.Repo, err)
+			}
+		}
+	})
+}
+
+// UpdateStatus 把 issue 的状态标签换成 loop:<status>。两条独立的 gh issue edit，
+// 顺序执行：先 remove 旧状态标签，再 add 新标签——add 失败不回滚 remove，至少
+// 旧状态标签能清掉（修 #54：旧版 add+remove 原子 edit，add 因标签缺失 404 时连带
+// remove 也没执行，#54 一直挂着 loop:blocked）。
 //
-// 容错（与写回容错一致，不翻转任务结局）：
-//   - 读标签失败 → 退化为只加不摘（旧行为），打标成功优先于互斥洁癖；
-//   - edit 带 --remove-label 失败（gh 对「已不在 issue 上的标签」报错，view→edit
-//     之间标签被人摘掉即此竞态）→ 退化为只加不摘重试一次。
+// 开头先 EnsureLabels（幂等、只跑一次），让 add-label 的目标标签存在；即便建标
+// 没权限（降级），remove 仍照常先行。
+//
+// remove 的容错：view→edit 之间标签被人摘掉会让 remove 报「已不在 issue 上」，
+// 此错误只记日志、不阻断 add（remove 是互斥优化，不是打标前置门槛）。
 func (g *GitHub) UpdateStatus(ctx context.Context, ref, status string) error {
+	g.EnsureLabels(ctx)
+
 	add := "loop:" + status
 	remove := g.currentStatusLabelsToRemove(ctx, ref, status)
-	args := []string{"issue", "edit", ref, "--repo", g.Repo, "--add-label", add}
-	for _, l := range remove {
-		args = append(args, "--remove-label", l)
-	}
-	if _, err := g.gh(ctx, args...); err != nil {
-		if len(remove) == 0 {
-			return err
+
+	// remove first, in its own edit. Best-effort: a stale/racy remove must not
+	// block the add — the old status label is at least cleared either way.
+	if len(remove) > 0 {
+		rmArgs := []string{"issue", "edit", ref, "--repo", g.Repo}
+		for _, l := range remove {
+			rmArgs = append(rmArgs, "--remove-label", l)
 		}
-		if _, fallbackErr := g.gh(ctx, "issue", "edit", ref, "--repo", g.Repo, "--add-label", add); fallbackErr != nil {
-			return err // 回报原始错误（带 remove 上下文，更可诊断）
+		if _, err := g.gh(ctx, rmArgs...); err != nil {
+			log.Printf("channel/github: remove old status labels %v on %s failed: %v (continuing to add %s)", remove, ref, err, add)
 		}
 	}
-	return nil
+
+	// add in its own, separate edit — independent of remove. A failure here
+	// (e.g. label still missing because EnsureLabels lacked write scope) is
+	// returned, but remove has already committed, so the old label is gone.
+	_, err := g.gh(ctx, "issue", "edit", ref, "--repo", g.Repo, "--add-label", add)
+	return err
 }
 
 // currentStatusLabelsToRemove 读 issue 现有标签并算出该摘的旧状态标签。读失败
@@ -221,11 +281,23 @@ func (g *GitHub) GetTaskStates(ctx context.Context, refs []string) (map[string]T
 	return out, nil
 }
 
-// gh runs a `gh` command (retried on transient failure) and returns stdout.
-// stderr is folded into the error. The GitHub API intermittently TLS-timeouts
-// from some networks; retrying (ghRetry ×, 2s/4s backoff) absorbs those blips so
-// a single ListNewTasks/PostComment failure doesn't abort the whole run.
+// gh runs a `gh` command and returns stdout (stderr folded into the error).
+// If g.ghFunc is set (tests) it replaces the real exec; otherwise ghExec runs
+// the real retried `gh`. Every GitHub method goes through here, so a test
+// setting ghFunc intercepts all channel traffic without shelling out.
 func (g *GitHub) gh(ctx context.Context, args ...string) ([]byte, error) {
+	if g.ghFunc != nil {
+		return g.ghFunc(ctx, args...)
+	}
+	return g.ghExec(ctx, args...)
+}
+
+// ghExec runs the real `gh` command (retried on transient failure) and returns
+// stdout. stderr is folded into the error. The GitHub API intermittently
+// TLS-timeouts from some networks; retrying (ghRetry ×, 2s/4s backoff) absorbs
+// those blips so a single ListNewTasks/PostComment failure doesn't abort the
+// whole run.
+func (g *GitHub) ghExec(ctx context.Context, args ...string) ([]byte, error) {
 	var lastErr error
 	for attempt := 1; attempt <= ghRetry; attempt++ {
 		cmd := exec.CommandContext(ctx, "gh", args...)
