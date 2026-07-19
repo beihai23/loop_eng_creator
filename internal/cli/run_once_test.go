@@ -169,3 +169,26 @@ func TestPlanEmbedRendersRetryDiagnosis(t *testing.T) {
 		t.Fatalf("空 RetryDiagnosis 时 plan embed 不应渲染诊断块:\n%s", without)
 	}
 }
+
+// TestPlanEmbedInstructsProactiveExploration 钉死 plan embed（embed/skills/plan.md）含
+// 「规划前主动探索仓库」指令——修复「各阶段看到的代码仓库不一致」第 1 点（最关键）：
+// plan 走 claude -p --dangerously-skip-permissions 本就有完整仓库探索能力，「盲规划」
+// 根因是 plan.md 没引导探索，故改 prompt 而非喂死摘要（撤回 RepoStateSummary 方向）。
+//
+// 本测试**只断言结构落点**——embed 文本经 mustSkillPrompt("plan") 读出后含 4 个标记串
+// （等价于 grep embed 源文件 internal/cli/embed/skills/plan.md）；**不**断言「plan 探索
+// 后规划更好」——后者非确定性、不可机械判定（#47 教训）。读 embed 而非 .loop/skills：
+// runtime 经 //go:embed embed/skills/*.md 读取，.loop/skills 只是 scaffold 副本，改它无效。
+func TestPlanEmbedInstructsProactiveExploration(t *testing.T) {
+	p := mustSkillPrompt("plan")
+	for _, want := range []string{
+		"只读不写",                  // (b) 「只规划、不写代码」澄清为「只读不写」
+		"repo-knowledge-map",        // (a) 优先 repo-knowledge-map
+		"主动探索",                  // (a) 规划前主动探索
+		"禁止发明不存在的文件",       // (c) 铁律：禁止发明不存在的文件/符号/字段
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("plan.md embed 缺标记串 %q（探索/只读指令未落进 embed？）:\n%s", want, p)
+		}
+	}
+}
