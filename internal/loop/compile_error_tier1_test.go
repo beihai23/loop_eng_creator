@@ -56,9 +56,7 @@ func slWithFailingVerify(t *testing.T, exec model.Executer, verifyDetail string)
 	st, _ := state.Open(t.TempDir() + "/s.db")
 	t.Cleanup(func() { st.Close() })
 	fake := model.NewFake(map[string]string{
-		// 非空 plan：空计划防护（subloop.go「plan 产出空计划」）会拦下 PlanOutput{}，
-		// plan 永远到不了 execute，本测试要跑的是 verify 驳回路径。
-		"PLAN:":   mustJSON(skill.PlanOutput{Plan: validPlanSteps()}),
+		"PLAN:":   validPlanJSON(), // 非空 plan：#53 的空计划防护要求 plan 非空才进 execute（镜像 retry_diagnosis_tier1_test.go，原 PlanOutput{} 笔误致 0 execute prompt）
 		"VERIFY:": mustJSON(skill.VerifyOutput{Passed: false, Reason: verifyDetail}),
 	})
 	return &SubLoop{
