@@ -701,11 +701,13 @@ func scanStepRows(rows *sql.Rows) ([]StepRow, error) {
 }
 
 // TaskView 是 tasks+task_status join 出的一行，喂给 TUI 概览列表（spec §5[1]）。
-// 一条查询喂整张列表（无 N+1）：每个 task 带它当前的 status。Phase B 的 TUI
-// reader 直接消费。
+// 一条查询喂整张列表（无 N+1）：每个 task 带它当前的 status，以及「最后运行」列
+// 用的 LastRunAt（runs 表该 task 的 MAX(started_at)，LEFT JOIN 取，无 run 时为空串）。
+// Phase B 的 TUI reader 直接消费。
 type TaskView struct {
 	ID, IssueRef, Description, TaskType, Status string
 	CreatedAt                                   string
+	LastRunAt                                   string // RFC3339Nano（runs.MAX(started_at)）；无 run 时为空串，渲染层兜底「—」
 }
 
 // TasksByStatus 返回全部 task 及其当前 status，按 TUI 概览优先级排序：
@@ -717,8 +719,11 @@ type TaskView struct {
 // 正在 running 的 task 由 ActiveRun 单独透出，不在此列表里参与 status 分组。
 func (s *Store) TasksByStatus() ([]TaskView, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, ts.status, t.created_at
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, ts.status, t.created_at,
+		        COALESCE(lr.last_run, '')
 		 FROM tasks t JOIN task_status ts ON ts.task_id = t.id
+		 LEFT JOIN (SELECT task_id, MAX(started_at) AS last_run FROM runs GROUP BY task_id) lr
+		       ON lr.task_id = t.id
 		 ORDER BY CASE ts.status
 		     WHEN 'new' THEN 1 WHEN 'needs-review' THEN 2 WHEN 'needs-info' THEN 3
 		     WHEN 'needs-human-decision' THEN 3
@@ -731,7 +736,7 @@ func (s *Store) TasksByStatus() ([]TaskView, error) {
 	var out []TaskView
 	for rows.Next() {
 		var v TaskView
-		if err := rows.Scan(&v.ID, &v.IssueRef, &v.Description, &v.TaskType, &v.Status, &v.CreatedAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.IssueRef, &v.Description, &v.TaskType, &v.Status, &v.CreatedAt, &v.LastRunAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
