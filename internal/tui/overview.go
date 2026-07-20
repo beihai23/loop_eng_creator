@@ -4,17 +4,20 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
-// 列宽（显示单元格）。num/status 列固定宽，description 吃剩余宽度。
+// 列宽（显示单元格）。num/status/lastrun 列固定宽，description 吃剩余宽度。
 // marker 列宽 2（▶ / 空格），num 列容 "#999"，status 列容 running 行的
-// "● execute · retry 9"（phase + 可选 retry；非 running 行只占 "needs-review"）。
+// "● execute · retry 9"（phase + 可选 retry；非 running 行只占 "needs-review"），
+// lastrun 列容 "2026-07-20 10:30"（16）+ 1 尾随间隔，避免与任务名粘连。
 const (
-	ovMarkerW = 2
-	ovNumW    = 6
-	ovStatusW = 20
+	ovMarkerW  = 2
+	ovNumW     = 6
+	ovStatusW  = 20
+	ovLastRunW = 17
 )
 
 // ovOverheadRows 是总览一帧里除任务行之外的固定行数：
@@ -73,7 +76,7 @@ func RenderOverview(snap *Snapshot, selIdx, offset, visibleRows int, animPhase f
 		w = 40 // 极窄终端兜底，保证列头不挤
 	}
 	innerW := w - 2 // 边框表格内容宽（左右各 1 个 │）；分隔线宽 = innerW 让 lipgloss 据此定盒宽
-	descW := innerW - ovMarkerW - ovNumW - ovStatusW
+	descW := innerW - ovMarkerW - ovNumW - ovStatusW - ovLastRunW
 	if descW < 8 {
 		descW = 8
 	}
@@ -101,6 +104,7 @@ func RenderOverview(snap *Snapshot, selIdx, offset, visibleRows int, animPhase f
 	hdr := "  " +
 		lipgloss.NewStyle().Bold(true).Width(ovNumW).Render("№") +
 		lipgloss.NewStyle().Bold(true).Width(ovStatusW).Render("状态") +
+		lipgloss.NewStyle().Bold(true).Width(ovLastRunW).Render("最后运行") +
 		lipgloss.NewStyle().Bold(true).Render("任务")
 
 	// 分隔线：宽 = innerW，是表格里最宽的行 → lipgloss 据此把整盒定到 innerW+2 = w。
@@ -140,10 +144,13 @@ func RenderOverview(snap *Snapshot, selIdx, offset, visibleRows int, animPhase f
 			statusText = runningStatusText(snap.Running)
 		}
 		statusCol := fmt.Sprintf("%s %-*s", sym, ovStatusW-2, statusText)
+		// 最后运行列：固定宽（ovLastRunW），lipgloss.Width 按显示宽度补齐，正确处理
+		// 占位「—」的多字节宽度；与列头「最后运行」同宽对齐。
+		lastRunCol := lipgloss.NewStyle().Width(ovLastRunW).Render(formatLastRun(t.LastRunAt))
 		// 描述列：最末列，按显示宽度截断（MaxWidth 兼顾 CJK，不会劈开双宽字符）。
 		descCol := lipgloss.NewStyle().MaxWidth(descW).Render(t.Description)
 
-		content := marker + numCol + statusCol + descCol
+		content := marker + numCol + statusCol + lastRunCol + descCol
 		// 整行按状态着色；running 整行呼吸（呼吸灯在「运行中的任务」上，不在顶部计数条）。
 		rowSt := statusStyle(t.Status)
 		if t.Status == "running" {
@@ -178,6 +185,23 @@ func RenderOverview(snap *Snapshot, selIdx, offset, visibleRows int, animPhase f
 // countSegment 渲染计数条的一个段：符号 + 中文标签 + 计数，按给定样式（状态色）着色。
 func countSegment(sym, label string, n int, st lipgloss.Style) string {
 	return st.Render(fmt.Sprintf("%s %s %d", sym, label, n))
+}
+
+// formatLastRun 把 RFC3339Nano 时间戳（runs.started_at / nowISO 的产物）格式化为
+// "2006-01-02 15:04"（如 2026-07-20 10:30），供「最后运行」列使用。
+// 纯函数：不读 now、不查 DB——时间来源全在 snapshot 的 TaskView.LastRunAt。
+// 空串 / 无法以 time.Parse(time.RFC3339Nano) 解析的输入均兜底为「—」，不留空、不报错
+// （对应「从未运行过 / 值为空 / 不可解析」的 task 占位）。
+func formatLastRun(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "—"
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return "—"
+	}
+	return t.Format("2006-01-02 15:04")
 }
 
 // runningStatusText 组装 running 行的状态文本：phase（plan/execute/verify/starting），
