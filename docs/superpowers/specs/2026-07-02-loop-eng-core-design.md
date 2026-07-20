@@ -186,6 +186,7 @@ loop-eng daemon  （常驻）
 | `loop-eng replay <run-id>` | 按 trace 逐步回放某次 run。 |
 | `loop-eng skill (edit\|test) [<name>]` | 编辑 skill 覆盖 / 跑回归 fixture。 |
 | `loop-eng config (get\|set\|edit)` | 查看/编辑配置。 |
+| `loop-eng doctor` | channel 就绪性校验（preflight）：列出 provider 缺失的前置依赖，**不启动 daemon**。非零退出码供 CI/script gate。 |
 
 `loop-eng dashboard` 预留给子项目 2。主路径是「你建 issue → daemon 捞」，不是 CLI 派活。
 
@@ -308,6 +309,25 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 ### 8.11 工单通道（可插拔）
 
 `channel.Channel` 接口（见 §6.2）。v1 实现 `githubChannel`：用 go-github，按 `task_label` 过滤 issue；轮询拿新任务和 parked 任务的回复；把战报/求助/人审请求写成评论；用 label 更新 status（如 `loop:needs-review`）。Jira/Linear 后续实现同一接口。
+
+#### 8.11.1 Preflight —— 启动就绪性校验（#65，预防式）
+
+`Channel` 可选实现 `Preflighter`（`Local` 无前置依赖，不实现 = 恒就绪）。`daemon` 启动时跑一次、`doctor` 主动跑一次；**缺失则拒绝启动 + 清单式报错**，而不是等运行期才暴露（如 #54 的 `loop:running` 标签缺失，到 `UpdateStatus` 时整条 edit 才 404）。与 #58（运行时容错）互补：#58 保运行期不崩，preflight 保启动期早发现。
+
+**冻结签名**（由 `internal/channel/preflight_tier1_test.go` 编译期 `var _` 钉死；改动前先改测试）：
+
+```go
+type Preflighter interface {
+    Preflight(ctx context.Context) ([]PreflightIssue, error)
+}
+type PreflightIssue struct {
+    Code    string // missing-label | missing-project | unresolvable-status | auth
+    Target  string // 具体缺失项，如 "loop:running"、`status_map[done]="Finished"`
+    Message string // 人可读、可操作的修复说明（逐字进清单）
+}
+```
+
+返回约定：`[]PreflightIssue` 是**配置缺口**（nil/空 = 就绪）；单独的 `error` 仅当**校验本身没跑完**（`gh` 不可达、GraphQL endpoint 挂了）——缺口是 issue，基建失败是 error。各 provider 校验项：GitHub = `loop:task` + 全套 `loop:<status>` 标签存在；Linear = project 存在、status_map 目标 WorkflowState 按名可解析、API key 有效（whoami）。
 
 ---
 

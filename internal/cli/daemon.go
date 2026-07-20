@@ -43,6 +43,14 @@ func NewDaemonCmd() *cobra.Command {
 				return err
 			}
 
+			// Preflight gate (#65): refuse to start when the channel's
+			// prerequisites are missing, with an actionable checklist — fail
+			// fast at boot instead of crashing mid-run (e.g. a missing
+			// loop:running label only surfacing when UpdateStatus hits it).
+			if err := runPreflight(context.Background(), ch); err != nil {
+				return err
+			}
+
 			// RunTask: construct a fresh SubLoop per dispatched task + run it.
 			// SubLoop does the full plan→execute→verify→writeback (incl. channel
 			// comment + status mark via report()). PreinsertedTaskID = the daemon's

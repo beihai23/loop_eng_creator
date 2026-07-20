@@ -20,6 +20,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.AddCommand(NewSkillCmd())
 	cmd.AddCommand(NewTaskCmd())
 	cmd.AddCommand(NewDaemonCmd())
+	cmd.AddCommand(NewDoctorCmd())
 	cmd.AddCommand(NewDashboardCmd())
 	return cmd
 }
