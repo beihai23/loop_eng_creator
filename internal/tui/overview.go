@@ -9,15 +9,26 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// 列宽（显示单元格）。num/status/lastrun 列固定宽，description 吃剩余宽度。
-// marker 列宽 2（▶ / 空格），num 列容 "#999"，status 列容 running 行的
-// "● execute · retry 9"（phase + 可选 retry；非 running 行只占 "needs-review"），
-// lastrun 列容 "2026-07-20 10:30"（16）+ 1 尾随间隔，避免与任务名粘连。
+// 列宽（显示单元格）。marker/num/status/lastrun 列固定宽，description 吃剩余宽度。
+// marker 列宽 2（▶ / 空格），num 列容 "#999"。
+//
+// 间距契约（修订自人审反馈「状态↔最后运行 太大、最后运行↔任务 太小」）。
+// 各列右侧补空格到固定宽，故两列之间的可见间距 = 左列尾随空格数：
+//   - 最后运行↔任务（右侧 G_R）= ovLastRunW - 16（"2006-01-02 15:04" 恒为 16 显示宽）。
+//     ovLastRunW=21 → G_R=5，≥2，时间戳不再与任务名粘连。
+//   - 状态↔最后运行（左侧 G_L）= ovStatusW - 2 - len(statusText)（sym 占 1 + 间隔 1），
+//     随状态长短变化。ovStatusW=17 使最长静态状态 needs-review(12) 的 G_L=3（≥2 不粘连）；
+//     最短状态 new(3) 的 G_L=12 ≤ 3×G_R=15，故「状态↔最后运行 ≤ 3× 最后运行↔任务」
+//     对最短状态亦成立——左间距不再远大于右间距。
+//
+// status 列不为 running 行的动态装饰 "● execute · retry 9"（最长 17 显示宽）留位：那是
+// retry 时的临时文本，超出 ovStatusW-2=15 槽位时按 %-*s 自然外溢（文本仍完整渲染，仅该行
+// 右侧列整体右移），不参与「最长真实状态」的列宽裁定（验收以 needs-review 为准）。
 const (
 	ovMarkerW  = 2
 	ovNumW     = 6
-	ovStatusW  = 20
-	ovLastRunW = 17
+	ovStatusW  = 17
+	ovLastRunW = 21
 )
 
 // ovOverheadRows 是总览一帧里除任务行之外的固定行数：
