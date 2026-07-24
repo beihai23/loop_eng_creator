@@ -50,6 +50,16 @@ type SubLoop struct {
 	Channel           channel.Channel
 	PreinsertedTaskID string // daemon path: if set, skip InsertTask (task already ingested by daemon tick)
 
+	// PlanModelRef / ExecuteModelRef / VerifyModelRef carry each phase's provider
+	// label ("who ran this step") into steps.model_ref — the per-step audit column
+	// that always existed but was never populated. Optional (zero value "" =
+	// legacy empty model_ref); set by run-once/daemon from the effective config
+	// (incl. task-level agent override) so dashboard/replay show the agent per
+	// step. subloop_test.go does not reference these — zero value = old behavior.
+	PlanModelRef    string
+	ExecuteModelRef string
+	VerifyModelRef  string
+
 	// Log is the observability sink for phase start/done, retry, and budget
 	// events. When nil, defaults to os.Stderr with a "[subloop]" prefix. Tests
 	// inject a logger backed by a bytes.Buffer to assert on log output without
@@ -247,7 +257,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		if emptyPlan {
 			planStatus, planStepErr = "fail", "empty plan"
 		}
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, ModelRef: sl.PlanModelRef, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr})
 		if err != nil {
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
@@ -346,7 +356,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "execute error: " + err.Error()
-			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", InputJSON: execPrompt, Error: err.Error()})
+			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", ModelRef: sl.ExecuteModelRef, InputJSON: execPrompt, Error: err.Error()})
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
@@ -358,7 +368,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			Out  string `json:"out"`
 			Diff string `json:"diff"`
 		}{Out: execOut, Diff: diff})
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", InputJSON: execPrompt, OutputJSON: string(rec)})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", ModelRef: sl.ExecuteModelRef, InputJSON: execPrompt, OutputJSON: string(rec)})
 		sl.logf("[subloop] %s phase=execute done", sid)
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
@@ -384,6 +394,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		sl.Store.AppendStep(state.StepRow{
 			RunID: runID, Seq: attempt*10 + 3, Role: "verify",
 			Status:     statusOf2(res.Passed),
+			ModelRef:   sl.VerifyModelRef,
 			OutputJSON: string(vt),
 		})
 		// 逐 tier 落盘 verifications（spec §4.6）：best-effort，trace 不 gate loop。

@@ -20,6 +20,12 @@ type Task struct {
 	// channel. Carries through to tasks.created_at so the dispatch FIFO orders by
 	// submission time, not by ingest order. Empty when the channel has no value.
 	CreatedAt string
+	// Agent is an optional per-task coding-agent override (a provider key, e.g.
+	// "codex"). Sourced from the issue's `agent:` frontmatter (local) or an
+	// `agent:codex`-style label (github, future). Empty = use the configured
+	// default provider for every role. Carries through to tasks.agent so the
+	// daemon can opt this one task into a different provider stack.
+	Agent string
 }
 
 type Reply struct{ Body string }

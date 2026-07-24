@@ -60,6 +60,10 @@ func parseLocalTask(raw string) Task {
 		switch {
 		case strings.HasPrefix(line, "type:"):
 			t.TaskType = strings.TrimSpace(strings.TrimPrefix(line, "type:"))
+		case strings.HasPrefix(line, "agent:"):
+			// 任务级 agent override：`agent: codex` → 该任务全程用 codex（覆盖 config
+			// 各角色默认 provider）。空值/未知 provider 由调用方（applyTaskAgent）回落。
+			t.Agent = strings.TrimSpace(strings.TrimPrefix(line, "agent:"))
 		case strings.HasPrefix(line, "- [ ]"):
 			t.AcceptanceCriteria = append(t.AcceptanceCriteria, strings.TrimSpace(strings.TrimPrefix(line, "- [ ]")))
 		case line != "" && !strings.HasPrefix(line, "#") && t.Description == "":

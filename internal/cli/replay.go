@@ -24,7 +24,13 @@ func NewReplayCmd() *cobra.Command {
 				return err
 			}
 			for _, s := range steps {
-				fmt.Fprintf(out, "%d %s %s\n", s.Seq, s.Role, s.Status)
+				// model_ref（谁跑的这步）非空时方括号显示——点亮现成但曾恒空的
+				// steps.model_ref 审计列（spec §8.7）。空时退化为旧行 `seq role status`。
+				if s.ModelRef != "" {
+					fmt.Fprintf(out, "%d %s [%s] %s\n", s.Seq, s.Role, s.ModelRef, s.Status)
+				} else {
+					fmt.Fprintf(out, "%d %s %s\n", s.Seq, s.Role, s.Status)
+				}
 			}
 			return nil
 		},

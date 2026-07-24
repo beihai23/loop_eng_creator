@@ -10,6 +10,7 @@ import (
 	"text/template"
 
 	"loop-eng/internal/budget"
+	"loop-eng/internal/config"
 	"loop-eng/internal/skill"
 )
 
@@ -182,13 +183,75 @@ func TestPlanEmbedRendersRetryDiagnosis(t *testing.T) {
 func TestPlanEmbedInstructsProactiveExploration(t *testing.T) {
 	p := mustSkillPrompt("plan")
 	for _, want := range []string{
-		"只读不写",                  // (b) 「只规划、不写代码」澄清为「只读不写」
-		"repo-knowledge-map",        // (a) 优先 repo-knowledge-map
-		"主动探索",                  // (a) 规划前主动探索
-		"禁止发明不存在的文件",       // (c) 铁律：禁止发明不存在的文件/符号/字段
+		"只读不写",               // (b) 「只规划、不写代码」澄清为「只读不写」
+		"repo-knowledge-map", // (a) 优先 repo-knowledge-map
+		"主动探索",               // (a) 规划前主动探索
+		"禁止发明不存在的文件",         // (c) 铁律：禁止发明不存在的文件/符号/字段
 	} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("plan.md embed 缺标记串 %q（探索/只读指令未落进 embed？）:\n%s", want, p)
 		}
+	}
+}
+
+// TestProviderLabel: providerLabel renders the role's effective provider for
+// steps.model_ref — "" normalizes to "claude" (the default), and a set model
+// name appends as provider/name.
+func TestProviderLabel(t *testing.T) {
+	cases := []struct {
+		ref  config.ModelRef
+		want string
+	}{
+		{config.ModelRef{}, "claude"},
+		{config.ModelRef{Provider: "codex"}, "codex"},
+		{config.ModelRef{Provider: "codex", Name: "gpt-5.1"}, "codex/gpt-5.1"},
+		{config.ModelRef{Name: "haiku"}, "claude/haiku"},
+	}
+	for _, c := range cases {
+		if got := providerLabel(c.ref); got != c.want {
+			t.Fatalf("providerLabel(%+v) = %q, want %q", c.ref, got, c.want)
+		}
+	}
+}
+
+// TestApplyTaskAgent: a task-level agent hint opts every role into the named
+// provider (provider+binary reset to it, claude-specific cmd dropped so it
+// doesn't get passed to the other binary, model name preserved). An empty OR
+// unregistered agent leaves cfg unchanged (no crash on untrusted issue input).
+func TestApplyTaskAgent(t *testing.T) {
+	base := &config.Config{Models: config.Models{
+		Execute: config.ModelRef{Provider: "", Binary: "claude", Name: "sonnet", Cmd: []string{"--dangerously-skip-permissions"}},
+		Plan:    config.ModelRef{Provider: "", Binary: "claude", Cmd: []string{"--dangerously-skip-permissions"}},
+	}}
+
+	// codex override: each role switches provider+binary; cmd dropped; name kept.
+	over := applyTaskAgent(base, "codex")
+	if over == base {
+		t.Fatal("applyTaskAgent(codex) must return a clone, not the same config")
+	}
+	if got := over.Models.Execute.Provider; got != "codex" {
+		t.Fatalf("execute provider want codex, got %q", got)
+	}
+	if got := over.Models.Execute.Binary; got != "codex" {
+		t.Fatalf("execute binary want codex, got %q", got)
+	}
+	if got := over.Models.Execute.Name; got != "sonnet" {
+		t.Fatalf("execute model name should be preserved, got %q", got)
+	}
+	if len(over.Models.Execute.Cmd) != 0 {
+		t.Fatalf("claude-specific cmd must be dropped on provider switch, got %v", over.Models.Execute.Cmd)
+	}
+	// base config is untouched (clone, not in-place mutation).
+	if base.Models.Execute.Provider != "" || base.Models.Execute.Binary != "claude" {
+		t.Fatalf("base config mutated: %+v", base.Models.Execute)
+	}
+
+	// empty agent → unchanged (same pointer, the common no-override path).
+	if got := applyTaskAgent(base, ""); got != base {
+		t.Fatal("empty agent must return cfg unchanged")
+	}
+	// unregistered agent → unchanged (no crash; falls back to default).
+	if got := applyTaskAgent(base, "no-such-provider"); got != base {
+		t.Fatal("unknown agent must fall back to cfg unchanged (no crash)")
 	}
 }

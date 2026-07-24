@@ -9,18 +9,28 @@ import (
 
 	"github.com/spf13/cobra"
 	"loop-eng/internal/channel"
+	"loop-eng/internal/config"
+	"loop-eng/internal/model"
 )
 
-// NewDoctorCmd builds `loop-eng doctor`: an on-demand channel readiness check
-// (preflight). It runs the same Preflight the daemon runs at startup, but only
-// reports — it never starts the engine. Output is a ready report (✅ ready /
-// ❌ checklist of missing prerequisites) so the operator can fix gaps before
-// booting the daemon (#65). Exits non-zero when not ready so CI/scripts can gate.
+// NewDoctorCmd builds `loop-eng doctor`: an on-demand readiness check. It runs
+// TWO preflights and only reports — it never starts the engine:
+//   - channel preflight (the daemon's #65 startup gate): GitHub labels, Linear
+//     project, etc.
+//   - provider preflight: each configured model role's coding-agent binary must
+//     be on PATH and its auth in place (claude binary, codex binary+CODEX_API_KEY,
+//     …) — spec §8.10 agent provider neutrality. A misconfigured provider would
+//     crash mid-run (e.g. binary missing only surfacing when Execute shells out),
+//     so doctor surfaces it before boot.
+//
+// Output is a ready report (✅ ready / ❌ checklist of missing prerequisites) so
+// the operator can fix gaps before booting the daemon. Exits non-zero when not
+// ready so CI/scripts can gate.
 func NewDoctorCmd() *cobra.Command {
 	var repo, channelFlag string
 	cmd := &cobra.Command{
 		Use:   "doctor",
-		Short: "channel 就绪性校验（preflight）：列出缺失的前置依赖，不启动 daemon",
+		Short: "就绪性校验：channel + coding-agent provider 的前置依赖，不启动 daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := mustLoad(repo)
 			if channelFlag != "" {
@@ -35,31 +45,65 @@ func NewDoctorCmd() *cobra.Command {
 				prov = "local"
 			}
 
-			pf, ok := ch.(channel.Preflighter)
-			if !ok {
-				// Local and any provider without prerequisites — always ready.
-				fmt.Printf("channel=%s：无前置依赖，就绪 ✅\n", prov)
-				return nil
+			// ---- channel preflight ----
+			var chanIssues []channel.PreflightIssue
+			if pf, ok := ch.(channel.Preflighter); ok {
+				issues, err := pf.Preflight(context.Background())
+				if err != nil {
+					fmt.Printf("❌ channel 校验未能完成：%v\n", err)
+					return fmt.Errorf("preflight: %w", err)
+				}
+				chanIssues = issues
 			}
 
-			fmt.Printf("channel=%s：开始就绪性校验（preflight）...\n", prov)
-			issues, err := pf.Preflight(context.Background())
-			if err != nil {
-				fmt.Printf("❌ 校验未能完成：%v\n", err)
-				return fmt.Errorf("preflight: %w", err)
-			}
-			if len(issues) == 0 {
-				fmt.Printf("✅ 就绪：所有前置依赖已配置\n")
+			// ---- provider preflight (coding-agent binary + auth per role) ----
+			provIssues := providerPreflight(cfg)
+
+			total := len(chanIssues) + len(provIssues)
+			if total == 0 {
+				fmt.Printf("channel=%s：✅ 就绪（channel 与 provider 前置依赖均已配置）\n", prov)
 				return nil
 			}
-			fmt.Printf("❌ 未就绪：缺 %d 项前置依赖\n", len(issues))
-			fmt.Print(formatPreflightIssues(issues))
-			return fmt.Errorf("channel 未就绪：%d 项前置依赖缺失", len(issues))
+			fmt.Printf("channel=%s：❌ 未就绪，缺 %d 项前置依赖（channel %d + provider %d）\n",
+				prov, total, len(chanIssues), len(provIssues))
+			fmt.Print(formatPreflightIssues(chanIssues))
+			for _, msg := range provIssues {
+				fmt.Printf("  - %s\n", msg)
+			}
+			return fmt.Errorf("未就绪：%d 项前置依赖缺失", total)
 		},
 	}
 	cmd.Flags().StringVar(&repo, "repo", ".", "仓库路径")
 	cmd.Flags().StringVar(&channelFlag, "channel", "", "local | github | linear（空=用 cfg.Channel.Provider）")
 	return cmd
+}
+
+// providerPreflight validates every configured model role's coding-agent: each
+// config.ModelRef must resolve to a registered Agent (NewAgent) AND that agent's
+// Check (binary on PATH + auth) must pass. Returns one human-readable issue
+// string per failure (role-prefixed). Used by `loop-eng doctor` so a missing
+// binary or credential surfaces before the daemon shells out mid-run.
+func providerPreflight(cfg *config.Config) []string {
+	var issues []string
+	for _, r := range []struct {
+		role string
+		ref  config.ModelRef
+	}{
+		{"triage", cfg.Models.Triage},
+		{"plan", cfg.Models.Plan},
+		{"execute", cfg.Models.Execute},
+		{"verify", cfg.Models.Verify},
+	} {
+		a, err := model.NewAgent(r.ref)
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("[provider] models.%s: %v", r.role, err))
+			continue
+		}
+		if err := a.Check(context.Background()); err != nil {
+			issues = append(issues, fmt.Sprintf("[provider] models.%s (%s): %v", r.role, a.Provider(), err))
+		}
+	}
+	return issues
 }
 
 // runPreflight is the daemon's startup gate. It runs the channel's Preflight

@@ -271,7 +271,14 @@ func stepTokens(steps []state.StepRow) string {
 			continue
 		}
 		mark, st := stepMark(s.Status)
-		segs = append(segs, st.Render(role+mark))
+		// model_ref（谁跑的这步）非空时方括号附在 role+mark 后——点亮 steps.model_ref
+		// 审计列，dashboard trace 能看「plan✓[claude] execute✓[codex]」即每步的 provider。
+		// 空时退化为旧行为（plan✓），向后兼容。
+		label := role + mark
+		if mr := strings.TrimSpace(s.ModelRef); mr != "" {
+			label += "[" + mr + "]"
+		}
+		segs = append(segs, st.Render(label))
 	}
 	return strings.Join(segs, " ")
 }

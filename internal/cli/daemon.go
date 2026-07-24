@@ -57,7 +57,10 @@ func NewDaemonCmd() *cobra.Command {
 			// already-ingested task ID (avoids duplicate InsertTask).
 			runTask := func(ctx context.Context, task state.TaskRow) (string, string, error) {
 				bz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
-				exec, plan, verifySkill, _ := buildModels(cfg, models, bz)
+				// 任务级 agent override：daemon 从 issue 摄取的 task.Agent 覆盖各角色 provider
+				// （agent: codex → 该任务全程用 codex）。未知 provider 静默回落 config 默认。
+				taskCfg := applyTaskAgent(cfg, task.Agent)
+				exec, plan, verifySkill, _ := buildModels(taskCfg, models, bz)
 
 				// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
 				// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
@@ -68,9 +71,12 @@ func NewDaemonCmd() *cobra.Command {
 					Execute:           exec,
 					Plan:              plan,
 					VerifyLLM:         verify.LLM{Skill: verifySkill},
-					Tier3Human:        cfg.Verify.Tier3Human,
+					Tier3Human:        taskCfg.Verify.Tier3Human,
 					Channel:           ch,
 					PreinsertedTaskID: task.ID,
+					PlanModelRef:      providerLabel(taskCfg.Models.Plan),
+					ExecuteModelRef:   providerLabel(taskCfg.Models.Execute),
+					VerifyModelRef:    providerLabel(taskCfg.Models.Verify),
 				}
 
 				ct := channel.Task{
