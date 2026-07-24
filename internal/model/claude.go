@@ -74,11 +74,16 @@ func isFatalClaudeError(stderr, stdout string) bool {
 
 // runOnce executes a single `claude -p [--model M] <Args>` attempt with prompt
 // on stdin. dir=="" leaves the default working directory; non-empty sets
-// cmd.Dir (Exec). Returns stdout, stderr, error.
-func (c *ClaudeClient) runOnce(ctx context.Context, dir, prompt string) (string, string, error) {
+// cmd.Dir (Exec). model overrides c.Model for this attempt only (the Agent
+// layer passes req.Model; "" falls back to the client's configured Model).
+// Returns stdout, stderr, error.
+func (c *ClaudeClient) runOnce(ctx context.Context, dir, model, prompt string) (string, string, error) {
 	args := []string{"-p"}
-	if c.Model != "" {
-		args = append(args, "--model", c.Model)
+	if model == "" {
+		model = c.Model
+	}
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	args = append(args, c.Args...)
 	cmd := exec.CommandContext(ctx, c.Binary, args...)
@@ -93,45 +98,89 @@ func (c *ClaudeClient) runOnce(ctx context.Context, dir, prompt string) (string,
 	return out.String(), errBuf.String(), err
 }
 
-// callWithRetry runs runOnce up to claudeRetry times. Retry policy:
-//   - FATAL error (auth/credential, per fatalClaudeSignals) → abort at once,
-//     wrapped with ErrClaudeFatal so SubLoop gives up rather than retrying.
-//   - Retryable flake (rate-limit / 5xx / timeout / opaque exit-1) → retry with
-//     exponential backoff (claudeBackoffBase, 2x, 4x) + ±200ms jitter.
+// runWithRetry is the shared retry runner for every shell-out provider. It runs
+// attempt up to claudeRetry times with exponential backoff
+// (claudeBackoffBase, 2x, 4x) + ±200ms jitter. isFatal(short) aborts at once,
+// wrapping the error with ErrClaudeFatal so SubLoop's fatal short-circuit fires
+// (auth/credential failures must not burn budget retrying). label prefixes the
+// exhausted-retries error (e.g. "claude -p", "codex exec") for debuggability.
 //
-// The final error carries BOTH stderr AND stdout — claude often prints its real
-// error to stdout, which a discard-on-error caller would lose.
-func (c *ClaudeClient) callWithRetry(ctx context.Context, dir, prompt string) (string, Usage, error) {
+// The final error carries BOTH stderr AND stdout — headless agents often print
+// their real error to stdout, which a discard-on-error caller would lose.
+//
+// This is the provider-common extraction of ClaudeClient.callWithRetry; the
+// 30/60/120s + ±200ms jitter + fatal-short-circuit semantics are preserved so
+// retry_test.go's three contracts (exhaust-retries / recover / fatal-abort) stay
+// green for the claude path, and codex (and future providers) inherit the same
+// retry behavior + ErrClaudeFatal wiring.
+func runWithRetry(
+	ctx context.Context,
+	label string,
+	attempt func(context.Context) (stdout, stderr string, err error),
+	isFatal func(stderr, stdout string) bool,
+) (string, Usage, error) {
 	var lastOut, lastErrBuf string
 	var lastErr error
-	for attempt := 1; attempt <= claudeRetry; attempt++ {
-		out, errBuf, err := c.runOnce(ctx, dir, prompt)
+	for n := 1; n <= claudeRetry; n++ {
+		out, errBuf, err := attempt(ctx)
 		if err == nil {
 			return out, Usage{TokensOut: len(out)}, nil
 		}
 		lastOut, lastErrBuf, lastErr = out, errBuf, err
-		if isFatalClaudeError(lastErrBuf, lastOut) {
+		if isFatal != nil && isFatal(lastErrBuf, lastOut) {
 			return lastOut, Usage{}, fmt.Errorf("%w: %v (stderr: %q stdout: %.400q)",
 				ErrClaudeFatal, lastErr, lastErrBuf, lastOut)
 		}
-		if attempt < claudeRetry {
-			backoff := claudeBackoffBase << (attempt - 1) // 30s, 60s, 120s
+		if n < claudeRetry {
+			backoff := claudeBackoffBase << (n - 1) // 30s, 60s, 120s
 			jitter := time.Duration(rand.Intn(400)-200) * time.Millisecond
 			time.Sleep(backoff + jitter)
 		}
 	}
-	return lastOut, Usage{}, fmt.Errorf("claude -p: %w after %d attempts (stderr: %q stdout: %.400q)",
-		lastErr, claudeRetry, lastErrBuf, lastOut)
+	return lastOut, Usage{}, fmt.Errorf("%s: %w after %d attempts (stderr: %q stdout: %.400q)",
+		label, lastErr, claudeRetry, lastErrBuf, lastOut)
+}
+
+// callWithRetry runs runOnce up to claudeRetry times via the shared runWithRetry
+// runner. Retry policy is documented on runWithRetry; isFatalClaudeError supplies
+// the claude auth/credential signal set.
+func (c *ClaudeClient) callWithRetry(ctx context.Context, dir, model, prompt string) (string, Usage, error) {
+	return runWithRetry(ctx, "claude -p",
+		func(ctx context.Context) (string, string, error) { return c.runOnce(ctx, dir, model, prompt) },
+		isFatalClaudeError)
 }
 
 // Call implements Client by running `claude -p [--model M] <Args>` (default
 // working directory) with the prompt on stdin, retried on retryable failure.
 func (c *ClaudeClient) Call(ctx context.Context, prompt string) (string, Usage, error) {
-	return c.callWithRetry(ctx, "", prompt)
+	return c.callWithRetry(ctx, "", c.Model, prompt)
 }
 
 // Exec implements Executer: `claude -p [--model M] <Args>` with cmd.Dir=worktreeDir
 // so the agent's edits land on the isolated worktree. Retried on retryable failure.
 func (c *ClaudeClient) Exec(ctx context.Context, worktreeDir, prompt string) (string, Usage, error) {
-	return c.callWithRetry(ctx, worktreeDir, prompt)
+	return c.callWithRetry(ctx, worktreeDir, c.Model, prompt)
+}
+
+// claudeAgent is the claude provider implementation of Agent. It wraps a
+// ClaudeClient (the legacy shell-out), so NewClaudeClient / Call / Exec /
+// ErrClaudeFatal and friends stay exactly as exec_test.go / retry_test.go /
+// subloop.go use them — claudeAgent is a thin Agent view, not a replacement.
+type claudeAgent struct{ c *ClaudeClient }
+
+func (a *claudeAgent) Provider() string { return "claude" }
+
+// Run delegates to ClaudeClient.callWithRetry. req.Model overrides the client's
+// configured Model when set (the step-level agent hint path, P5); otherwise the
+// role's configured model is used.
+func (a *claudeAgent) Run(ctx context.Context, req AgentRequest) (AgentResult, error) {
+	out, u, err := a.c.callWithRetry(ctx, req.Workdir, req.Model, req.Prompt)
+	return AgentResult{Out: out, Usage: u}, err
+}
+
+// Check verifies the claude binary is resolvable (doctor / preflight). Auth is
+// the Claude Code login (out-of-band); binary presence is the machine-checkable
+// half.
+func (a *claudeAgent) Check(ctx context.Context) error {
+	return checkBinary(a.c.Binary)
 }

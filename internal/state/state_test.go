@@ -90,6 +90,59 @@ func TestAppendStepAndReplay(t *testing.T) {
 	}
 }
 
+// TestInsertTaskAgentRoundTrip: the per-task agent override (issue frontmatter
+// `agent: codex`) persists in tasks.agent and reads back through every dispatch
+// path — GetTask (run-once), NextReadyTask (daemon FIFO head). This is the state
+// half of the task-level agent override; the daemon reads task.Agent at dispatch
+// to opt the task into a different provider.
+func TestInsertTaskAgentRoundTrip(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+	id, err := s.InsertTask(TaskRow{
+		IssueRef: "o/r#7", Description: "d", TaskType: "feat",
+		Criteria: []string{"c"}, Agent: "codex",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Agent != "codex" {
+		t.Fatalf("GetTask: want Agent=codex, got %q", got.Agent)
+	}
+	// NextReadyTask is the daemon's dispatch pick — it must surface Agent too so
+	// runTask can apply the override without an extra query.
+	head, ok, err := s.NextReadyTask()
+	if err != nil || !ok {
+		t.Fatalf("NextReadyTask: ok=%v err=%v", ok, err)
+	}
+	if head.Agent != "codex" {
+		t.Fatalf("NextReadyTask: want Agent=codex, got %q", head.Agent)
+	}
+}
+
+// TestAppendStepModelRefReplays: steps.model_ref (the per-step "who ran this"
+// audit column) survives AppendStep → Replay so dashboard/replay can show the
+// agent that produced each step. The column always existed but was never written
+// until the agent layer lit it up.
+func TestAppendStepModelRefReplays(t *testing.T) {
+	s, _ := Open(t.TempDir() + "/state.db")
+	defer s.Close()
+	runID := newID("run")
+	if err := s.AppendStep(StepRow{RunID: runID, Seq: 1, Role: "plan", Status: "ok", ModelRef: "kimi"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Replay(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ModelRef != "kimi" {
+		t.Fatalf("model_ref did not round-trip: %+v", got)
+	}
+}
+
 // TestInFlight covers the single-active live view via the dedicated in_flight
 // table (spec §8.7 cross-process observable). SetInFlight writes the active
 // task+phase; InFlight reads it back; ClearInFlight empties it.

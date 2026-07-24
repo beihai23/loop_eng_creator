@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"loop-eng/internal/channel"
+	"loop-eng/internal/config"
 )
 
 // fakePreflightChannel embeds *channel.Local (satisfies channel.Channel via
@@ -89,5 +90,47 @@ func TestFormatPreflightIssuesRendersChecklist(t *testing.T) {
 	}
 	if strings.Count(out, "\n") != 2 {
 		t.Fatalf("want one bullet per issue (2 lines), got:\n%s", out)
+	}
+}
+
+// TestProviderPreflight: doctor's provider gate surfaces a role whose binary is
+// missing (here: execute → codex with a nonexistent binary path), while the
+// claude-backed roles pass. Each issue is role-prefixed and tagged [provider] so
+// the operator can see exactly which provider/binary to install.
+func TestProviderPreflight(t *testing.T) {
+	cfg := &config.Config{Models: config.Models{
+		Triage:  config.ModelRef{Provider: "", Binary: "claude"},
+		Plan:    config.ModelRef{Provider: "", Binary: "claude"},
+		Execute: config.ModelRef{Provider: "codex", Binary: "/no/such/codex-bin-zzz"},
+		Verify:  config.ModelRef{Provider: "", Binary: "claude"},
+	}}
+	issues := providerPreflight(cfg)
+	if len(issues) == 0 {
+		t.Fatal("providerPreflight must flag the codex role with a missing binary")
+	}
+	var found bool
+	for _, msg := range issues {
+		if strings.Contains(msg, "execute") && strings.Contains(msg, "codex") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("providerPreflight must report models.execute (codex) missing; got %v", issues)
+	}
+}
+
+// TestProviderPreflightUnknownProvider: an unregistered provider on a role is
+// reported (NewAgent error), not silently dropped — doctor must tell the
+// operator the provider name is wrong.
+func TestProviderPreflightUnknownProvider(t *testing.T) {
+	cfg := &config.Config{Models: config.Models{
+		Plan: config.ModelRef{Provider: "no-such-provider-zzz", Binary: "no-such-provider-zzz"},
+	}}
+	issues := providerPreflight(cfg)
+	if len(issues) == 0 {
+		t.Fatal("providerPreflight must flag an unknown provider")
+	}
+	if !strings.Contains(issues[0], "plan") || !strings.Contains(issues[0], "no-such-provider-zzz") {
+		t.Fatalf("issue must name role+provider; got %v", issues)
 	}
 }

@@ -44,8 +44,6 @@ func NewRunOnceCmd() *cobra.Command {
 			}
 
 			bz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
-			exec, plan, verifySkill, triage := buildModels(cfg, models, bz)
-			_ = triage // M1 SubLoop 外分诊（M3 daemon 调用）
 
 			ch, err := buildChannel(cfg, repo)
 			if err != nil {
@@ -56,17 +54,25 @@ func NewRunOnceCmd() *cobra.Command {
 			if err != nil || len(tasks) == 0 {
 				return fmt.Errorf("no task in inbox %s", inbox)
 			}
+			// 任务级 agent override：issue frontmatter `agent: codex` 把整任务切到指定
+			// provider（覆盖各角色默认）。未知 provider 静默回落 config 默认（不崩进程）。
+			cfg = applyTaskAgent(cfg, tasks[0].Agent)
+			exec, plan, verifySkill, _ := buildModels(cfg, models, bz)
+
 			// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
 			// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
 			sl := &loop.SubLoop{
-				Repo:       repo,
-				Store:      st,
-				Budget:     bz,
-				Execute:    exec,
-				Plan:       plan,
-				VerifyLLM:  verify.LLM{Skill: verifySkill},
-				Tier3Human: cfg.Verify.Tier3Human,
-				Channel:    ch,
+				Repo:            repo,
+				Store:           st,
+				Budget:          bz,
+				Execute:         exec,
+				Plan:            plan,
+				VerifyLLM:       verify.LLM{Skill: verifySkill},
+				Tier3Human:      cfg.Verify.Tier3Human,
+				Channel:         ch,
+				PlanModelRef:    providerLabel(cfg.Models.Plan),
+				ExecuteModelRef: providerLabel(cfg.Models.Execute),
+				VerifyModelRef:  providerLabel(cfg.Models.Verify),
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
 			// Integrate done work: prefer a GitHub PR. push 最终失败 → LAND PARTIAL
@@ -167,16 +173,86 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: f}
 		return
 	}
-	// real: all via `claude -p` (no SDK, no API key). Each role uses claude's
-	// default model unless its config sets `name` (→ --model <name>) as an opt-in
-	// (e.g. a lighter model for plan/verify to ease a congested default). History:
-	// direct-API (决策 J) rejected (needs key/SDK); alias-pinning (决策 K) rejected
-	// (aliases drift); final = model-agnostic default + config-opt-in per role.
-	exec = model.NewClaudeClient(cfg.Models.Execute.Binary, cfg.Models.Execute.Name, cfg.Models.Execute.Cmd)
-	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.NewClaudeClient(cfg.Models.Plan.Binary, cfg.Models.Plan.Name, cfg.Models.Plan.Cmd)}
-	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.NewClaudeClient(cfg.Models.Verify.Binary, cfg.Models.Verify.Name, cfg.Models.Verify.Cmd), Enf: bz}}
-	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.NewClaudeClient(cfg.Models.Triage.Binary, cfg.Models.Triage.Name, cfg.Models.Triage.Cmd)}
+	// real: dispatch each role's agent by config.ModelRef.Provider via NewAgent
+	// (spec §8.10 — the shell-out is provider-neutral). Default config sets no
+	// provider → "" → claude → the same `claude -p` path as before (out-of-box
+	// behavior unchanged). provider: codex (or opencode/kimi/kilo once added)
+	// routes to that provider's adapter. Each Agent is bridged onto the frozen
+	// Client/Executer interfaces via AsClient/AsExecuter, so budget/skill/subloop
+	// wiring is untouched. The verify skill's Model is still wrapped in a
+	// budget.Client sharing bz (the Task 12 carry-forward fix — verify.Chain's
+	// frozen Tier takes no Enforcer, so the decorator is how verify's Call accrues).
+	exec = model.AsExecuter(mustAgent(cfg.Models.Execute))
+	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.AsClient(mustAgent(cfg.Models.Plan))}
+	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Verify)), Enf: bz}}
+	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.AsClient(mustAgent(cfg.Models.Triage))}
 	return
+}
+
+// mustAgent resolves a config.ModelRef to an Agent, panicking on an unknown
+// provider. Real configs only ever carry registered providers (""/claude via the
+// default, or a task-agent that applyTaskAgent has already validated against
+// NewAgent), so the panic is a truly-unreachable guard — not a runtime path.
+func mustAgent(ref config.ModelRef) model.Agent {
+	a, err := model.NewAgent(ref)
+	if err != nil {
+		panic(err)
+	}
+	return a
+}
+
+// providerLabel renders a role's effective provider for the trace's model_ref
+// column ("who ran this step"). It normalizes "" → "claude" and appends the
+// model name when set (e.g. "codex/gpt-5.1"), so dashboard/replay can show the
+// agent+model that produced each step.
+func providerLabel(ref config.ModelRef) string {
+	p := ref.Provider
+	if p == "" {
+		p = "claude"
+	}
+	if ref.Name != "" {
+		return p + "/" + ref.Name
+	}
+	return p
+}
+
+// applyTaskAgent returns a config clone with every model role switched to the
+// task's requested provider. A task-level agent hint (issue frontmatter
+// `agent: codex`) opts the WHOLE task into a different provider stack, so each
+// role's provider+binary are reset to that provider's defaults and the old
+// provider's cmd flags (e.g. claude's --dangerously-skip-permissions, which
+// other binaries reject) are dropped; a per-role model name is preserved.
+//
+// agent=="" returns cfg unchanged (the common case: no override). An agent that
+// isn't a registered provider (e.g. a provider not yet implemented) also returns
+// cfg unchanged — validated against NewAgent so an unknown name falls back to
+// the configured default rather than crashing the daemon on untrusted issue input.
+func applyTaskAgent(cfg *config.Config, agent string) *config.Config {
+	if agent == "" {
+		return cfg
+	}
+	if _, err := model.NewAgent(config.ModelRef{Provider: agent, Binary: agent}); err != nil {
+		return cfg
+	}
+	clone := *cfg
+	clone.Models = config.Models{
+		Triage:  forProvider(cfg.Models.Triage, agent),
+		Plan:    forProvider(cfg.Models.Plan, agent),
+		Execute: forProvider(cfg.Models.Execute, agent),
+		Verify:  forProvider(cfg.Models.Verify, agent),
+	}
+	return &clone
+}
+
+// forProvider resets a ModelRef to a provider's defaults: provider+binary set to
+// the provider name, model name kept, cmd dropped (the old provider's native
+// flags don't apply to the new one).
+func forProvider(ref config.ModelRef, provider string) config.ModelRef {
+	return config.ModelRef{
+		Provider: provider,
+		Binary:   provider,
+		Name:     ref.Name,
+	}
 }
 
 // mustSkillPrompt reads an embedded skill template (embed/skills/<name>.md) and

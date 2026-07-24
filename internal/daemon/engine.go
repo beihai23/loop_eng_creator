@@ -288,8 +288,9 @@ func (e *Engine) ingest(ctx context.Context) error {
 			TaskType:    t.TaskType,
 			Source:      "daemon",
 			Criteria:    t.AcceptanceCriteria,
-			Body:        t.Body, // 全文：摄入即落库，不靠下轮 compare-and-update 回填
+			Body:        t.Body,      // 全文：摄入即落库，不靠下轮 compare-and-update 回填
 			CreatedAt:   t.CreatedAt, // #33/#36: 存 issue 提交时间 → NextReadyTask 按 created_at FIFO（不是入库时间）
+			Agent:       t.Agent,     // 任务级 agent override（issue frontmatter `agent: codex`）
 		}
 		if _, err := e.Store.InsertTask(row); err != nil {
 			return err
