@@ -1,8 +1,8 @@
 ---
 arc: plan-contract-visibility
 started: 3e8258c
-status: active
-commits: []
+status: resolved
+commits: [8c3332f]
 ---
 
 # plan↔execute 合同可见性（#71 振荡的根治）

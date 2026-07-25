@@ -1,8 +1,8 @@
 ---
 arc: p5-real-tokens-step-override
 started: 3e8258c
-status: active
-commits: []
+status: resolved
+commits: [8c3332f]
 ---
 
 # #71 落地：真实 token 采集（A）+ 步骤级 agent override（B）
