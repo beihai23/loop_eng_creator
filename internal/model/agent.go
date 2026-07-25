@@ -3,9 +3,9 @@
 // loop-eng's triage/plan/execute/verify stages shell out to a headless coding
 // agent CLI. Historically that was hard-wired to `claude -p` (ClaudeClient).
 // This file introduces an Agent abstraction so the shell-out target is chosen by
-// config (config.ModelRef.Provider): claude today, codex/opencode/kimi/kilo
-// tomorrow — each a thin adapter, dispatched by NewAgent (spec §8.10: the
-// shell-out is provider-neutral; swapping the binary/agent is a config change).
+// config (config.ModelRef.Provider): claude, codex, opencode, kimi, kilo — each
+// a thin adapter, dispatched by NewAgent (spec §8.10: the shell-out is
+// provider-neutral; swapping the binary/agent is a config change).
 //
 // The frozen Client / Executer interfaces (model.go) are how the rest of
 // loop-eng consumes an LLM. Agent is the richer internal contract (it knows its
@@ -69,8 +69,14 @@ func NewAgent(ref config.ModelRef) (Agent, error) {
 		return &claudeAgent{c: NewClaudeClient(binaryOf(ref, "claude"), ref.Name, ref.Cmd)}, nil
 	case "codex":
 		return newCodexAgent(ref), nil
+	case "opencode":
+		return newOpencodeAgent(ref), nil
+	case "kimi":
+		return newKimiAgent(ref), nil
+	case "kilo":
+		return newKiloAgent(ref), nil
 	default:
-		return nil, fmt.Errorf("model: unknown provider %q (want one of claude, codex)", p)
+		return nil, fmt.Errorf("model: unknown provider %q (want one of claude, codex, opencode, kimi, kilo)", p)
 	}
 }
 
