@@ -9,10 +9,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"loop-eng/internal/config"
+	"loop-eng/internal/model"
 )
 
 // NewConfigCmd builds `loop-eng config`: the primary setup command — scaffolds
@@ -56,7 +58,7 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		fmt.Fprintln(out, "loop-eng initialized at", loopDir)
 	}
 	cfgPath := filepath.Join(loopDir, "config.yaml")
-	cfg, err := config.Load(cfgPath)
+	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return err
 	}
@@ -161,6 +163,42 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		cfg.Channel.Inbox = inbox
 	}
 
+	// coding-agent provider 步：channel 配好后、Save 前引导配置
+	// models.<role>.provider（triage/plan/execute/verify 的 shell-out 目标）。该步
+	// 复用 pickProvider 的 non-interactive-safe 语义——scope 行空/EOF（含 piped
+	// stdin 在 channel 步用尽后的尾部 EOF）→ 保持现状、继续 Save，故现有 piped
+	// stdin 脚本零回归。channel provider 为空时已在上方提前 return，根本不触达这里。
+	scope, err := promptLine(r, out, "coding-agent provider 配置方式 (1=全局, 2=逐角色)", "")
+	if err != nil {
+		return err
+	}
+	roles := []string{"triage", "plan", "execute", "verify"}
+	switch scope {
+	case "1":
+		// 全局一把梭：选一个 provider 写进四个角色。
+		prov, err := pickAgentProvider(r, out)
+		if err != nil {
+			return err
+		}
+		if prov != "" {
+			for _, role := range roles {
+				setRoleProvider(cfg, role, prov)
+			}
+		}
+	case "2":
+		// 逐角色：每个角色独立选，空=保持该角色现状。
+		for _, role := range roles {
+			fmt.Fprintf(out, "当前 %s provider: %s\n", role, roleProvider(cfg, role))
+			prov, err := pickAgentProvider(r, out)
+			if err != nil {
+				return err
+			}
+			if prov != "" {
+				setRoleProvider(cfg, role, prov)
+			}
+		}
+	}
+
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return err
 	}
@@ -197,6 +235,79 @@ func pickProvider(r *bufio.Reader, out io.Writer) (string, error) {
 		}
 		fmt.Fprintf(out, "无法识别的输入 %q，请重新选择\n", s)
 	}
+}
+
+// pickAgentProvider prints the coding-agent provider menu (drawn dynamically
+// from the model registry) and reads one line. Accepts a 1-based number OR the
+// provider name, case-insensitively and trimmed. Empty line or EOF returns
+// ("", nil) — the caller treats that as "keep current provider" (the same
+// non-interactive-safe contract as pickProvider, so piped stdin stays
+// scriptable and empty input is a no-op). Invalid input reprints the menu and
+// reads again. The menu is built over model.RegisteredProviders(), so a newly
+// registered provider appears here automatically — adding a provider is a
+// one-line registry edit (single source of truth).
+func pickAgentProvider(r *bufio.Reader, out io.Writer) (string, error) {
+	names := model.RegisteredProviders()
+	for {
+		fmt.Fprintln(out, "选择 coding-agent provider:")
+		for i, n := range names {
+			fmt.Fprintf(out, "  %d) %s\n", i+1, n)
+		}
+		fmt.Fprint(out, "> ")
+		line, err := r.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		s := strings.ToLower(strings.TrimSpace(line))
+		if s == "" {
+			return "", nil
+		}
+		// number match (1-based index into the sorted registry)
+		if num, err := strconv.Atoi(s); err == nil && num >= 1 && num <= len(names) {
+			return names[num-1], nil
+		}
+		// name match (case-insensitive — return the registry's canonical casing)
+		for _, n := range names {
+			if s == strings.ToLower(n) {
+				return n, nil
+			}
+		}
+		fmt.Fprintf(out, "无法识别的输入 %q，请重新选择\n", s)
+	}
+}
+
+// setRoleProvider writes provider into the Models field for role (one of
+// triage/plan/execute/verify). Unknown roles are a no-op — the only callers
+// iterate the fixed four-role list, so this never receives anything else.
+func setRoleProvider(cfg *config.Config, role, provider string) {
+	switch role {
+	case "triage":
+		cfg.Models.Triage.Provider = provider
+	case "plan":
+		cfg.Models.Plan.Provider = provider
+	case "execute":
+		cfg.Models.Execute.Provider = provider
+	case "verify":
+		cfg.Models.Verify.Provider = provider
+	}
+}
+
+// roleProvider returns the current provider for role (one of
+// triage/plan/execute/verify); "" for an unknown role. The read counterpart to
+// setRoleProvider, used to show "当前 <role> provider: ..." context in the
+// per-role walkthrough.
+func roleProvider(cfg *config.Config, role string) string {
+	switch role {
+	case "triage":
+		return cfg.Models.Triage.Provider
+	case "plan":
+		return cfg.Models.Plan.Provider
+	case "execute":
+		return cfg.Models.Execute.Provider
+	case "verify":
+		return cfg.Models.Verify.Provider
+	}
+	return ""
 }
 
 // promptLine prints "<label> [<def>]: " (or "<label>: " when def is empty),

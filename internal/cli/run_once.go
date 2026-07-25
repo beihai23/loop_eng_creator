@@ -301,11 +301,29 @@ func jsonStr(v any) string {
 	return string(b)
 }
 
-// mustLoad reads <repo>/.loop/config.yaml. M1 simplification: load failure
-// panics (run-once is a dev/test entry point; M3 daemon will surface errors
-// via issue comments).
+// loadConfig reads a config file and validates its model providers
+// (model.ValidateProviders — the same registry NewAgent dispatches on), so a
+// misspelled `models.<role>.provider` fails at load time instead of surfacing
+// mid-run when NewAgent shells out. It is the shared gate for every CLI path
+// that reads config (daemon / run-once / dashboard / doctor / config): routing
+// config.Load through here means provider validation can't be skipped.
+func loadConfig(path string) (*config.Config, error) {
+	c, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := model.ValidateProviders(c); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// mustLoad reads <repo>/.loop/config.yaml via loadConfig (provider validation
+// included). M1 simplification: load failure panics (run-once is a dev/test
+// entry point; the daemon and dashboard reach config through mustLoad too, so a
+// bad provider now panics at boot rather than mid-run).
 func mustLoad(repo string) *config.Config {
-	c, err := config.Load(filepath.Join(repo, ".loop", "config.yaml"))
+	c, err := loadConfig(filepath.Join(repo, ".loop", "config.yaml"))
 	if err != nil {
 		panic(err)
 	}
