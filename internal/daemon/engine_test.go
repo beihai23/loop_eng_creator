@@ -933,6 +933,7 @@ func TestIngestResyncsBodyOnlyEdit(t *testing.T) {
 //  1. !startable → needs-info：不占活跃位（RunTask 未被调用），issue 收到缺信息评论；
 //  2. 人补充信息（评论）→ pollSignals 唤醒 → 重新分诊（这次 startable）→ 正常派发；
 //  3. needs_human_decision → needs-human-decision 挂起。
+//
 // 同时断言 TriageFunc 拿到全文 Body（分诊判断「缺不缺信息」的输入）。
 func TestTriageGate(t *testing.T) {
 	st := newTestStore(t)
@@ -1054,5 +1055,68 @@ func TestTriageGateHumanDecision(t *testing.T) {
 	}
 	if len(ran) != 1 || ran[0] != "B" {
 		t.Fatalf("triage 报错不应阻塞派发, ran=%v", ran)
+	}
+}
+
+// TestZeroGainBlockedResumesWithFeedback 钉死 DoD 3 的 daemon 段：SubLoop 零增益结局把任务
+// 落成 blocked（detail 注明零增益）→ 人在 issue 评论补充信息 → pollSignals 把它从 blocked
+// 重排队到 new 并把回复落成 ResumeFeedback → 下一轮 SubLoop 经 PopResumeFeedback（subloop.go
+// 的既有通道）携带新信息重试。本测试只驱动 daemon 段（直接模拟 SubLoop 的 blocked 结局 +
+// SetLastCommentAt），不断言 SubLoop 内部。
+func TestZeroGainBlockedResumesWithFeedback(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{}
+	eng := &Engine{Channel: ch, Store: st, Interval: time.Second}
+
+	taskID, err := st.InsertTask(state.TaskRow{IssueRef: "A", Description: "零增益任务"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	// 模拟 SubLoop 零增益结局：running→blocked，detail 注明零增益（escalateZeroGain→report
+	// 会做这步；这里直接落 transition 以隔离 daemon 段）。
+	if err := st.AppendTransition(taskID, "running", "blocked",
+		"重试零增益提前终止（连续两轮失败签名相同，重试不会自愈）。签名: x"); err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	// report() 在 PostComment 成功后会 SetLastCommentAt——pollSignals 据此判定「新」回复。
+	if err := st.SetLastCommentAt(taskID, time.Now()); err != nil {
+		t.Fatalf("set last comment at: %v", err)
+	}
+	// 人在 issue 回复（携带新信息：修订后的实现合同）。
+	ch.replies = map[string][]channel.Reply{"A": {{Body: "合同是 plan 冻结 3 个值，execute 按这个改"}}}
+
+	if err := eng.pollSignals(context.Background()); err != nil {
+		t.Fatalf("pollSignals: %v", err)
+	}
+
+	// 零增益 blocked 任务在人回复后被重排队到 new。
+	if got := statusOf(t, st, taskID); got != "new" {
+		t.Fatalf("零增益 blocked 任务人回复后应重排队为 new, got %q", got)
+	}
+	// transitions 含 blocked→new 且 reason 含回复原文。
+	trans, err := st.Transitions(taskID)
+	if err != nil {
+		t.Fatalf("transitions: %v", err)
+	}
+	var resumed bool
+	for _, tr := range trans {
+		if tr.From == "blocked" && tr.To == "new" && strings.Contains(tr.Reason, "合同是 plan 冻结 3 个值") {
+			resumed = true
+		}
+	}
+	if !resumed {
+		t.Fatalf("缺 blocked→new 且含回复原文的 transition: %+v", trans)
+	}
+	// PopResumeFeedback 返回非空——下一轮 SubLoop 经 subloop.go 的 PopResumeFeedback 通道
+	// 注入 priorFailure 的新信息（携带人回复重试）。
+	fb, err := st.PopResumeFeedback(taskID)
+	if err != nil {
+		t.Fatalf("pop resume feedback: %v", err)
+	}
+	if strings.TrimSpace(fb) == "" {
+		t.Fatalf("PopResumeFeedback 应返回非空（携带人回复作为下轮新信息）, got %q", fb)
+	}
+	if !strings.Contains(fb, "合同是 plan 冻结 3 个值") {
+		t.Fatalf("resume feedback 应含回复原文, got %q", fb)
 	}
 }

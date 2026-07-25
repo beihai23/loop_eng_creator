@@ -57,7 +57,7 @@ func NewRunOnceCmd() *cobra.Command {
 			// 任务级 agent override：issue frontmatter `agent: codex` 把整任务切到指定
 			// provider（覆盖各角色默认）。未知 provider 静默回落 config 默认（不崩进程）。
 			cfg = applyTaskAgent(cfg, tasks[0].Agent)
-			exec, plan, verifySkill, _ := buildModels(cfg, models, bz)
+			exec, plan, verifySkill, _, help := buildModels(cfg, models, bz)
 
 			// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
 			// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
@@ -67,6 +67,7 @@ func NewRunOnceCmd() *cobra.Command {
 				Budget:          bz,
 				Execute:         exec,
 				Plan:            plan,
+				Help:            help,
 				VerifyLLM:       verify.LLM{Skill: verifySkill},
 				Tier3Human:      cfg.Verify.Tier3Human,
 				Channel:         ch,
@@ -160,18 +161,26 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	plan skill.Skill[skill.PlanInput, skill.PlanOutput],
 	vs skill.Skill[skill.VerifyInput, skill.VerifyOutput],
 	triage skill.Skill[skill.TriageInput, skill.TriageOutput],
+	help skill.Skill[skill.HelpInput, skill.HelpOutput],
 ) {
 	if mode == "fake" {
+		// fakeHelp: help skill 的 fake 输出（零增益 blocked 战报的结构化求助占位）。
+		fakeHelp := skill.HelpOutput{}
+		fakeHelp.HelpRequest.StuckAt = "（fake）零增益卡住"
+		fakeHelp.HelpRequest.Tried = []string{"（fake）已重试多轮，失败签名相同"}
+		fakeHelp.HelpRequest.NeedFromHuman = "（fake）请人决策合同/补信息/排查环境"
 		f := model.NewFake(map[string]string{
 			"TRIAGE:":  jsonStr(skill.TriageOutput{Startable: true, LoopDoable: true}),
 			"PLAN:":    jsonStr(skill.PlanOutput{Plan: []skill.PlanStep{{Step: "实现任务以满足验收标准"}}}),
 			"EXECUTE:": "ok",
 			"VERIFY:":  jsonStr(skill.VerifyOutput{Passed: true}),
+			"HELP:":    jsonStr(fakeHelp),
 		})
 		exec = f
 		plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: f}
 		vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: f, Enf: bz}}
 		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: f}
+		help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: f}
 		return
 	}
 	// real: dispatch each role's agent by config.ModelRef.Provider via NewAgent
@@ -187,6 +196,10 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.AsClient(mustAgent(cfg.Models.Plan))}
 	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Verify)), Enf: bz}}
 	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.AsClient(mustAgent(cfg.Models.Triage))}
+	// help 复用 triage 的 agent：config.Models 无 Help 字段（已核实只有 Triage/Plan/Execute/
+	// Verify），help 与 triage 同属分类/诊断类，按 spec §8.8 原设计接线上（模板/类型早就在，
+	// 本次补接线）。零增益 blocked 战报由此产出结构化 stuck_at/tried/need_from_human。
+	help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: model.AsClient(mustAgent(cfg.Models.Triage))}
 	return
 }
 

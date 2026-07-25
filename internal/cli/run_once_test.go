@@ -92,7 +92,7 @@ func TestRunOnceGitHubPathWiresChannel(t *testing.T) {
 // PriorFailureSignal. This test fails the moment someone re-truncates the
 // template or stops wiring the embedded file.
 func TestVerifySkillCarriesAcceptanceCriteria(t *testing.T) {
-	_, _, vs, _ := buildModels(nil, "fake", budget.New(1000, 10000, 1))
+	_, _, vs, _, _ := buildModels(nil, "fake", budget.New(1000, 10000, 1))
 
 	prompt := renderTemplate(t, vs.PromptTmpl, skill.VerifyInput{
 		Diff:               "diff body",
