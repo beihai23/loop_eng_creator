@@ -1,8 +1,8 @@
 ---
 arc: plan-in-worktree
 started: 32158d4
-status: active
-commits: []
+status: resolved
+commits: [3384a3b]
 ---
 
 # plan 阶段挪进 attempt worktree（§8.9 回滚原语覆盖 plan）

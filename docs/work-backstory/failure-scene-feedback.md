@@ -1,8 +1,8 @@
 ---
 arc: failure-scene-feedback
 started: 32158d4
-status: active
-commits: []
+status: resolved
+commits: [3384a3b]
 ---
 
 # 失败现场回灌 + worktree GC（判决之外，现场也传；树是缓存，SQLite 是档案）
