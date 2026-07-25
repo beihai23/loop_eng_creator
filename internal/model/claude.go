@@ -3,6 +3,7 @@ package model
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -76,9 +77,11 @@ func isFatalClaudeError(stderr, stdout string) bool {
 // on stdin. dir=="" leaves the default working directory; non-empty sets
 // cmd.Dir (Exec). model overrides c.Model for this attempt only (the Agent
 // layer passes req.Model; "" falls back to the client's configured Model).
+// stdout is a `--output-format json` envelope (parsed by callWithRetry; the
+// flag is inserted before c.Args so a config passthrough may still override).
 // Returns stdout, stderr, error.
 func (c *ClaudeClient) runOnce(ctx context.Context, dir, model, prompt string) (string, string, error) {
-	args := []string{"-p"}
+	args := []string{"-p", "--output-format", "json"}
 	if model == "" {
 		model = c.Model
 	}
@@ -144,10 +147,48 @@ func runWithRetry(
 // callWithRetry runs runOnce up to claudeRetry times via the shared runWithRetry
 // runner. Retry policy is documented on runWithRetry; isFatalClaudeError supplies
 // the claude auth/credential signal set.
+//
+// On success the raw stdout is a `--output-format json` envelope: parse it for
+// the final assistant text (Out semantics unchanged — downstream extractJSON
+// still sees the model's own output) and the REAL token usage (replacing the
+// len(Out) estimate, #71-A). Parse failure falls back to raw text + estimate —
+// envelope schema drift must never break the loop (#68 risk section).
 func (c *ClaudeClient) callWithRetry(ctx context.Context, dir, model, prompt string) (string, Usage, error) {
-	return runWithRetry(ctx, "claude -p",
+	out, u, err := runWithRetry(ctx, "claude -p",
 		func(ctx context.Context) (string, string, error) { return c.runOnce(ctx, dir, model, prompt) },
 		isFatalClaudeError)
+	if err != nil {
+		return out, u, err
+	}
+	if text, in, outTok, ok := parseClaudeResult(out); ok {
+		return text, Usage{TokensIn: in, TokensOut: outTok}, nil
+	}
+	return out, u, nil
+}
+
+// claudeResultEnvelope is the success shape of `claude -p --output-format json`
+// ({"type":"result", "result":..., "session_id":..., "usage":{...}}). Only the
+// fields loop-eng consumes are modeled.
+type claudeResultEnvelope struct {
+	Result string `json:"result"`
+	Usage  *struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+// parseClaudeResult extracts the final assistant text + real token counts from
+// a `--output-format json` envelope. ok=false on any shape deviation (non-JSON,
+// missing usage) — callers then keep the raw text and the len(Out) estimate.
+func parseClaudeResult(raw string) (text string, tokensIn, tokensOut int, ok bool) {
+	var env claudeResultEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		return "", 0, 0, false
+	}
+	if env.Usage == nil {
+		return "", 0, 0, false
+	}
+	return env.Result, env.Usage.InputTokens, env.Usage.OutputTokens, true
 }
 
 // Call implements Client by running `claude -p [--model M] <Args>` (default

@@ -65,6 +65,15 @@ type SubLoop struct {
 	ExecuteModelRef string
 	VerifyModelRef  string
 
+	// AgentForRole constructs an agent for a role ("execute"|"verify") with its
+	// provider overridden — the step-level agent override (#71-B). When plan
+	// emits AgentHints, SubLoop calls this AFTER plan returns (execute/verify
+	// run after plan, so the hint is known in time). nil = hints ignored
+	// (legacy/tests). The CLI builds it over config with forProvider semantics
+	// (provider+binary swapped, model name kept, cmd flags dropped). A hint
+	// that errors here falls back to the role's configured agent, never crashes.
+	AgentForRole func(role, provider string) (model.Agent, error)
+
 	// Log is the observability sink for phase start/done, retry, and budget
 	// events. When nil, defaults to os.Stderr with a "[subloop]" prefix. Tests
 	// inject a logger backed by a bytes.Buffer to assert on log output without
@@ -96,13 +105,14 @@ func shortID(id string) string {
 }
 
 // tiersFor 在每轮按 worktree + plan 产出重建 tier 链：tier1（plan 产出的验收脚本，
-// 在 wt 里跑）→ tier2 → tier3。
+// 在 wt 里跑）→ tier2 → tier3。llm 是本轮生效的 tier-2（可能被 plan 的 agent_hints
+// 步骤级 override 替换，见 #71-B）。
 //
 // tier-1 完全来自 plan（planOut.VerifyScript），无任何静态/兜底列表：
 //   - plan 产出且 Valid（非空、有运行命令）→ 挂 tier-1（Dir=wt，脚本 body 先落盘）。
 //   - plan 未产出（VerifyScript=nil）→ tier-1 缺席，链直接落 tier-2。
 //   - plan 产出了但非法（缺运行命令等）→ Run 已记一行，这里同样跳过，落 tier-2。
-func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput) []verify.Tier {
+func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput, llm verify.LLM) []verify.Tier {
 	var tiers []verify.Tier
 	if s := planOut.VerifyScript; s.Valid() {
 		tiers = append(tiers, verify.Deterministic{
@@ -113,7 +123,7 @@ func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput) []verify.Tier {
 			ScriptBody: s.Body,
 		})
 	}
-	tiers = append(tiers, sl.VerifyLLM)
+	tiers = append(tiers, llm)
 	// tier-3：M3 注入了真人审 tier（HumanTier）就用它；否则 Tier3Human 时挂 HumanStub
 	// 自动通过占位。HumanStub 不再产 NeedsHuman，故 M1/M2 的 done/blocked 路径不受影响。
 	switch {
@@ -135,6 +145,47 @@ func labelOf(s *skill.PlanVerifyScript) string {
 		return strings.Join(s.Run, " ")
 	}
 	return "tier-1"
+}
+
+// resolveAgentHints applies plan's per-phase agent hints (#71-B): a hinted
+// phase gets a freshly-constructed agent (provider swapped via AgentForRole);
+// an unbuildable hint falls back to the role's configured agent (never crash on
+// untrusted model output). Selection priority: step hint → task agent (already
+// baked into the role's agent by the CLI's applyTaskAgent) → role config →
+// default. Returns the effective execute gateway + label and tier-2 LLM + label
+// for THIS attempt.
+func (sl *SubLoop) resolveAgentHints(sid string, hints *skill.AgentHints) (model.Executer, string, verify.LLM, string) {
+	exec, execRef := sl.Execute, sl.ExecuteModelRef
+	llm, verifyRef := sl.VerifyLLM, sl.VerifyModelRef
+	if hints == nil || sl.AgentForRole == nil {
+		return exec, execRef, llm, verifyRef
+	}
+	if p := hints.Execute; p != "" {
+		if a, err := sl.AgentForRole("execute", p); err == nil {
+			exec, execRef = model.AsExecuter(a), p
+			sl.logf("[subloop] %s execute agent override: %s (plan hint)", sid, p)
+		} else {
+			sl.logf("[subloop] %s execute agent hint %q unusable (%v) — fall back to role config", sid, p, err)
+		}
+	}
+	if p := hints.Verify; p != "" {
+		if a, err := sl.AgentForRole("verify", p); err == nil {
+			ov := sl.VerifyLLM
+			// 保留预算装饰器（verify.Chain 的冻结 Tier 接口不带 Enforcer，
+			// budget.Client 是 verify token 计入预算的唯一通道）；无 Budget 时
+			// （纯测试装配）退化为裸 client。
+			if sl.Budget != nil {
+				ov.Skill.Model = &budget.Client{Base: model.AsClient(a), Enf: sl.Budget}
+			} else {
+				ov.Skill.Model = model.AsClient(a)
+			}
+			llm, verifyRef = ov, p
+			sl.logf("[subloop] %s verify agent override: %s (plan hint)", sid, p)
+		} else {
+			sl.logf("[subloop] %s verify agent hint %q unusable (%v) — fall back to role config", sid, p, err)
+		}
+	}
+	return exec, execRef, llm, verifyRef
 }
 
 // planExecEstimate is the conservative per-call token estimate SubLoop feeds
@@ -205,6 +256,10 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	// 才是完整的失败上下文。run 内每次 verify 驳回会就地更新它，故 attempt N+1 的
 	// plan/execute 看到的永远是「最近一次被驳回的实现」，而非重掷骰子。
 	lastRejectedDiff := sl.loadPriorSceneDiff(ctx, task.Ref)
+	// 合同回灌（跨 run）：找回上一轮 plan 冻结的实现合同（steps+verify_script）——
+	// plan 每轮是全新会话，看不到前任冻结的签名就会盲重设计（#71 三轮 4→3→2
+	// 振荡的病根）。run 内每轮 plan 成功后就地更新它。
+	lastPlanContract := sl.loadPriorPlanContract(task.Ref)
 	// sceneKept：重试耗尽的末轮被驳回时保留的 worktree（供人排查/复用；GC 按 TTL
 	// 清理）。非末轮的 attempt 树仍即建即弃——diff 已进 lastRejectedDiff 与
 	// steps.output_json，弃树不丢信息。
@@ -258,6 +313,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			// 失败现场（plan 侧）：上一轮被驳回实现的 diff（截断后）。与 RetryDiagnosis
 			// 分工：诊断是「为什么被驳回」的元指令，这是「实际写了什么」的现场。
 			RejectedDiff: truncateSceneDiff(lastRejectedDiff),
+			// 合同回灌（plan 侧）：上一轮冻结的实现合同——默认保持稳定，防每轮
+			// 盲重设计签名（#71 振荡）。
+			PriorPlanContract: lastPlanContract,
 		}
 		// 把喂给 plan 的原始提示词落进 step trace（input_json）——dashboard 详情页
 		// 的「初始提示词」读它。RenderPrompt 与 Plan.Run 内部渲染同一模板+输入，
@@ -285,7 +343,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		if emptyPlan {
 			planStatus, planStepErr = "fail", "empty plan"
 		}
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, ModelRef: sl.PlanModelRef, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, ModelRef: sl.PlanModelRef, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr, TokensIn: u.TokensIn, TokensOut: u.TokensOut})
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
@@ -308,6 +366,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			continue
 		}
 		sl.logf("[subloop] %s phase=plan done", sid)
+		// 合同回灌（run 内）：本轮 plan 冻结的合同成为下一轮 plan 的 PriorPlanContract
+		// （attempt N+1 的 plan 不再盲重设计）。
+		lastPlanContract = contractOf(planOut)
 		// plan 产出验收脚本但非法（缺运行命令等）→ tier-1 缺席，落 tier-2。记一行可观测。
 		// plan 未产出是正常分支（判定不可脚本化 → tier-2），不算异常，不打 warning。
 		if vs := planOut.VerifyScript; vs != nil && !vs.Valid() {
@@ -333,6 +394,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
 		}
 
+		// 步骤级 agent override（#71-B）：plan 返回后、execute 前解析 hints——
+		// execute/verify 本轮用哪个 agent 由 plan 的 hint（如有）决定，优先级
+		// step → task（已烘进 role agent）→ role → 默认。
+		exec, execModelRef, llm, verifyModelRef := sl.resolveAgentHints(sid, planOut.AgentHints)
+
 		// ---- execute (in the attempt's worktree, created before plan) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
 		_ = sl.Store.SetInFlight(taskID, "execute")
@@ -351,6 +417,10 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		if criteriaRevised && planOut.CriteriaNotes != "" {
 			execPrompt += "（以上验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）\n"
 		}
+		// 合同可见性（execute 侧）：plan 冻结的步骤（含签名）+ tier-1 验收脚本直达
+		// execute——被合同约束的人必须能看到合同。#71 三轮 blocked 的病根就是
+		// execute 看不到 plan 冻结的 parseClaudeResult 签名，每轮瞎猜一个。
+		execPrompt += executeContractSection(planOut)
 		// 编译错误特化（#46）：上一轮 verify 驳回若是编译/构建类错误，作为独立且显眼的段
 		// 直达 execute prompt——不埋进下面的战报散文（issue 评论）。这是确定性、可机械判定
 		// 的杠杆：字符串特征命中 + prompt 拼装，直接命中 #46「execute 连续多轮不修编译错误」
@@ -378,7 +448,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		execPrompt += "上下文：若任务/issue 引用了设计文档或 spec，开工前先读相关章节；也可浏览仓库的 README/docs 了解项目约定与冻结接口，再动手。\n" +
 			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
-		execOut, u2, err := sl.Execute.Exec(ctx, wt, execPrompt)
+		execOut, u2, err := exec.Exec(ctx, wt, execPrompt)
 		sl.Budget.AfterCall(u2)
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
@@ -388,7 +458,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "execute error: " + err.Error()
-			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", ModelRef: sl.ExecuteModelRef, InputJSON: execPrompt, Error: err.Error()})
+			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", ModelRef: execModelRef, InputJSON: execPrompt, Error: err.Error()})
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
@@ -400,7 +470,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			Out  string `json:"out"`
 			Diff string `json:"diff"`
 		}{Out: execOut, Diff: diff})
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", ModelRef: sl.ExecuteModelRef, InputJSON: execPrompt, OutputJSON: string(rec)})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", ModelRef: execModelRef, InputJSON: execPrompt, OutputJSON: string(rec), TokensIn: u2.TokensIn, TokensOut: u2.TokensOut})
 		sl.logf("[subloop] %s phase=execute done", sid)
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
@@ -414,7 +484,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- verify (Chain of tiers; independent judgment) ----
 		sl.logf("[subloop] %s phase=verify start", sid)
 		_ = sl.Store.SetInFlight(taskID, "verify")
-		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut), diff, effTask.AcceptanceCriteria, priorFailure)
+		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut, llm), diff, effTask.AcceptanceCriteria, priorFailure)
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
 		// 且 failing_criteria 随行落库——修 #10 黑箱（旧 trace 只剩空的 detail=）。
@@ -427,7 +497,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		sl.Store.AppendStep(state.StepRow{
 			RunID: runID, Seq: attempt*10 + 3, Role: "verify",
 			Status:     statusOf2(res.Passed),
-			ModelRef:   sl.VerifyModelRef,
+			ModelRef:   verifyModelRef,
 			OutputJSON: string(vt),
 		})
 		// 逐 tier 落盘 verifications（spec §4.6）：best-effort，trace 不 gate loop。

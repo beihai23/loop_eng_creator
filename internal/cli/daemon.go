@@ -77,6 +77,7 @@ func NewDaemonCmd() *cobra.Command {
 					PlanModelRef:      providerLabel(taskCfg.Models.Plan),
 					ExecuteModelRef:   providerLabel(taskCfg.Models.Execute),
 					VerifyModelRef:    providerLabel(taskCfg.Models.Verify),
+					AgentForRole:      agentForRole(taskCfg),
 				}
 
 				ct := channel.Task{

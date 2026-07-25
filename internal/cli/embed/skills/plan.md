@@ -21,6 +21,19 @@ PLAN: 你是 loop 的计划器。**只读不写**：你只产出计划 JSON，�
 {{.RejectedDiff}}
 ```
 {{end}}
+{{if .PriorPlanContract}}
+## 上一轮冻结的实现合同（plan 契约——默认保持稳定）
+
+下面是上一轮 plan（另一个会话）冻结的实现合同：步骤（含签名）与 tier-1 验收
+脚本。**默认保持合同稳定**：任务与验收标准未变、且驳回理由没有证明合同本身
+错误时，**沿用上一轮的签名与方案，不要重新设计**——上一轮被驳回往往只是
+execute 的实现没对上合同（你的合同是对的），双方同时改只会振荡。只有驳回
+理由证明**合同本身**错误/不可满足时，才修订合同，并在 risks 里说明修订理由。
+
+```json
+{{.PriorPlanContract}}
+```
+{{end}}
 
 ## 规划前：主动探索仓库（只读不写）
 
@@ -52,8 +65,19 @@ PLAN: 你是 loop 的计划器。**只读不写**：你只产出计划 JSON，�
   "risks":  ["..."],
   "revised_criteria": ["..."],   // 可选，见下「验收标准评审」
   "criteria_notes":   "...",     // 修订理由（revised_criteria 非空时必填）
-  "verify_script": { ... 见下，可选 ... }
+  "verify_script": { ... 见下，可选 ... },
+  "agent_hints": { ... 见下，可选，默认不产出 ... }
 }
+
+### agent_hints —— 步骤级 agent 提示（可选，默认不产出）
+
+execute / verify 各可指定一个**已注册**的 provider key（如 "claude"、"codex"），
+让该 phase 用不同于角色默认的 agent 跑（选择优先级：你的 hint → 任务级 agent →
+角色配置 → 全局默认）。铁律：
+- **默认不产出**——角色配置已经过任务级 override，多数任务没有换 agent 的理由。
+- 只在某个 phase 明显更适合另一 provider 时产出（如 execute 需要某 provider 的
+  特有生态、verify 需要与 execute 不同的模型以保证独立性）。
+- 未知的 provider key 会被忽略并回落角色配置，不要发明不存在的 provider。
 
 ### 验收标准评审（revised_criteria —— 可选，由你独立判断）
 

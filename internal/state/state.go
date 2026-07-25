@@ -786,6 +786,25 @@ func (s *Store) LatestExecuteOutputByRef(ref string) (string, error) {
 	return out, err
 }
 
+// LatestPlanOutputByRef 返回该 issue_ref 最近一次成功 plan step 的 output_json
+// （PlanOutput：steps/verify_script/revised_criteria），供「合同回灌」：下一次 run
+// 的 plan 能看到上一轮冻结的实现合同（签名/验收脚本），默认保持稳定而非重设计——
+// #71 三轮 blocked 的病根之一就是 plan 每轮盲重掷签名（4→3→2 与 execute 振荡）。
+// 查不到返回空串 + nil error（按「无既往合同」处理）。
+func (s *Store) LatestPlanOutputByRef(ref string) (string, error) {
+	var out string
+	err := s.db.QueryRow(
+		`SELECT s.output_json FROM steps s
+		 JOIN runs r ON r.id = s.run_id
+		 JOIN tasks t ON t.id = r.task_id
+		 WHERE t.issue_ref = ? AND s.role = 'plan' AND s.status = 'ok'
+		 ORDER BY s.at DESC LIMIT 1`, ref).Scan(&out)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return out, err
+}
+
 // VerificationRow 是 verifications 表的一行，供 TUI 详情面板的逐 tier 状态展示（spec §4.6）。
 type VerificationRow struct {
 	Tier   int

@@ -308,6 +308,12 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 
 循环只依赖 `model.Client` 接口；`claudeClient` 是唯一真实实现，`FakeClient` 供测试注入。
 
+**真实 token 采集（#71-A）**：claude provider 以 `--output-format json` 运行，adapter 从结果信封解析最终文本（`Out` 语义不变——下游 extractJSON 看到的仍是模型自己的输出）与真实 usage（`input_tokens`/`output_tokens`，落 `steps.tokens_in/out`），解析失败一律兜底原文 + `len(Out)` 估算（不致命、不中断）。预算三刹车与 dashboard 的 token 列自此吃真值而非字符数估算。codex 等其余 provider 维持估算兜底，后续按同模式接入。
+
+**步骤级 agent override（#71-B）**：plan 可在产出里带 `agent_hints`（execute/verify 各一个已注册 provider key）。子循环在 plan 返回后、execute 前解析 hint，经 `AgentForRole` 工厂按 forProvider 语义（换 provider+binary、保留 model 名、丢弃旧 provider 的 cmd 旗标）现构 agent；选择优先级 **step hint → 任务级 `agent:` → 角色配置 → 全局默认**。hint 不可用（未知 provider）回落角色配置，不崩。生效步的 `steps.model_ref` 写实际运行的 provider。冻结的 `Client`/`Executer` 接口不动——override 经 `AsClient`/`AsExecuter` 桥接。
+
+**合同可见性（plan↔execute）**：plan 冻结的实现合同（steps 里冻结的签名 + tier-1 验收脚本）直达 execute prompt——被合同约束的人必须能看到合同；上一轮冻结的合同回灌下一轮 plan（run 内内存直传、跨 run 按 issue_ref 从 steps.output_json 读回），plan 默认保持合同稳定、仅在驳回证明合同本身错误时修订。治 #71 三轮 blocked 的振荡病根（双方互不可见、同时对陈旧信号反应）。
+
 ### 8.11 工单通道（可插拔）
 
 `channel.Channel` 接口（见 §6.2）。v1 实现 `githubChannel`：用 go-github，按 `task_label` 过滤 issue；轮询拿新任务和 parked 任务的回复；把战报/求助/人审请求写成评论；用 label 更新 status（如 `loop:needs-review`）。Jira/Linear 后续实现同一接口。

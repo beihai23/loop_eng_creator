@@ -99,6 +99,15 @@ type PlanInput struct {
 	// actually written), so plan can choose to amend it or start over with full
 	// information instead of re-rolling from scratch. Empty = no prior scene.
 	RejectedDiff string
+	// PriorPlanContract is the previous round's frozen implementation contract
+	// (plan steps + verify_script, JSON) — within a run from the last attempt's
+	// own plan output, across runs recovered from the state store by issue_ref.
+	// It exists to stop plan from blindly re-designing the contract every round
+	// (#71 oscillated 4→3→2 return values because each fresh plan session
+	// couldn't see its predecessor's frozen signature): the plan.md block
+	// instructs default-stability (keep the contract unless the rejection proves
+	// the contract itself wrong). Empty = no prior contract.
+	PriorPlanContract string
 }
 type PlanStep struct {
 	Step     string   `json:"step"`
@@ -125,6 +134,10 @@ type PlanOutput struct {
 	// criterion was clarified/rewritten/dropped) — the audit trail surfaced in
 	// the run trace and battle reports. Empty when nothing was revised.
 	CriteriaNotes string `json:"criteria_notes,omitempty"`
+	// AgentHints is plan's optional per-phase provider recommendation (#71-B).
+	// nil = no hint (role config governs). See AgentHints for the selection
+	// priority and validation semantics.
+	AgentHints *AgentHints `json:"agent_hints,omitempty"`
 }
 
 // PlanVerifyScript is the plan-produced tier-1 acceptance script: a runnable
@@ -148,6 +161,18 @@ type PlanVerifyScript struct {
 	File  string   `json:"file,omitempty"`
 	Body  string   `json:"body,omitempty"`
 	Run   []string `json:"run"`
+}
+
+// AgentHints is plan's optional per-phase provider recommendation (#71-B step-
+// level agent override): execute/verify may each name a registered provider key
+// (e.g. "codex"). nil / empty field = no hint → role config governs (which
+// already reflects the task-level `agent:` override). Selection priority:
+// step hint → task agent → role config → global default. SubLoop validates the
+// hinted provider (unregistered names fall back to role config, never crash on
+// untrusted model output) and stamps the step's model_ref with what actually ran.
+type AgentHints struct {
+	Execute string `json:"execute,omitempty"`
+	Verify  string `json:"verify,omitempty"`
 }
 
 // Valid reports whether a plan-produced verify script is runnable — the basic

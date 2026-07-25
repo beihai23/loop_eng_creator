@@ -73,6 +73,7 @@ func NewRunOnceCmd() *cobra.Command {
 				PlanModelRef:    providerLabel(cfg.Models.Plan),
 				ExecuteModelRef: providerLabel(cfg.Models.Execute),
 				VerifyModelRef:  providerLabel(cfg.Models.Verify),
+				AgentForRole:    agentForRole(cfg),
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
 			// Integrate done work: prefer a GitHub PR. push 最终失败 → LAND PARTIAL
@@ -252,6 +253,26 @@ func forProvider(ref config.ModelRef, provider string) config.ModelRef {
 		Provider: provider,
 		Binary:   provider,
 		Name:     ref.Name,
+	}
+}
+
+// agentForRole builds SubLoop's step-level agent factory (#71-B): the role's
+// ModelRef with the provider swapped (forProvider semantics — model name kept,
+// the old provider's cmd flags dropped). Unknown providers surface as errors;
+// SubLoop falls back to the role's configured agent (never crashes on untrusted
+// plan output).
+func agentForRole(cfg *config.Config) func(role, provider string) (model.Agent, error) {
+	return func(role, provider string) (model.Agent, error) {
+		var base config.ModelRef
+		switch role {
+		case "execute":
+			base = cfg.Models.Execute
+		case "verify":
+			base = cfg.Models.Verify
+		default:
+			return nil, fmt.Errorf("agent hint: unknown role %q", role)
+		}
+		return model.NewAgent(forProvider(base, provider))
 	}
 }
 
