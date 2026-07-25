@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -32,7 +33,11 @@ func NewDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "就绪性校验：channel + coding-agent provider 的前置依赖，不启动 daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := mustLoad(repo)
+			cfg, err := loadConfig(filepath.Join(repo, ".loop", "config.yaml"))
+			if err != nil {
+				fmt.Printf("❌ config load：%v\n", err)
+				return err
+			}
 			if channelFlag != "" {
 				cfg.Channel.Provider = channelFlag
 			}

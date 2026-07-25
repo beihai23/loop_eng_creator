@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"sort"
+	"strings"
 
 	"loop-eng/internal/config"
 )
@@ -59,25 +61,88 @@ type Agent interface {
 	Check(ctx context.Context) error
 }
 
-// NewAgent dispatches an Agent by ref.Provider. "" and "claude" both resolve to
-// the claude provider so the default config (no provider field) keeps today's
-// `claude -p` out-of-box behavior. An unknown provider returns an error —
-// callers (buildModels) surface it rather than silently falling back.
-func NewAgent(ref config.ModelRef) (Agent, error) {
-	switch p := ref.Provider; p {
-	case "", "claude":
-		return &claudeAgent{c: NewClaudeClient(binaryOf(ref, "claude"), ref.Name, ref.Cmd)}, nil
-	case "codex":
-		return newCodexAgent(ref), nil
-	case "opencode":
-		return newOpencodeAgent(ref), nil
-	case "kimi":
-		return newKimiAgent(ref), nil
-	case "kilo":
-		return newKiloAgent(ref), nil
-	default:
-		return nil, fmt.Errorf("model: unknown provider %q (want one of claude, codex, opencode, kimi, kilo)", p)
+// ProviderFactory builds an Agent for one provider key. Each entry in Providers
+// is a factory that knows how to construct its provider's adapter from a
+// ModelRef. This is the single source of truth for the provider set — NewAgent
+// dispatch, config validation (ValidateProviders), and the interactive config
+// menu all read Providers, so adding a provider is a one-line map edit (spec
+// §8.10 — the shell-out is provider-neutral).
+type ProviderFactory func(config.ModelRef) Agent
+
+// Providers is the registry of every supported coding-agent provider. The
+// default ("") provider is NOT a key here — ResolveProvider maps "" → "claude"
+// before lookup, so the registry holds only explicit providers and a config
+// with no provider field keeps today's `claude -p` out-of-box behavior.
+var Providers = map[string]ProviderFactory{
+	"claude": func(ref config.ModelRef) Agent {
+		return &claudeAgent{c: NewClaudeClient(binaryOf(ref, "claude"), ref.Name, ref.Cmd)}
+	},
+	"codex":    func(ref config.ModelRef) Agent { return newCodexAgent(ref) },
+	"opencode": func(ref config.ModelRef) Agent { return newOpencodeAgent(ref) },
+	"kimi":     func(ref config.ModelRef) Agent { return newKimiAgent(ref) },
+	"kilo":     func(ref config.ModelRef) Agent { return newKiloAgent(ref) },
+}
+
+// ResolveProvider normalizes a provider key: "" → "claude" (the out-of-box
+// default; a config that sets no provider field keeps `claude -p` behavior).
+// Every other value is returned as-is — validity is checked against Providers
+// by the caller (NewAgent / ValidateProviders).
+func ResolveProvider(p string) string {
+	if p == "" {
+		return "claude"
 	}
+	return p
+}
+
+// RegisteredProviders returns the sorted list of registered provider keys — the
+// single source of truth consumed by NewAgent's error message, ValidateProviders,
+// and the interactive config menu. Sorted so output (errors, menus) is stable.
+func RegisteredProviders() []string {
+	names := make([]string, 0, len(Providers))
+	for k := range Providers {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// NewAgent dispatches an Agent by ref.Provider via the Providers registry. ""
+// resolves to claude (ResolveProvider), so the default config (no provider
+// field) keeps today's `claude -p` out-of-box behavior. An unknown provider
+// returns an error carrying the full valid set — callers (buildModels /
+// ValidateProviders / doctor) surface it rather than silently falling back.
+func NewAgent(ref config.ModelRef) (Agent, error) {
+	f, ok := Providers[ResolveProvider(ref.Provider)]
+	if !ok {
+		return nil, fmt.Errorf("model: unknown provider %q (want one of: %s)", ref.Provider, strings.Join(RegisteredProviders(), ", "))
+	}
+	return f(ref), nil
+}
+
+// ValidateProviders checks every model role's Provider against the Providers
+// registry. It is the single config-side validation entry shared by the CLI
+// config-load path (loadConfig) and doctor — the same registry NewAgent
+// dispatches on — so an unknown provider fails fast at load time instead of
+// surfacing mid-run when NewAgent shells out. It deliberately does NOT call
+// config.validate (the model package must not depend on config's internals, and
+// a Config that fails other validation — e.g. a zero Budget — should still be
+// able to report a bad provider). Empty/claude and every registered provider
+// validate clean; anything else yields a role-named error carrying the valid set.
+func ValidateProviders(cfg *config.Config) error {
+	for _, r := range []struct {
+		role string
+		ref  config.ModelRef
+	}{
+		{"triage", cfg.Models.Triage},
+		{"plan", cfg.Models.Plan},
+		{"execute", cfg.Models.Execute},
+		{"verify", cfg.Models.Verify},
+	} {
+		if _, ok := Providers[ResolveProvider(r.ref.Provider)]; !ok {
+			return fmt.Errorf("models.%s: unknown provider %q (want one of: %s)", r.role, r.ref.Provider, strings.Join(RegisteredProviders(), ", "))
+		}
+	}
+	return nil
 }
 
 // binaryOf returns ref.Binary when set, else the provider's conventional default

@@ -15,17 +15,20 @@ import (
 //go:embed embed/skills/*.md
 var skillFiles embed.FS
 
-// defaultConfig: all roles via `claude -p`, NO model pinned (model-agnostic; no
-// SDK, no API key, no alias drift). There is NO static tier-1 script list —
-// tier-1 acceptance scripts are produced per-task by the planner and run in the
-// worktree. Per-role model opt-in: set `name` in .loop/config.yaml if a role
-// needs a different model.
+// defaultConfig: every role pinned to `provider: claude` (the coding-agent
+// shell-out target — out-of-box `claude -p`, the same path as before #68), NO
+// model name pinned (model-agnostic; no SDK, no API key, no alias drift). The
+// legacy `via: claude-p` field is kept for backward compatibility (config.Load
+// still parses it) but is no longer read by NewAgent — `provider` is the source
+// of truth. There is NO static tier-1 script list — tier-1 acceptance scripts
+// are produced per-task by the planner and run in the worktree. Per-role model
+// opt-in: set `name` in .loop/config.yaml if a role needs a different model.
 var defaultConfig = `
 models:
-  triage:  { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  plan:    { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  execute: { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  verify:  { via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  triage:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  plan:    { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  execute: { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  verify:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
