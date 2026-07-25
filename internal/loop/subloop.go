@@ -1,6 +1,9 @@
 // Package loop implements the per-task control loop (SubLoop): plan → execute
-// (in a fresh worktree) → verify (Chain of tiers) → writeback (state trace +
-// channel report), with bounded retries governed by the budget Enforcer.
+// → verify (Chain of tiers) → writeback (state trace + channel report), with
+// bounded retries governed by the budget Enforcer. Each attempt creates one
+// fresh worktree up front and plan/execute/verify all run inside it: plan's
+// exploration (and any stray writes) lands on the same disposable tree the
+// attempt will discard, so the base repo is never touched before verify passes.
 package loop
 
 import (
@@ -36,8 +39,10 @@ type Outcome struct {
 }
 
 // SubLoop drives a single task through plan→execute→verify→writeback, retrying
-// on verify failure up to Budget.MaxRetries. Each attempt executes in a fresh
-// worktree; a non-passing attempt discards that worktree.
+// on verify failure up to Budget.MaxRetries. Each attempt runs plan, execute,
+// and verify in one fresh worktree created at attempt start; a non-passing
+// attempt discards that worktree (plan included — its exploration is read-only
+// by contract, and any violation dies with the discarded tree).
 type SubLoop struct {
 	Repo              string
 	Store             *state.Store
@@ -195,6 +200,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	if fb, err := sl.Store.PopResumeFeedback(taskID); err == nil && fb != "" {
 		priorFailure = fb
 	}
+	// 失败现场回灌（跨 run）：找回该 issue 上一轮 execute 的 diff。判决（驳回理由）
+	// 经战报/评论/priorFailure 传递，现场（实际写出的代码）经这里传递——两者合起来
+	// 才是完整的失败上下文。run 内每次 verify 驳回会就地更新它，故 attempt N+1 的
+	// plan/execute 看到的永远是「最近一次被驳回的实现」，而非重掷骰子。
+	lastRejectedDiff := sl.loadPriorSceneDiff(ctx, task.Ref)
+	// sceneKept：重试耗尽的末轮被驳回时保留的 worktree（供人排查/复用；GC 按 TTL
+	// 清理）。非末轮的 attempt 树仍即建即弃——diff 已进 lastRejectedDiff 与
+	// steps.output_json，弃树不丢信息。
+	sceneKept := ""
 	// lastCompileError 携带「上一轮 verify 驳回若是编译/构建类错误」的原始 detail，作为
 	// 结构化的一手信号喂给下一轮 execute prompt 的独立显眼段（#46）：编译错误原本要绕
 	// verify detail → issue 评论 → collectIssueComments → 战报散文 才到 execute，信号被
@@ -210,10 +224,21 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 预算刹车·重试：每轮入口记一行（spec §8.8）
 		sl.Store.AppendBudget(runID, "task", "retry", attempt, sl.Budget.MaxRetries)
 
+		// ---- worktree：attempt 开头创建，plan/execute/verify 共用 ----
+		// plan 也在 worktree 里跑（RunIn → cmd.Dir=wt）：探索内容与 HEAD 一致，
+		// 但任何违反「只读」契约的落笔都写进这棵随 attempt 丢弃的树，主仓库在
+		// verify 通过前零接触（§8.9 回滚原语自此覆盖 plan 阶段）。
+		wt, err := isolation.Create(sl.Repo, taskID+"-r"+fmt.Sprint(attempt))
+		if err != nil {
+			_ = sl.Store.ClearInFlight()
+			return Outcome{Status: "error", Detail: err.Error()}, err
+		}
+
 		// ---- plan ----
 		sl.logf("[subloop] %s phase=plan start", sid)
 		_ = sl.Store.SetInFlight(taskID, "plan")
 		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
+			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
@@ -230,12 +255,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			// 与「发生了什么」的战报分离——经 plan embed 的 {{.RetryDiagnosis}} 条件块渲染进
 			// planPrompt，落进 plan step 的 input_json（attempt≥2 的 seq≥20 行）可审计。
 			RetryDiagnosis: retryDiagnosisFor(attempt, priorFailure),
+			// 失败现场（plan 侧）：上一轮被驳回实现的 diff（截断后）。与 RetryDiagnosis
+			// 分工：诊断是「为什么被驳回」的元指令，这是「实际写了什么」的现场。
+			RejectedDiff: truncateSceneDiff(lastRejectedDiff),
 		}
 		// 把喂给 plan 的原始提示词落进 step trace（input_json）——dashboard 详情页
 		// 的「初始提示词」读它。RenderPrompt 与 Plan.Run 内部渲染同一模板+输入，
 		// 文本一致；渲染失败（模板错）时 Plan.Run 同样会报 render 错，这里留空即可。
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
-		planOut, u, err := sl.Plan.Run(ctx, planIn)
+		planOut, u, err := sl.Plan.RunIn(ctx, planIn, wt)
 		sl.Budget.AfterCall(u)
 		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
 		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
@@ -259,6 +287,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 1, Role: "plan", Status: planStatus, ModelRef: sl.PlanModelRef, InputJSON: planPrompt, OutputJSON: planOutJSON, Error: planStepErr})
 		if err != nil {
+			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=plan fail: %v", sid, err)
 			if errors.Is(err, model.ErrClaudeFatal) {
 				_ = sl.Store.ClearInFlight()
@@ -272,6 +301,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			// priorFailure 用中文锚点「plan 产出空计划」：MaxRetries 耗尽时 blocked
 			// detail = "retries exhausted: " + priorFailure，故含此字样；下一轮 plan 的
 			// 重试诊断也会逐字引用它，提示「上一轮你给了空计划」。
+			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=plan fail: plan 产出空计划 (empty plan)", sid)
 			priorFailure = "plan 产出空计划"
 			sl.logRetry(sid, attempt, priorFailure)
@@ -298,18 +328,14 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
 		if ok, _ := sl.Store.CancelRequested(taskID); ok {
 			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
 		}
 
-		// ---- execute (in a fresh worktree) ----
+		// ---- execute (in the attempt's worktree, created before plan) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
 		_ = sl.Store.SetInFlight(taskID, "execute")
-		wt, err := isolation.Create(sl.Repo, taskID+"-r"+fmt.Sprint(attempt))
-		if err != nil {
-			_ = sl.Store.ClearInFlight()
-			return Outcome{Status: "error", Detail: err.Error()}, err
-		}
 		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
@@ -343,6 +369,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			execPrompt += "战报/反馈（issue 评论，含历轮驳回与人审意见）——务必据此修正代码，" +
 				"不要只对照验收标准就说「已完成」:\n" + issueContext + "\n"
 		}
+		// 失败现场回灌（execute 侧）：上一轮被驳回实现的 diff + 驳回理由直达 execute。
+		// execute 过去只看得到判决散文（战报/评论），看不到被驳回的代码本身——驳回理由
+		// 引用的代码对象在它的上下文里不存在。有现场才注入，空串不影响首次 attempt。
+		if sec := rejectedSceneSection(priorFailure, lastRejectedDiff); sec != "" {
+			execPrompt += sec
+		}
 		execPrompt += "上下文：若任务/issue 引用了设计文档或 spec，开工前先读相关章节；也可浏览仓库的 README/docs 了解项目约定与冻结接口，再动手。\n" +
 			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
@@ -374,6 +406,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
 		if ok, _ := sl.Store.CancelRequested(taskID); ok {
 			sl.logf("[subloop] %s cancelled by TUI at phase boundary", sid)
+			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "cancelled", "cancelled by TUI"), nil
 		}
@@ -468,11 +501,26 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			lastCompileError = ""
 		}
 		priorFailure = res.Detail
-		isolation.Discard(sl.Repo, wt)
+		// 现场回灌（run 内）：本轮被驳回的 diff 成为下一轮 plan/execute 的上下文——
+		// 不绕 SQLite，直接用内存里的 diff（同一份已落 execute step output_json）。
+		lastRejectedDiff = diff
+		// 末轮（重试即将耗尽）保留这棵被驳回的 worktree：供人排查/复用，GC 按 TTL
+		// 清理。非末轮即弃——下一 attempt 从零建新树，diff 已在 lastRejectedDiff 与
+		// steps.output_json 双份留存，弃树不丢信息。
+		if sl.Budget.ShouldRetry(attempt + 1) {
+			isolation.Discard(sl.Repo, wt)
+		} else {
+			sceneKept = wt
+			sl.logf("[subloop] %s final attempt rejected: scene worktree preserved at %s", sid, wt)
+		}
 		sl.logRetry(sid, attempt, priorFailure)
 	}
 	_ = sl.Store.ClearInFlight()
-	return sl.report(ctx, taskID, task, "blocked", "retries exhausted: "+priorFailure), nil
+	blockedDetail := "retries exhausted: " + priorFailure
+	if sceneKept != "" {
+		blockedDetail += "\n（末轮被驳回实现的 worktree 保留于 " + sceneKept + "，供排查/复用；GC 将按 TTL 清理）"
+	}
+	return sl.report(ctx, taskID, task, "blocked", blockedDetail), nil
 }
 
 // logRetry logs a retry event and sleeps the backoff. The backoff is

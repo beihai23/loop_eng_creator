@@ -149,6 +149,20 @@ func NewDaemonCmd() *cobra.Command {
 				IngestMin: 3 * time.Second,
 				IngestMax: 10 * time.Second,
 			}
+			// worktree 现场 GC：每 tick 一次（状态驱动 + 48h 宽限期；blocked 现场
+			// 缓存按 SceneTTL 回收）。repo 路径在 CLI 层，故以闭包注入 engine。
+			eng.GC = func(ctx context.Context) error {
+				acts, err := loop.GCWorktrees(repo, st, loop.DefaultGCPolicy())
+				if err != nil {
+					return err
+				}
+				for _, a := range acts {
+					if a.Delete {
+						fmt.Printf("[daemon] gc: deleted %s (%s)\n", a.Name, a.Reason)
+					}
+				}
+				return nil
+			}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

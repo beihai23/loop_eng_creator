@@ -21,12 +21,26 @@ type Skill[I any, O any] struct {
 }
 
 func (s Skill[I, O]) Run(ctx context.Context, input I) (O, model.Usage, error) {
+	return s.RunIn(ctx, input, "")
+}
+
+// RunIn is Run with an optional working directory for the model call. When
+// dir is non-empty AND the skill's Model implements model.DirClient, the call
+// runs with that directory (plan inside the attempt worktree); otherwise it
+// falls back to plain Model.Call (test fakes, clients without dir support).
+func (s Skill[I, O]) RunIn(ctx context.Context, input I, dir string) (O, model.Usage, error) {
 	var zero O
 	prompt, err := render(s.PromptTmpl, input)
 	if err != nil {
 		return zero, model.Usage{}, fmt.Errorf("render skill %s: %w", s.Name, err)
 	}
-	out, usage, err := s.Model.Call(ctx, prompt)
+	var out string
+	var usage model.Usage
+	if dc, ok := s.Model.(model.DirClient); ok && dir != "" {
+		out, usage, err = dc.CallIn(ctx, dir, prompt)
+	} else {
+		out, usage, err = s.Model.Call(ctx, prompt)
+	}
 	if err != nil {
 		return zero, usage, err
 	}
@@ -77,6 +91,14 @@ type PlanInput struct {
 	// BattleReport (which is "what happened" history/context); rendering it through
 	// its own {{.RetryDiagnosis}} block keeps the two separable for plan.
 	RetryDiagnosis string
+	// RejectedDiff is the previous attempt's rejected implementation (unified
+	// diff), when one exists: within a run it is the last verify-rejected
+	// attempt's diff; across runs it is the prior run's execute diff recovered
+	// from the state store by issue_ref. BattleReport/RetryDiagnosis carry the
+	// *verdict* (why it was rejected); this carries the *scene* (what was
+	// actually written), so plan can choose to amend it or start over with full
+	// information instead of re-rolling from scratch. Empty = no prior scene.
+	RejectedDiff string
 }
 type PlanStep struct {
 	Step     string   `json:"step"`

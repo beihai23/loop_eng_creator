@@ -75,6 +75,12 @@ type Engine struct {
 	IngestMin time.Duration
 	IngestMax time.Duration
 
+	// GC is an optional per-tick hook for worktree scene garbage collection
+	// (loop.GCWorktrees, wired by the CLI layer which owns the repo path). Nil =
+	// no GC (tests). Errors are logged and never stall the tick — GC losing a
+	// cycle just means scene caches live a little longer.
+	GC func(ctx context.Context) error
+
 	coolUntil time.Time
 
 	// ingestMu serializes ingest() calls (the main tick's step 1 and the
@@ -166,6 +172,13 @@ func (e *Engine) tick(ctx context.Context) error {
 	// ---- step 3.5: drain TUI commands (spec §4.2/§7) ----
 	if err := e.drainCommands(ctx); err != nil {
 		e.logf("[daemon] drain commands error: %v", err)
+	}
+
+	// ---- step 3.6: worktree scene GC（best-effort：失败只记日志，下个 tick 再来）----
+	if e.GC != nil {
+		if err := e.GC(ctx); err != nil {
+			e.logf("[daemon] gc error: %v", err)
+		}
 	}
 
 	// ---- step 4: dispatch (spec §7.1 step 3) ----

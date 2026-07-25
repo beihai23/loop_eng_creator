@@ -27,3 +27,13 @@ type Client interface {
 type Executer interface {
 	Exec(ctx context.Context, worktreeDir, prompt string) (output string, usage Usage, err error)
 }
+
+// DirClient is an OPTIONAL extension of Client for callers that can supply a
+// working directory (plan runs inside the attempt's worktree so its exploration
+// — and any stray writes — land on the disposable worktree, not the base repo).
+// Client.Call stays frozen: consumers type-assert to DirClient and fall back to
+// Call when the concrete client does not implement it (e.g. test fakes).
+type DirClient interface {
+	Client
+	CallIn(ctx context.Context, dir, prompt string) (output string, usage Usage, err error)
+}

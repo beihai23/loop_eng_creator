@@ -156,6 +156,12 @@ func (c *ClaudeClient) Call(ctx context.Context, prompt string) (string, Usage, 
 	return c.callWithRetry(ctx, "", c.Model, prompt)
 }
 
+// CallIn implements DirClient: like Call but with cmd.Dir=dir (plan inside the
+// attempt worktree). Retried on retryable failure, same as Call/Exec.
+func (c *ClaudeClient) CallIn(ctx context.Context, dir, prompt string) (string, Usage, error) {
+	return c.callWithRetry(ctx, dir, c.Model, prompt)
+}
+
 // Exec implements Executer: `claude -p [--model M] <Args>` with cmd.Dir=worktreeDir
 // so the agent's edits land on the isolated worktree. Retried on retryable failure.
 func (c *ClaudeClient) Exec(ctx context.Context, worktreeDir, prompt string) (string, Usage, error) {

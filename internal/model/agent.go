@@ -105,6 +105,14 @@ func (c *agentClient) Call(ctx context.Context, prompt string) (string, Usage, e
 	return r.Out, r.Usage, err
 }
 
+// CallIn implements DirClient: like Call but with AgentRequest.Workdir=dir
+// (plan inside the attempt worktree). Provider-neutral — each adapter maps
+// Workdir onto its native mechanism (claude: cmd.Dir; codex: --cd + cmd.Dir).
+func (c *agentClient) CallIn(ctx context.Context, dir, prompt string) (string, Usage, error) {
+	r, err := c.a.Run(ctx, AgentRequest{Workdir: dir, Prompt: prompt})
+	return r.Out, r.Usage, err
+}
+
 // AsClient returns a Client view over a (Call without directory).
 func AsClient(a Agent) Client { return &agentClient{a: a} }
 
@@ -123,6 +131,7 @@ func AsExecuter(a Agent) Executer { return &agentExecuter{a: a} }
 
 // Compile-time guards: the adapters satisfy the frozen interfaces.
 var (
-	_ Client   = (*agentClient)(nil)
-	_ Executer = (*agentExecuter)(nil)
+	_ Client    = (*agentClient)(nil)
+	_ DirClient = (*agentClient)(nil)
+	_ Executer  = (*agentExecuter)(nil)
 )

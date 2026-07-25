@@ -264,7 +264,7 @@ daemon 任何阶段都不阻塞在人上（原则 7）。**没有并发、没有
 - **tier 2 —— LLM 新鲜上下文。** `claude -p` 开全新会话，只给 **diff + 验收标准**（重试时再加**上一轮的验证失败详情**——绝不是 execute/plan 的输出）。绝不给执行对话。处理脚本覆盖不到的语义标准。
 - **tier 3 —— 异步人审。** 子循环不阻塞：发 review-request 评论（diff 摘要 + 验收标准 + 要人判断的点）→ 置 `needs-review` → park → 释放活跃位 → 子循环结束。daemon 轮询到人在该 issue 上的回复后，带反馈恢复任务。人 accept → 写回 → done；reject/反馈 → 带反馈重试。用于业务正确性、审美、外部依赖正确性这类判断。
 
-**顺序：** tier 1 → 2 → 3。tier 1 不过就短路（不浪费 tier 2/3）。tier 1/2 任何一层不过 → 失败成为下一轮 计划 的反馈，预算内重试。**执行端的自报只触发这条链，绝不是结论**（原则 3，结构性强制：execute 的输出不是任何一层「通过」判定的输入）。
+**顺序：** tier 1 → 2 → 3。tier 1 不过就短路（不浪费 tier 2/3）。tier 1/2 任何一层不过 → 失败成为下一轮 计划 的反馈，预算内重试。**反馈分两路，判决与现场都传**：判决（驳回理由）经 priorFailure / verify-fail 评论 / 重试诊断；现场（被驳回的完整 diff）在 run 内由驳回处就地更新、跨 run 由 Run 开头按 issue_ref 从 steps.output_json 读回，两路都注入下一轮 plan（`RejectedDiff`）与 execute prompt——下一轮是「带完整信息决定沿用修正还是推倒重来」，不是对着判决书从零重掷。**执行端的自报只触发这条链，绝不是结论**（原则 3，结构性强制：execute 的输出不是任何一层「通过」判定的输入）。
 
 **验证查的是验收标准，不是 plan。** plan 是预测、用完即弃；验收标准才是契约。执行偏离 plan 是常态（执行 agentic、可自适应——Occam 那轮已定：不把执行绑死在 plan 上），只要 diff 满足验收标准就过——**偏离 plan 不算「脱节」**，因为验证从不依赖 plan。真正的脱节只有两种：① 实现没满足标准（→ 正常失败、重试）；② 执行发现标准本身错/不全（→ 见 §10，criteria-mismatch 走人，**执行端不得自改标准**）。
 
@@ -291,7 +291,9 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 
 ### 8.9 worktree 隔离
 
-每个子循环在一个全新 git worktree 里执行，从当前仓库 HEAD 分叉，路径 `.loop/worktrees/<run-id>/`。验证通过时，worktree 的 diff 就是产物（后续：提为 PR）。失败/中止时，worktree 分支丢弃。这是回滚原语（文章 2）：「跑飞了丢这个分支」。**parked 任务（等人）期间其 worktree 保留**，恢复时续用。
+每轮 attempt 在开头创建一个全新 git worktree（从当前仓库 HEAD 分叉，路径 `.loop/worktrees/<run-id>/`），**plan / execute / verify 三者共用这一棵树**：plan 在其中只读探索（内容与 HEAD 一致，且其任何违规落笔都随树丢弃，主仓库在验收通过前零接触），execute 在其中实现，tier-1 在其中跑验收脚本。验证通过时，worktree 的 diff 就是产物（后续：提为 PR）。失败/中止时，worktree 分支丢弃——包括 plan 阶段失败（空计划 / 调用错误），树同样即建即弃。**例外一：重试耗尽的末轮被驳回时，该 worktree 作为失败现场保留**（供人排查/复用；其 diff 另存于 steps.output_json 并回灌下一次 run，见 §8.6），blocked 战报注明路径。这是回滚原语（文章 2）：「跑飞了丢这个分支」——注意安全边界在 **landing**（未验证的工作永不合并进 main），不在树的存亡；保留现场树不违反回滚语义。**例外二：parked 任务（等人）期间其 worktree 保留**，恢复时续用。
+
+**GC（现场是缓存，SQLite 是档案）**：保留的树由状态驱动 GC 回收——48h 宽限期内一律不删（防状态滞后误删活树）；宽限期后按 task_status 判定：running/needs-review/needs-info/needs-human-decision/done 保留，blocked 超 7 天 TTL 删，cancelled/error/孤儿删。触发点两个：daemon 每 tick 一次 + `loop-eng clean`（`--dry-run` 可看判定）。GC 的正确性不依赖树存活——现场的档案在 steps.output_json（append-only），树只是缓存，误删丢的是调试便利，不是证据。
 
 ### 8.10 模型集成（单路径：`claude -p`）
 

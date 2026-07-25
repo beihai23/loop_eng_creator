@@ -768,6 +768,24 @@ func (s *Store) StepsOfTask(taskID string) ([]StepRow, error) {
 	return scanStepRows(rows)
 }
 
+// LatestExecuteOutputByRef 返回该 issue_ref 最近一次成功 execute step 的
+// output_json（{out, diff}），供「失败现场回灌」：下一次 run（即便run-once 每次
+// 新建 task 行）按 issue_ref 跨 task 行找回上一轮被驳回实现的 diff。查不到
+// （从没跑过 execute / 全部失败）返回空串 + nil error——调用方按「无现场」处理。
+func (s *Store) LatestExecuteOutputByRef(ref string) (string, error) {
+	var out string
+	err := s.db.QueryRow(
+		`SELECT s.output_json FROM steps s
+		 JOIN runs r ON r.id = s.run_id
+		 JOIN tasks t ON t.id = r.task_id
+		 WHERE t.issue_ref = ? AND s.role = 'execute' AND s.status = 'ok'
+		 ORDER BY s.at DESC LIMIT 1`, ref).Scan(&out)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return out, err
+}
+
 // VerificationRow 是 verifications 表的一行，供 TUI 详情面板的逐 tier 状态展示（spec §4.6）。
 type VerificationRow struct {
 	Tier   int
