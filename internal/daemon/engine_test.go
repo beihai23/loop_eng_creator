@@ -574,6 +574,117 @@ func TestDrainCommandsIdempotent(t *testing.T) {
 	}
 }
 
+// TestDrainCommandsResumeCancelled 守住：cancel 后反悔的自助通道——对 cancelled
+// 任务发 resume 命令，drainCommands 应迁 cancelled→new、把 payload 落盘为 resume
+// 反馈、命令标记 applied。复用 newTestStore/statusOf/scriptedChannel（同 package）。
+func TestDrainCommandsResumeCancelled(t *testing.T) {
+	st := newTestStore(t)
+	eng := &Engine{Channel: &scriptedChannel{}, Store: st, Interval: time.Second}
+
+	id, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#1", Description: "d"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := st.AppendTransition(id, "new", "cancelled", "cancelled by TUI"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if err := st.InsertCommand(id, "resume", "retry with fix Y"); err != nil {
+		t.Fatalf("insert resume cmd: %v", err)
+	}
+
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	// cancelled → new
+	if got := statusOf(t, st, id); got != "new" {
+		t.Fatalf("status=%q want new", got)
+	}
+	// payload 落盘为 resume 反馈
+	fb, err := st.PopResumeFeedback(id)
+	if err != nil {
+		t.Fatalf("pop feedback: %v", err)
+	}
+	if !strings.Contains(fb, "fix Y") {
+		t.Fatalf("feedback=%q want contains 'fix Y'", fb)
+	}
+	// transitions 含一条 cancelled→new，reason 前缀 tui resume:
+	trans, err := st.Transitions(id)
+	if err != nil {
+		t.Fatalf("transitions: %v", err)
+	}
+	var saw bool
+	for _, tr := range trans {
+		if tr.From == "cancelled" && tr.To == "new" && strings.HasPrefix(tr.Reason, "tui resume:") {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatalf("no cancelled→new resume transition in %+v", trans)
+	}
+	// 命令标记 applied（pending 清零）
+	pend, err := st.PendingCommands()
+	if err != nil {
+		t.Fatalf("pending cmds: %v", err)
+	}
+	if len(pend) != 0 {
+		t.Fatalf("pending=%d want 0", len(pend))
+	}
+}
+
+// TestDrainCommandsResumeIdempotentTerminal 回归：把 cancelled 加进 resume 白
+// 名单后，done/error 仍应是 no-op——不迁移、不写 feedback，只回写 applied_at。
+func TestDrainCommandsResumeIdempotentTerminal(t *testing.T) {
+	st := newTestStore(t)
+	eng := &Engine{Channel: &scriptedChannel{}, Store: st, Interval: time.Second}
+
+	mk := func(term string) string {
+		id, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#" + term, Description: "d"})
+		if err != nil {
+			t.Fatalf("insert %s: %v", term, err)
+		}
+		if err := st.AppendTransition(id, "new", term, "ran"); err != nil {
+			t.Fatalf("transition %s: %v", term, err)
+		}
+		if err := st.InsertCommand(id, "resume", "should be ignored"); err != nil {
+			t.Fatalf("insert resume cmd %s: %v", term, err)
+		}
+		return id
+	}
+	doneID := mk("done")
+	errID := mk("error")
+
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	for _, c := range []struct{ id, want string }{{doneID, "done"}, {errID, "error"}} {
+		if got := statusOf(t, st, c.id); got != c.want {
+			t.Fatalf("status=%q want %q (resume must be idempotent)", got, c.want)
+		}
+		fb, err := st.PopResumeFeedback(c.id)
+		if err != nil || fb != "" {
+			t.Fatalf("%s feedback=%q want empty (no side effect)", c.want, fb)
+		}
+		trans, err := st.Transitions(c.id)
+		if err != nil {
+			t.Fatalf("transitions %s: %v", c.want, err)
+		}
+		for _, tr := range trans {
+			if tr.To == "new" {
+				t.Fatalf("%s task got a →new transition %+v (must be no-op)", c.want, tr)
+			}
+		}
+	}
+	pend, err := st.PendingCommands()
+	if err != nil {
+		t.Fatalf("pending cmds: %v", err)
+	}
+	if len(pend) != 0 {
+		t.Fatalf("pending=%d want 0 (terminal resume must still be marked applied)", len(pend))
+	}
+}
+
 // growingChannel models a channel whose visible task set grows over time:
 // ListNewTasks always returns the *current* snapshot (no per-call advance), and
 // add() appends a task mid-flight. This simulates a human filing a new issue
