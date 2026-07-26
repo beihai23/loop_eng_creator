@@ -17,6 +17,17 @@ import (
 // single transient ListNewTasks/PostComment failure doesn't abort the whole run.
 const ghRetry = 3
 
+// ghFetchConcurrency bounds the goroutine pool ListReplies / GetTaskStates use
+// to fan N refs across concurrent `gh issue view` calls. Previously each ref
+// was fetched serially, so N parked tasks meant N sequential round-trips (each
+// with its own 3× retry / 2s-4s backoff) blocking the whole daemon tick — a
+// network blip could stall dispatch for minutes. The pool makes the wall-clock
+// ≈ ⌈N/pool⌉ × single-call latency instead of N×, while the semaphore keeps the
+// fan-out from hammering the API / exhausting fd slots when capRefs still leaves
+// a large batch. ghExec is ctx-aware (#97), so pool goroutines pass ctx through
+// and a tick cancel kills every in-flight process.
+const ghFetchConcurrency = 8
+
 // loopStatusNames is the loop:<status> family the engine moves tasks through —
 // the channel-visible outcomes the daemon reports via UpdateStatus / report()
 // (see internal/loop/subloop.go and internal/daemon/engine.go). EnsureLabels
@@ -128,7 +139,7 @@ func parseIssueCommentsJSON(raw []byte, since time.Time) ([]Reply, error) {
 				continue
 			}
 		}
-		replies = append(replies, Reply{Body: cm.Body})
+		replies = append(replies, Reply{Body: cm.Body, CreatedAt: cm.CreatedAt})
 	}
 	return replies, nil
 }
@@ -277,20 +288,60 @@ func (g *GitHub) IsPRMerged(ctx context.Context, branch string) (bool, error) {
 	return len(prs) > 0, nil
 }
 
+// ListReplies fetches comments for every ref through a bounded goroutine pool
+// (ghFetchConcurrency) instead of serially — N refs now resolve in
+// ~⌈N/pool⌉ round-trips, not N, so a network blip on one ref no longer blocks
+// the whole daemon tick. refs are first capped to maxRefsPerTick (overflow is
+// logged, not silently dropped). A failing ref logs and continues; the first
+// error is returned but partial results are still back-filled so the daemon can
+// process whichever refs succeeded. ctx flows into every gh call, so a tick
+// cancel aborts every in-flight process.
 func (g *GitHub) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
+	refs = capRefs("github.ListReplies", refs)
 	out := make(map[string][]Reply, len(refs))
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, ghFetchConcurrency)
+		firstErr error
+	)
 	for _, ref := range refs {
-		raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "comments")
-		if err != nil {
-			return nil, err
-		}
-		replies, err := parseIssueCommentsJSON(raw, since)
-		if err != nil {
-			return nil, err
-		}
-		out[ref] = replies
+		wg.Add(1)
+		go func(ref string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "comments")
+			if err != nil {
+				mu.Lock()
+				log.Printf("channel/github: ListReplies ref %s failed: %v (continuing other refs)", ref, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			replies, err := parseIssueCommentsJSON(raw, since)
+			if err != nil {
+				mu.Lock()
+				log.Printf("channel/github: ListReplies ref %s parse failed: %v (continuing other refs)", ref, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			out[ref] = replies
+			mu.Unlock()
+		}(ref)
 	}
-	return out, nil
+	wg.Wait()
+	return out, firstErr
 }
 
 type ghIssueView struct {
@@ -302,27 +353,65 @@ type ghIssueLabel struct {
 	Name string `json:"name"`
 }
 
+// GetTaskStates fetches each ref's open/labels state through the same bounded
+// goroutine pool as ListReplies — N terminal refs (reconcile batch) resolve in
+// ~⌈N/pool⌉ round-trips instead of N. refs are capped to maxRefsPerTick first
+// (overflow logged, not silently dropped). A failing ref logs and continues; the
+// first error is returned but partial states are still back-filled so reconcile
+// can act on whichever refs it learned about. ctx flows into every gh call.
 func (g *GitHub) GetTaskStates(ctx context.Context, refs []string) (map[string]TaskState, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}
+	refs = capRefs("github.GetTaskStates", refs)
 	out := make(map[string]TaskState, len(refs))
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, ghFetchConcurrency)
+		firstErr error
+	)
 	for _, ref := range refs {
-		raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "state,labels")
-		if err != nil {
-			return nil, err
-		}
-		var v ghIssueView
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, fmt.Errorf("parse gh issue state: %w", err)
-		}
-		labels := make([]string, 0, len(v.Labels))
-		for _, l := range v.Labels {
-			labels = append(labels, l.Name)
-		}
-		out[ref] = TaskState{Ref: ref, IsOpen: v.State == "OPEN", Labels: labels}
+		wg.Add(1)
+		go func(ref string) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			raw, err := g.gh(ctx, "issue", "view", ref, "--repo", g.Repo, "--json", "state,labels")
+			if err != nil {
+				mu.Lock()
+				log.Printf("channel/github: GetTaskStates ref %s failed: %v (continuing other refs)", ref, err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			var v ghIssueView
+			if err := json.Unmarshal(raw, &v); err != nil {
+				mu.Lock()
+				log.Printf("channel/github: GetTaskStates ref %s parse failed: %v (continuing other refs)", ref, err)
+				if firstErr == nil {
+					firstErr = fmt.Errorf("parse gh issue state %s: %w", ref, err)
+				}
+				mu.Unlock()
+				return
+			}
+			labels := make([]string, 0, len(v.Labels))
+			for _, l := range v.Labels {
+				labels = append(labels, l.Name)
+			}
+			mu.Lock()
+			out[ref] = TaskState{Ref: ref, IsOpen: v.State == "OPEN", Labels: labels}
+			mu.Unlock()
+		}(ref)
 	}
-	return out, nil
+	wg.Wait()
+	return out, firstErr
 }
 
 // gh runs a `gh` command and returns stdout (stderr folded into the error).

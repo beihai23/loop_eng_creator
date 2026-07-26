@@ -26,6 +26,10 @@ type scriptedChannel struct {
 	replies  map[string][]channel.Reply // human replies per issue ref; nil/empty → none
 	calls    int
 	comments []string // PostComment 收到的正文（按序），供断言写回内容
+	// listRepliesCalls counts how many times ListReplies was invoked. The batched
+	// pollTaskReplies should call it once per parked class per tick regardless of
+	// how many tasks are in that class — this counter pins that contract.
+	listRepliesCalls int
 }
 
 func (f *scriptedChannel) ListNewTasks(ctx context.Context) ([]channel.Task, error) {
@@ -41,6 +45,7 @@ func (f *scriptedChannel) ListNewTasks(ctx context.Context) ([]channel.Task, err
 // asks about. The daemon only calls this with parked (needs-review) refs, so a
 // test simulates "human answered" by setting replies[<ref>] before the tick.
 func (f *scriptedChannel) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]channel.Reply, error) {
+	f.listRepliesCalls++
 	out := make(map[string][]channel.Reply)
 	for _, r := range refs {
 		if rs, ok := f.replies[r]; ok {
@@ -1229,5 +1234,100 @@ func TestZeroGainBlockedResumesWithFeedback(t *testing.T) {
 	}
 	if !strings.Contains(fb, "合同是 plan 冻结 3 个值") {
 		t.Fatalf("resume feedback 应含回复原文, got %q", fb)
+	}
+}
+
+// TestPollTaskRepliesBatchesSingleCall 钉死批量契约：N 个同类 parked 任务每 tick
+// 只发 1 次 ListReplies（不再逐任务 N 次串行），且回填后按各自 last_comment_at
+// 过滤、命中者重排队。这是 daemon tick 不再 O(N) 阻塞派发的核心保证。
+func TestPollTaskRepliesBatchesSingleCall(t *testing.T) {
+	st := newTestStore(t)
+	ch := &scriptedChannel{}
+	eng := &Engine{Channel: ch, Store: st, Interval: time.Second}
+
+	// 3 个 blocked 任务（同类 → pollTaskReplies 一次喂 3 个 ref）。
+	mkBlocked := func(ref string) string {
+		id, err := st.InsertTask(state.TaskRow{IssueRef: ref, Description: ref})
+		if err != nil {
+			t.Fatalf("insert %s: %v", ref, err)
+		}
+		if err := st.AppendTransition(id, "new", "blocked", "test"); err != nil {
+			t.Fatalf("transition %s: %v", ref, err)
+		}
+		return id
+	}
+	idA := mkBlocked("A")
+	idB := mkBlocked("B")
+	idC := mkBlocked("C")
+
+	// 各自的 last_comment_at：A 早、C 晚、B 无（零）。
+	if err := st.SetLastCommentAt(idA, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("set last comment A: %v", err)
+	}
+	if err := st.SetLastCommentAt(idC, time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("set last comment C: %v", err)
+	}
+
+	// 人在 issue 回复：A 的新回复（晚于 A 的 last_comment_at）→ 命中；
+	// C 的旧回复（早于 C 的 last_comment_at）→ 被 repliesSince 过滤掉；B 无回复。
+	ch.replies = map[string][]channel.Reply{
+		"A": {{Body: "answer-a", CreatedAt: "2026-07-10T00:00:00Z"}},
+		"C": {{Body: "stale-c", CreatedAt: "2026-07-10T00:00:00Z"}},
+	}
+
+	if err := eng.pollSignals(context.Background()); err != nil {
+		t.Fatalf("pollSignals: %v", err)
+	}
+
+	// 整批只发 1 次 ListReplies（3 个 blocked 任务一次拉回）；其余 parked 类
+	// （needs-review / needs-info / needs-human-decision）为空，不触发调用。
+	if ch.listRepliesCalls != 1 {
+		t.Fatalf("ListReplies 调用数 = %d, want 1（同类 N 任务应批量一次）", ch.listRepliesCalls)
+	}
+	// A 命中 → new；B 无回复、C 被过滤 → 留 blocked。
+	if got := statusOf(t, st, idA); got != "new" {
+		t.Fatalf("A 有新回复应重排队为 new, got %q", got)
+	}
+	if got := statusOf(t, st, idB); got != "blocked" {
+		t.Fatalf("B 无回复应留 blocked, got %q", got)
+	}
+	if got := statusOf(t, st, idC); got != "blocked" {
+		t.Fatalf("C 的回复早于 last_comment_at 应被过滤、留 blocked, got %q", got)
+	}
+}
+
+// TestRepliesSince 钉死 repliesSince 的过滤规则，重点是安全侧：CreatedAt 为空或不可解析
+// 时保留该条（宁可重排队也不丢真人回复），仅 CreatedAt 解析成功且 ≤since 才丢。
+func TestRepliesSince(t *testing.T) {
+	rs := []channel.Reply{
+		{Body: "after", CreatedAt: "2026-07-10T00:00:00Z"},
+		{Body: "before", CreatedAt: "2026-06-01T00:00:00Z"},
+		{Body: "equal", CreatedAt: "2026-07-01T00:00:00Z"},
+		{Body: "empty-ts", CreatedAt: ""},
+		{Body: "bad-ts", CreatedAt: "not-a-date"},
+	}
+	since := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+	// since=零值 → 全部通过。
+	all := repliesSince(rs, time.Time{})
+	if len(all) != len(rs) {
+		t.Fatalf("since=零应全部保留, got %d want %d", len(all), len(rs))
+	}
+
+	got := repliesSince(rs, since)
+	bodies := make(map[string]bool, len(got))
+	for _, r := range got {
+		bodies[r.Body] = true
+	}
+	// after(>since) 保留；empty-ts/bad-ts 安全侧保留；equal(==since)/before(<since) 丢弃。
+	for _, keep := range []string{"after", "empty-ts", "bad-ts"} {
+		if !bodies[keep] {
+			t.Errorf("应保留 %q（安全侧/晚于 since）, got %+v", keep, bodies)
+		}
+	}
+	for _, drop := range []string{"before", "equal"} {
+		if bodies[drop] {
+			t.Errorf("应丢弃 %q（≤since）, got %+v", drop, bodies)
+		}
 	}
 }

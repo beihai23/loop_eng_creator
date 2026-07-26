@@ -608,10 +608,18 @@ func (e *Engine) pollSignals(ctx context.Context) error {
 	return nil
 }
 
-// pollTaskReplies polls one class of task (needs-review or blocked) for new
-// human reply comments. Only comments posted after the daemon's last comment
-// (last_comment_at) are surfaced so the same reply doesn't re-queue the task
-// on every tick.
+// pollTaskReplies polls one class of parked task (needs-review / blocked /
+// needs-info / needs-human-decision) for new human replies and re-queues any
+// that have been answered. Previously this issued one ListReplies PER task
+// (each a serial network round-trip with its own retry/backoff), so N parked
+// tasks blocked the whole daemon tick — a network blip could stall dispatch
+// for minutes. Now it makes ONE batched ListReplies for the whole class
+// (since=zero: the channel returns every comment, capped/concurrent inside),
+// then re-filters each task against its OWN last_comment_at client-side. A
+// batch error is logged but does not halt the tick: partial results are still
+// processed (a ref that failed simply has no replies and is skipped, exactly
+// as the old per-task error path did — it no longer also blocks every other
+// ref). A task is re-queued iff it has ≥1 reply newer than its last_comment_at.
 func (e *Engine) pollTaskReplies(
 	ctx context.Context,
 	fetch func() ([]state.TaskRow, error),
@@ -621,15 +629,26 @@ func (e *Engine) pollTaskReplies(
 	if err != nil {
 		return err
 	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	refs := make([]string, len(tasks))
+	sinces := make([]time.Time, len(tasks))
+	for i, t := range tasks {
+		refs[i] = t.IssueRef
+		sinces[i], _ = e.Store.LastCommentAt(t.ID)
+	}
+	// One batched fetch for the whole class. since=zero → channel returns all
+	// comments (carrying CreatedAt); repliesSince re-applies each task's own
+	// last_comment_at below. An error is log-only: the partial map is still
+	// consumed so a failing ref doesn't block the rest of the class.
+	replies, lerr := e.Channel.ListReplies(ctx, refs, time.Time{})
+	if lerr != nil {
+		e.logf("%s: ListReplies %d refs failed: %v (processing partial)", currentStatus, len(refs), lerr)
+	}
 	var resumed int
-	for _, t := range tasks {
-		since, _ := e.Store.LastCommentAt(t.ID)
-		replies, err := e.Channel.ListReplies(ctx, []string{t.IssueRef}, since)
-		if err != nil {
-			e.logf("[daemon] pollTaskReplies for %s: %v", t.ID, err)
-			continue
-		}
-		rs := replies[t.IssueRef]
+	for i, t := range tasks {
+		rs := repliesSince(replies[t.IssueRef], sinces[i])
 		if len(rs) == 0 {
 			continue
 		}
@@ -648,6 +667,35 @@ func (e *Engine) pollTaskReplies(
 		e.logf("[daemon] tick resume: %d task(s) re-queued", resumed)
 	}
 	return nil
+}
+
+// repliesSince filters replies to those created strictly after since. It is the
+// client-side half of the batched poll: ListReplies fetched every comment for a
+// whole class with since=zero, and this re-applies one task's own
+// last_comment_at. A reply whose CreatedAt is empty or unparseable is KEPT
+// (safe side: surface a possibly-stale reply and re-queue rather than silently
+// drop a real human response whose timestamp the channel couldn't report).
+// When since is zero, every reply passes.
+func repliesSince(rs []channel.Reply, since time.Time) []channel.Reply {
+	if since.IsZero() {
+		return rs
+	}
+	out := make([]channel.Reply, 0, len(rs))
+	for _, r := range rs {
+		if r.CreatedAt == "" {
+			out = append(out, r) // channel reported no time → keep (safe side)
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, r.CreatedAt)
+		if err != nil {
+			out = append(out, r) // unparseable → keep (safe side)
+			continue
+		}
+		if t.After(since) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // joinReplies flattens one task's human replies into a single feedback string
