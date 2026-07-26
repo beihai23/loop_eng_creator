@@ -59,7 +59,7 @@
 - 子循环编排：计划 → 执行 → 验证 → 写回，带重试；tier-3 时 park
 - 完整三层验证链（确定性 → LLM 新鲜上下文 → **异步**人审）
 - 4 个 skill（含初稿 prompt）：`triage`、`plan`、`verify`、`help`（执行直接用 `claude`，不造 skill）
-- 单条模型集成路径：`claude -p`（triage、plan、execute、verify-tier2 全走；**不**直连 API）
+- 模型集成：四角色经 provider 中立 `Agent` 层 shell-out（默认 `claude`，可配；**不**直连 API）
 - 可插拔工单通道接口 + v1 实现 `githubChannel`（轮询）
 - 可回放的 SQLite trace（可观测性数据层）+ 任务生命周期状态
 - 预算强制（三道刹车）+ 只追加的账本
@@ -98,7 +98,7 @@ internal/
     subloop.go     计划 → 执行 → 验证 → 写回 （单任务，带重试；tier-3 时 park）
   channel/    工单通道接口 + github/github.go（go-github，轮询）
   skill/      skill 注册表、模板渲染、I/O 序列化/反序列化、回归
-  model/      两个客户端：apiClient（anthropic SDK）+ claudeClient（os/exec 调 `claude -p`）
+  model/      provider 中立 `Agent` 层（`Providers` 注册表：claude/codex/opencode/kimi/kilo）+ `AsClient`/`AsExecuter` 桥接冻结 `Client`/`Executer`
   verify/     chain.go, deterministic.go, llm.go, human.go（human.go 异步 park）
   state/      SQLite 存储（modernc.org/sqlite）、schema、回放读取器
   budget/     每调用 / 每任务 / 重试 强制 + 账本
@@ -117,7 +117,7 @@ internal/
   `UpdateStatus(ctx, taskRef, status) error`
   `CreateTask(ctx, desc, criteria) (taskRef, error)` （仅 `task new` 助手用）
   v1 实现：`githubChannel`（按标签 `loop:task` 过滤 issue；轮询）。
-- `model.Client` —— `Call(ctx, prompt) (output, usage, err)`。一个真实实现 `claudeClient`（`claude -p`）+ 测试用 `FakeClient`；循环只依赖接口，测试时注入 stub。
+- `model.Client` / `model.Executer` —— 冻结接口（`Call` / `Exec`），经 `AsClient`/`AsExecuter` 由 provider 中立的 `Agent` 层实现；`Agent` 由 `NewAgent(ref)` 按 `ref.Provider` 从 `Providers` 注册表派发（默认 `claude`）。测试用 `FakeClient` 注入 stub。
 - `skill.Skill` —— `{Name, Version, Render(input) (prompt string), Parse(output) (typed, err)}`。无状态。
 - `verify.Tier` —— `Check(ctx, diff, criteria, priorFailure) (result, err)`。tier-3 的实现不阻塞：返回 `needs-human`，由 daemon park。
 - `state.Store` —— 只追加写入器 + 回放读取器 + 任务生命周期读写。trace 行**禁止原地改写**。
@@ -148,11 +148,11 @@ loop-eng daemon  （常驻）
 
 ```
 第 n 轮：
-  a. 计划   ── plan skill（直连 API）：读落盘状态 + 任务 + 标准 → 执行计划（不写代码）
-  b. 执行   ── `claude -p`，在 worktree 里：计划 + 任务 + 标准 + 仓库路径 → diff + 自报（信号）
+  a. 计划   ── plan skill（经 `Agent` 层，默认 `claude`）：读落盘状态 + 任务 + 标准 → 执行计划（不写代码）
+  b. 执行   ── 经 `Agent` 层 shell-out（默认 `claude`），在 worktree 里：计划 + 任务 + 标准 + 仓库路径 → diff + 自报（信号）
   c. 验证   ── 三层链，按序：
                tier 1  确定性脚本（config）              ─ 不过 → 反馈
-               tier 2  `claude -p` 新鲜会话：只给 diff + 标准 ─ 不过 → 反馈
+               tier 2  `Agent` 层新鲜会话（默认 `claude`）：只给 diff + 标准 ─ 不过 → 反馈
                tier 3  人审（异步）                       ─ 见下
              tier 1/2 全过 → 写回 → done
   d. 写回   ── 落盘状态（SQLite trace）+ 战报（issue 评论）+ 把结果摄取回主循环
@@ -202,10 +202,10 @@ daemon:
   poll_interval: 60s
   # 单活跃子循环；无并发，故无 concurrency 配置
 models:
-  triage:  { via: claude-p, binary: claude }                 # 全角色统一走 claude -p
-  plan:    { via: claude-p, binary: claude }
-  execute: { via: claude-p, binary: claude }
-  verify:  { via: claude-p, binary: claude }                 # 每次调用开新会话
+  triage:  { provider: claude }                 # 默认 claude；改 provider 切换（claude/codex/opencode/kimi/kilo）
+  plan:    { provider: claude }
+  execute: { provider: claude }
+  verify:  { provider: claude }                 # 每次调用开新会话
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
@@ -252,7 +252,7 @@ daemon 任何阶段都不阻塞在人上（原则 7）。**没有并发、没有
 - **verify**（tier-2）—— 入：`{diff, acceptance_criteria, prior_failure_signal?}` → 出：`{passed, reason, failing_criteria[]}`（新鲜上下文；执行推理**绝不**在输入里）
 - **help** —— 入：`{task, blocked_state, attempts_summary, last_error}` → 出：`{help_request:{stuck_at, tried[], need_from_human}}`
 
-**执行不是 skill** —— 它直接调 `claude -p`（要用工具 / 改文件）。skill 的 I/O 是强类型 Go struct；强类型**就是**「固定 I/O 契约」的强制手段。
+**执行不是 skill** —— 它经 provider 中立的 `Agent` 层 shell-out（默认 `claude`，可配；要用工具 / 改文件）。skill 的 I/O 是强类型 Go struct；强类型**就是**「固定 I/O 契约」的强制手段。
 
 > **plan 输出里的 `files` 只是给执行参考和给战报记录用，不做任何调度约束**（v3 已删掉 scope 串行/冲突机制；见 §12）。
 
@@ -261,7 +261,7 @@ daemon 任何阶段都不阻塞在人上（原则 7）。**没有并发、没有
 对独立性的结构性强制（原则 2）：`verify` 包是一个**与执行分离的组件**，与执行**不共享**任何内存上下文。它只从落盘存储读 `(diff, acceptance_criteria)`。
 
 - **tier 1 —— 确定性脚本。** 对 worktree 跑每条配置好的 `verify.deterministic` 命令；解析退出码 + 输出。最独立（不碰 LLM）。默认第一道筛。脚本报错（而非失败）按「失败带详情」处理，绝不按通过。
-- **tier 2 —— LLM 新鲜上下文。** `claude -p` 开全新会话，只给 **diff + 验收标准**（重试时再加**上一轮的验证失败详情**——绝不是 execute/plan 的输出）。绝不给执行对话。处理脚本覆盖不到的语义标准。
+- **tier 2 —— LLM 新鲜上下文。** 经 `Agent` 层开全新会话（默认 `claude`），只给 **diff + 验收标准**（重试时再加**上一轮的验证失败详情**——绝不是 execute/plan 的输出）。绝不给执行对话。处理脚本覆盖不到的语义标准。
 - **tier 3 —— 异步人审。** 子循环不阻塞：发 review-request 评论（diff 摘要 + 验收标准 + 要人判断的点）→ 置 `needs-review` → park → 释放活跃位 → 子循环结束。daemon 轮询到人在该 issue 上的回复后，带反馈恢复任务。人 accept → 写回 → done；reject/反馈 → 带反馈重试。用于业务正确性、审美、外部依赖正确性这类判断。
 
 **顺序：** tier 1 → 2 → 3。tier 1 不过就短路（不浪费 tier 2/3）。tier 1/2 任何一层不过 → 失败成为下一轮 计划 的反馈，预算内重试。**反馈分两路，判决与现场都传**：判决（驳回理由）经 priorFailure / verify-fail 评论 / 重试诊断；现场（被驳回的完整 diff）在 run 内由驳回处就地更新、跨 run 由 Run 开头按 issue_ref 从 steps.output_json 读回，两路都注入下一轮 plan（`RejectedDiff`）与 execute prompt——下一轮是「带完整信息决定沿用修正还是推倒重来」，不是对着判决书从零重掷。**执行端的自报只触发这条链，绝不是结论**（原则 3，结构性强制：execute 的输出不是任何一层「通过」判定的输入）。
@@ -295,18 +295,18 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 
 **GC（现场是缓存，SQLite 是档案）**：保留的树由状态驱动 GC 回收——48h 宽限期内一律不删（防状态滞后误删活树）；宽限期后按 task_status 判定：running/needs-review/needs-info/needs-human-decision/done 保留，blocked 超 7 天 TTL 删，cancelled/error/孤儿删。触发点两个：daemon 每 tick 一次 + `loop-eng clean`（`--dry-run` 可看判定）。GC 的正确性不依赖树存活——现场的档案在 steps.output_json（append-only），树只是缓存，误删丢的是调试便利，不是证据。
 
-### 8.10 模型集成（单路径：`claude -p`）
+### 8.10 模型集成（默认 `claude`，provider 可配置）
 
-**所有四个角色（triage、plan、execute、verify-tier2）都走 `claude -p`**（`claudeClient`，`os/exec`），每次调用开**全新会话**（不共享对话）——这也是验证独立性强制的一部分（verify-tier2 永远是干净上下文）。
+**四个角色（triage、plan、execute、verify-tier2）都经 provider 中立的 `Agent` 层 shell-out**（`internal/model/agent.go`），每次调用开**全新会话**（不共享对话）——这也是验证独立性强制的一部分（verify-tier2 永远是干净上下文）。`Providers` 注册表（`claude`/`codex`/`opencode`/`kimi`/`kilo` 五家，`agent.go` 的 `var Providers`）是 provider 集合的**单一真相源**——config 校验（`ValidateProviders`）、`doctor` 派发、交互式配置菜单都读它，加 provider 是一行 map 编辑。`NewAgent(ref config.ModelRef)` 按 `ref.Provider` 派发（`ResolveProvider` 把 `""` 归一为 `claude`，保留开箱即用的 `claude -p` 行为）；未知 provider 直接报错（带全部合法集合），不静默回落。
 
-**为什么不直连 API（v3.1 砍掉曾经设计的 SDK 直连路径）：**
+**为什么不直连 API（v3.1 砍掉曾经设计的 SDK 直连路径；默认 `claude`，可配置）：**
 1. **安装/配置最简**：用户只需装好 `claude` CLI（execute/verify 本来就要用），无需再配 `ANTHROPIC_API_KEY`——一条认证路径。
 2. **不碰用户的 key**：`claude` CLI 自管认证（Claude Code 登录），本工具永远不接触/存储 API key。
-3. **agent 可替换**：shell-out 到一个 agent CLI 是 provider 中立的；将来换别的 agent（或别的二进制）只改 config 里的 `binary`，不动代码。
+3. **agent 可替换**：shell-out 到 agent CLI 是 provider 中立的——provider 中立的 `Agent` 层 + `Providers` 注册表已落地，换/加 provider（claude/codex/opencode/kimi/kilo）只改 config、不动代码（加 provider 是一行 map 编辑）。
 
 代价：triage/plan 这种轻量判断也要拉起一个 `claude` 会话，比直连 API 重。个人工具接受这个代价，换取上面三点（v3.1 决策；见 §12）。
 
-循环只依赖 `model.Client` 接口；`claudeClient` 是唯一真实实现，`FakeClient` 供测试注入。
+冻结的 `Client`/`Executer` 接口（`model.go`）不动——循环其余部分（budget、skill、subloop）继续经它们消费 LLM；`Agent` 经 `AsClient`/`AsExecuter` 适配器桥接上冻结接口（见下文 #71-B 段），`FakeClient` 仍用于向冻结接口注入测试 stub。
 
 **真实 token 采集（#71-A）**：claude provider 以 `--output-format json` 运行，adapter 从结果信封解析最终文本（`Out` 语义不变——下游 extractJSON 看到的仍是模型自己的输出）与真实 usage（`input_tokens`/`output_tokens`，落 `steps.tokens_in/out`），解析失败一律兜底原文 + `len(Out)` 估算（不致命、不中断）。预算三刹车与 dashboard 的 token 列自此吃真值而非字符数估算。codex 等其余 provider 维持估算兜底，后续按同模式接入。
 
@@ -390,7 +390,7 @@ type: bugfix
 - **v1 工单 = GitHub Issue，通道可插拔** —— 最常见、和仓库同源；Jira/Linear 后续走同一 `channel.Channel` 接口。
 - **选 Go 而非 Python** —— 单一静态二进制（部署）、goroutine 原生的 daemon、强类型的 skill I/O 契约。常被提起的「Python LLM 生态」反对理由在这里消解：这个工具只做薄 HTTP 调用 + shell out 到 `claude`。
 - **`modernc.org/sqlite`（纯 Go）** 而非 CGO 驱动 —— 保持二进制全静态、可交叉编译。
-- **单条模型路径（全 `claude -p`）** —— v3.1 砍掉曾经设计的 API 直连：安装/配置最简（无需配 API key）、不碰用户的 key、agent 可替换（shell-out 是 provider 中立的）。代价是 triage/plan 轻量判断也要拉起 `claude` 会话——个人工具接受。每次调用开新会话天然满足验证独立性。
+- **默认 `claude`，provider 可配置（经 provider 中立 `Agent` 层）** —— v3.1 砍掉曾经设计的 API 直连：安装/配置最简（无需配 API key）、不碰用户的 key、agent 可替换（shell-out 是 provider 中立的）。`Providers` 注册表（claude/codex/opencode/kimi/kilo）已落地，加 provider 是一行 map 编辑。代价是 triage/plan 轻量判断也要拉起 agent 会话（默认 `claude`）——个人工具接受。每次调用开新会话天然满足验证独立性。
 - **验证独立由结构强制**（独立包、不共享上下文、新会话）——命门是一个架构属性，不是一句约定。
 - **skill 作为用户拥有的 markdown，覆盖 `go:embed` 默认；v1 内置初稿** —— B 的所有权线；调优能在升级后存活；初稿让 v1 开箱可跑，再用 seed 任务调。
 - **只追加、可回放的 trace** —— 靠回放调试，不靠复现（文章 2）。
@@ -400,7 +400,7 @@ type: bugfix
 
 ## 13. 开放问题（实现前/早期要定）
 
-1. **`claude -p` 调用细节** —— execute 和新鲜 verify 各自的 flag / 输入格式。实现时按所装的 Claude Code 版本确认。
+1. **agent 调用细节** —— execute 和新鲜 verify 各自的 flag / 输入格式；已由各 provider adapter（claude/codex/opencode/kimi/kilo）落地，按所装 CLI 版本维护。
 2. **冷启动 seed 任务集** —— 文章 2 要求用真实任务去调分诊阈值 / 验收标准范式 / skill 初稿。为子项目 1 的校准定这批 seed 任务（需要用户给）。
 3. **issue 正文格式约定** —— 任务/验收标准的解析格式（§9 的草图）要不要做成更严格的 schema，还是容忍自然语言 + 让 triage skill 解析？
 4. **何时引入并发/优先级/依赖** —— v1 明确不做。触发条件（任务量到多少、是否多仓库）留待真实数据出现再定。
@@ -414,7 +414,7 @@ type: bugfix
 | 反馈控制环 | 整个 daemon + 子循环流程 |
 | 主循环（常驻慢环） | `internal/daemon`（常驻引擎，不阻塞在人上，单活跃） |
 | 子循环（串级快环） | `internal/loop/subloop.go` |
-| 控制器 = LLM | 模型客户端（triage/plan 走 API，execute/verify 走 `claude -p`） |
+| 控制器 = LLM | `Agent` 层（四角色都经 provider 中立 shell-out，默认 `claude`） |
 | 设定值 / 期望 | 验收标准 |
 | 观测值 / 现状 | 落盘的 SQLite 状态，每轮重读 |
 | 失忆将军 | 无状态的 skill + 上下文即缓存原则 |
