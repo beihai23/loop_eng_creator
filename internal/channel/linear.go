@@ -484,6 +484,7 @@ func (lc *Linear) ListNewTasks(ctx context.Context) ([]Task, error) {
 		t := parseLocalTask(n.Description) // 复用 M1 的 body 解析（同 github 通道）
 		t.Ref = n.Identifier
 		t.CreatedAt = n.CreatedAt
+		t.Title = n.Title // Linear issue 标题：PR 标题的源头（区别于 Description=正文首行）
 		if t.Description == "" {
 			t.Description = n.Title
 		}

@@ -287,8 +287,8 @@ func (e *Engine) ingest(ctx context.Context) error {
 		if known, ok := specs[t.Ref]; ok {
 			// 已知 ref：正文被编辑过才回写（比对解析后的 desc+criteria+全文 body——
 			// 与落库内容同构，未变时绝不产生 no-op UPDATE）。
-			if known.Description != t.Description || !equalStrings(known.Criteria, t.AcceptanceCriteria) || known.Body != t.Body {
-				if err := e.Store.UpdateTaskSpec(known.ID, t.Description, t.AcceptanceCriteria, t.Body); err != nil {
+			if known.Description != t.Description || !equalStrings(known.Criteria, t.AcceptanceCriteria) || known.Body != t.Body || known.Title != t.Title {
+				if err := e.Store.UpdateTaskSpec(known.ID, t.Description, t.AcceptanceCriteria, t.Body, t.Title); err != nil {
 					return err
 				}
 				e.logf("[daemon] ingest: task %s spec updated (issue body edited)", t.Ref)
@@ -297,6 +297,7 @@ func (e *Engine) ingest(ctx context.Context) error {
 		}
 		row := state.TaskRow{
 			IssueRef:    t.Ref,
+			Title:       t.Title, // issue 标题：PR 标题的源头（区别于 Description=正文首行）
 			Description: t.Description,
 			TaskType:    t.TaskType,
 			Source:      "daemon",

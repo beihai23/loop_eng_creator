@@ -41,6 +41,27 @@ func TestParseIssuesJSONCarriesCreatedAt(t *testing.T) {
 	}
 }
 
+// TestParseIssuesJSONCarriesTitle locks in that the GitHub issue title lands on
+// Task.Title — distinct from Description (the distilled body first line). Title
+// is the source of the PR title (prTitleFor prefers it), fixing #74/#76 where a
+// body opening with "# 目标" leaked a mid-body bullet into the PR title.
+func TestParseIssuesJSONCarriesTitle(t *testing.T) {
+	raw := `[{"number":42,"title":"Fix login bug","body":"# 目标\n- bullet from the body"}]`
+	tasks, err := parseIssuesJSON([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("got %d tasks", len(tasks))
+	}
+	if tasks[0].Title != "Fix login bug" {
+		t.Fatalf("Title should be the issue title, got %q", tasks[0].Title)
+	}
+	if tasks[0].Description != "- bullet from the body" {
+		t.Fatalf("Description should be the distilled body first line (not the title), got %q", tasks[0].Description)
+	}
+}
+
 // TestParseIssueCommentsJSON feeds a trimmed `gh issue view <ref> --json comments`
 // blob and asserts each comment maps to one Reply whose body is verbatim.
 func TestParseIssueCommentsJSON(t *testing.T) {
