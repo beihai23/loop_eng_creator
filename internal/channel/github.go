@@ -336,11 +336,34 @@ func (g *GitHub) gh(ctx context.Context, args ...string) ([]byte, error) {
 	return g.ghExec(ctx, args...)
 }
 
+// ghPermanentSignals marks gh/HTTP failures that will never succeed on retry —
+// auth (401 / bad credentials) and not-found (404). Retrying these only burns the
+// 2s/4s backoff per call (a broken gh auth session stalls every channel call ~6s
+// before failing). 403 is deliberately NOT permanent (rate-limit 403s are
+// transient); neither are 5xx / network / TLS-timeout — those are retried.
+var ghPermanentSignals = []string{
+	"401", "404", "bad credentials", "authentication required",
+	"login required", "not found", "could not find",
+}
+
+// ghPermanent reports whether a gh failure's stderr looks non-retryable.
+func ghPermanent(errStr string) bool {
+	s := strings.ToLower(errStr)
+	for _, sig := range ghPermanentSignals {
+		if strings.Contains(s, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 // ghExec runs the real `gh` command (retried on transient failure) and returns
 // stdout. stderr is folded into the error. The GitHub API intermittently
 // TLS-timeouts from some networks; retrying (ghRetry ×, 2s/4s backoff) absorbs
 // those blips so a single ListNewTasks/PostComment failure doesn't abort the
-// whole run.
+// whole run. Permanent failures (auth/not-found) short-circuit, and the backoff
+// is ctx-aware so SIGTERM aborts immediately instead of blocking up to ~6s per
+// in-flight gh call.
 func (g *GitHub) ghExec(ctx context.Context, args ...string) ([]byte, error) {
 	var lastErr error
 	for attempt := 1; attempt <= ghRetry; attempt++ {
@@ -348,13 +371,22 @@ func (g *GitHub) ghExec(ctx context.Context, args ...string) ([]byte, error) {
 		var out, errBuf outBuf
 		cmd.Stdout = &out
 		cmd.Stderr = &errBuf
-		if err := cmd.Run(); err == nil {
+		err := cmd.Run()
+		if err == nil {
 			return out.Bytes(), nil
-		} else {
-			lastErr = fmt.Errorf("gh %v: %w: %s", args, err, errBuf.String())
+		}
+		lastErr = fmt.Errorf("gh %v: %w: %s", args, err, errBuf.String())
+		// Permanent gh/HTTP failure (auth 401 / not-found 404): retrying can't fix
+		// it — short-circuit instead of burning the 2s/4s backoff.
+		if ghPermanent(errBuf.String()) {
+			return nil, lastErr
 		}
 		if attempt < ghRetry {
-			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+			select {
+			case <-ctx.Done():
+				return nil, lastErr
+			case <-time.After(time.Duration(attempt) * 2 * time.Second):
+			}
 		}
 	}
 	return nil, lastErr

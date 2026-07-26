@@ -137,7 +137,16 @@ func runWithRetry(
 		if n < claudeRetry {
 			backoff := claudeBackoffBase << (n - 1) // 30s, 60s, 120s
 			jitter := time.Duration(rand.Intn(400)-200) * time.Millisecond
-			time.Sleep(backoff + jitter)
+			// ctx-aware backoff: a SIGTERM mid-retry aborts immediately instead of
+			// blocking up to ~120s. time.After wins on a live ctx (preserves the
+			// existing retry pace); retry_test uses claudeBackoffBase=0 so time.After
+			// fires instantly and the contract tests stay green.
+			select {
+			case <-ctx.Done():
+				return lastOut, Usage{}, fmt.Errorf("%s: aborted backoff during retry: %w (last err: %v)",
+					label, ctx.Err(), lastErr)
+			case <-time.After(backoff + jitter):
+			}
 		}
 	}
 	return lastOut, Usage{}, fmt.Errorf("%s: %w after %d attempts (stderr: %q stdout: %.400q)",

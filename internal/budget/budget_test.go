@@ -29,3 +29,23 @@ func TestRetry(t *testing.T) {
 		t.Fatal("retry boundary wrong")
 	}
 }
+
+// TestHeadroomReservation pins the #86 fix: SubLoop calls BeforeCall(PerCall) so
+// the per-task pre-check reserves a full PerCall of headroom under PerTask —
+// tripping BEFORE a call that would overshoot, not after. With the old fixed
+// estimate (1000), this gate only fired once cumulative spend had already blown
+// past the cap (the #86 incident: spent=266844, per_task=200000).
+func TestHeadroomReservation(t *testing.T) {
+	const perCall, perTask = 20000, 200000
+	e := New(perCall, perTask, 3)
+	// Spend up to exactly the headroom line: spent+PerCall == PerTask still passes.
+	e.AfterCall(model.Usage{TokensOut: perTask - perCall}) // spent = 180000
+	if err := e.BeforeCall(perCall); err != nil {
+		t.Fatalf("spent+PerCall==PerTask should pass: %v", err)
+	}
+	// One more token of spend → spent+PerCall > PerTask → reject BEFORE the call.
+	e.AfterCall(model.Usage{TokensOut: 1}) // spent = 180001
+	if err := e.BeforeCall(perCall); !errors.Is(err, ErrPerTask) {
+		t.Fatalf("want ErrPerTask once spent+PerCall>PerTask, got %v", err)
+	}
+}

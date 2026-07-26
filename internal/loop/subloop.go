@@ -198,11 +198,15 @@ func (sl *SubLoop) resolveAgentHints(sid string, hints *skill.AgentHints) (model
 	return exec, execRef, llm, verifyRef
 }
 
-// planExecEstimate is the conservative per-call token estimate SubLoop feeds
-// the plan and execute BeforeCall pre-checks. AppendBudget logs the same value
-// so the durable budget_ledger row records exactly the estimate the Enforcer
-// checked (spec §8.8).
-const planExecEstimate = 1000
+// Before plan/execute calls SubLoop reserves a FULL PerCall of headroom under
+// the per-task cap — BeforeCall(sl.Budget.PerCall), not a tiny fixed estimate.
+// A call's real size is unknowable up front, so reserving PerCall guarantees the
+// next call cannot push cumulative spend past PerTask by more than the configured
+// per-call ceiling. The old fixed estimate (1000) was far smaller than a real
+// execute call (tens of thousands), so the per-task pre-check only tripped AFTER
+// an overshoot — proven by #86 (spent=266844, per_task=200000, estimate=1000).
+// AppendBudget logs the same PerCall value so the ledger records the estimate
+// the Enforcer checked (spec §8.8).
 
 // Run executes the plan→execute→verify→writeback loop for one task.
 //
@@ -305,13 +309,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- plan ----
 		sl.logf("[subloop] %s phase=plan start", sid)
 		_ = sl.Store.SetInFlight(taskID, "plan")
-		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
+		if err := sl.Budget.BeforeCall(sl.Budget.PerCall); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
 		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
@@ -424,13 +428,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- execute (in the attempt's worktree, created before plan) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
 		_ = sl.Store.SetInFlight(taskID, "execute")
-		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
+		if err := sl.Budget.BeforeCall(sl.Budget.PerCall); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(effTask.AcceptanceCriteria) + "\n"
