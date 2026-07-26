@@ -32,6 +32,15 @@ type TaskRow struct {
 	// configured default. The daemon reads it back at dispatch to opt this task
 	// into a different provider stack (applyTaskAgent).
 	Agent string
+	// LandBranch records the branch a done task's work lives on when its issue is
+	// deliberately left OPEN pending integration (PR created / LAND PARTIAL / land
+	// or commit failure sentinel). Non-empty ⟺ reconcile must NOT re-queue this
+	// done+open task (it is awaiting a PR merge, not a human reopen), and instead
+	// polls the branch for a merged PR to auto-close the issue. Empty ⟺ the old
+	// reopen semantics (locally landed + closed, later reopened by a human →
+	// re-queue). The "(unlanded)" sentinel marks a done task whose commitWorktree
+	// failed (no branch to merge) so reconcile still skips it.
+	LandBranch string
 }
 
 var schema = []string{
@@ -115,6 +124,10 @@ func Open(path string) (*Store, error) {
 	// Best-effort: add agent to tasks — 任务级 coding-agent override（issue frontmatter
 	// `agent: codex`）。幂等：旧 DB 已有该列时 ALTER 报 duplicate-column，被忽略。
 	db.Exec(`ALTER TABLE tasks ADD COLUMN agent TEXT`)
+	// Best-effort: add land_branch to tasks — done 任务故意留 issue OPEN 等合并时记录的
+	// 分支（PR 已建 / LAND PARTIAL / land 失败 / commit 失败哨兵）。幂等：旧 DB 已有该列
+	// 时 ALTER 报 duplicate-column，被忽略。
+	db.Exec(`ALTER TABLE tasks ADD COLUMN land_branch TEXT`)
 	return &Store{db: db}, nil
 }
 
@@ -156,10 +169,10 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 
 func (s *Store) GetTask(id string) (TaskRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, issue_ref, description, task_type, source, acceptance_criteria_json, COALESCE(body,''), COALESCE(agent,'') FROM tasks WHERE id=?`, id)
+		`SELECT id, issue_ref, description, task_type, source, acceptance_criteria_json, COALESCE(body,''), COALESCE(agent,''), COALESCE(land_branch,'') FROM tasks WHERE id=?`, id)
 	var t TaskRow
 	var critJSON string
-	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent); err != nil {
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.LandBranch); err != nil {
 		return t, err
 	}
 	_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
@@ -286,7 +299,7 @@ func (s *Store) IssueRefs() (map[string]bool, error) {
 // edited specs with zero extra channel reads.
 func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at, COALESCE(body,''), COALESCE(agent,'') FROM tasks`)
+		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at, COALESCE(body,''), COALESCE(agent,''), COALESCE(land_branch,'') FROM tasks`)
 	if err != nil {
 		return nil, err
 	}
@@ -295,13 +308,25 @@ func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 	for rows.Next() {
 		var t TaskRow
 		var critJSON string
-		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt, &t.Body, &t.Agent); err != nil {
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt, &t.Body, &t.Agent, &t.LandBranch); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
 		out[t.IssueRef] = t
 	}
 	return out, rows.Err()
+}
+
+// SetLandBranch records the branch a done task is awaiting integration on. A
+// non-empty value marks "issue deliberately left OPEN pending merge" — reconcile
+// reads it back to (a) skip the old done→new reopen re-queue and (b) poll the
+// branch for a merged PR to auto-close the issue. The daemon's land path sets it
+// (PR created / LAND PARTIAL / land or commit failure); clearing it (empty
+// string) restores the old reopen semantics. Called by the daemon, which owns
+// the task lifecycle and holds task.ID.
+func (s *Store) SetLandBranch(taskID, branch string) error {
+	_, err := s.db.Exec(`UPDATE tasks SET land_branch=? WHERE id=?`, branch, taskID)
+	return err
 }
 
 // UpdateTaskSpec re-ingests an edited issue body: replaces the stored spec
@@ -328,7 +353,7 @@ func (s *Store) UpdateTaskSpec(id, description string, criteria []string, body s
 // tick, one task, oldest-submitted first.
 func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,'')
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.land_branch,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status = 'new'
@@ -336,7 +361,7 @@ func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 		 LIMIT 1`)
 	var t TaskRow
 	var critJSON string
-	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent); err != nil {
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.LandBranch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TaskRow{}, false, nil
 		}
@@ -388,7 +413,7 @@ func (s *Store) NeedsHumanDecisionTasks() ([]TaskRow, error) {
 // side for human-driven reversals (reopen, un-label).
 func (s *Store) TerminalTasks() ([]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,'')
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.land_branch,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status IN ('done', 'blocked')
@@ -402,7 +427,7 @@ func (s *Store) TerminalTasks() ([]TaskRow, error) {
 
 func (s *Store) listTasksByStatus(status string) ([]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,'')
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.land_branch,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status = ?
@@ -419,7 +444,7 @@ func scanTaskRows(rows *sql.Rows) ([]TaskRow, error) {
 	for rows.Next() {
 		var t TaskRow
 		var critJSON string
-		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent); err != nil {
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.LandBranch); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)

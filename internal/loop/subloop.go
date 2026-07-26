@@ -967,11 +967,12 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 		fmt.Fprintf(os.Stderr, "writeback error: UpdateStatus failed: %v\n", err)
 		detail += " [writeback partial: status: " + err.Error() + "]"
 	}
-	if status == "done" {
-		if err := sl.Channel.CloseIssue(ctx, task.Ref); err != nil {
-			fmt.Fprintf(os.Stderr, "writeback error: CloseIssue failed: %v\n", err)
-			detail += " [writeback partial: close: " + err.Error() + "]"
-		}
-	}
+	// Issue closure is NOT a done writeback side-effect here. "done" only means
+	// the work passed verify + committed on a branch — it is not yet integrated.
+	// The landing path decides: a local FF-merge success closes the issue
+	// immediately (finalizeLand); a PR / LAND PARTIAL / land-failure leaves it
+	// OPEN pending merge, and the daemon's reconcile closes it once the PR
+	// merges (MergeChecker). Closing here prematurely marked issues CLOSED while
+	// their PRs were still OPEN (#72/#75).
 	return Outcome{Status: status, Detail: detail}
 }
