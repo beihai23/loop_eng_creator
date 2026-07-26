@@ -28,6 +28,8 @@
 
 - **Go 1.25+**（`go.mod` 跟踪 1.25.x）。
 - **`claude` CLI（Claude Code）** 已安装、登录并在 `PATH` 上——这是真正的模型引擎；工具不接触你的 API key / token。默认配置带 `--dangerously-skip-permissions` 以便无人值守运行，**请按需审查**。
+
+  **权限边界（只读纵深）：** triage / plan / verify 三角色默认额外带 `--disallowedTools Edit Write NotebookEdit`，把写工具从 agent 上下文里**物理移除**——它们的「只读」由权限层强制（非仅靠 prompt 自觉）；`--dangerously-skip-permissions` 仍保留在全部角色上（headless 下只读 Bash——grep / `go doc` / `git ls-files`——需要它才能跑），而 deny 规则优先于 bypass，两者共存时 deny 生效。execute 不带 `--disallowedTools`，保留全部写权限（它就是干活的）。**残余风险：** Bash 仍是潜在写通道——worktree 隔离兜住了仓库内落笔（写坏了随树丢弃），但仓库外动作（网络、全局状态、`~/.loop` 之外的文件）属个人工具定位的残余风险，由你按需审查。
 - **`git`**——每个任务在独立 git worktree 里执行，目标仓库必须是 git 仓库。
 - **`gh` CLI**（仅 GitHub 通道需要）：先 `gh auth login`。
 

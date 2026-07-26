@@ -23,12 +23,22 @@ var skillFiles embed.FS
 // of truth. There is NO static tier-1 script list — tier-1 acceptance scripts
 // are produced per-task by the planner and run in the worktree. Per-role model
 // opt-in: set `name` in .loop/config.yaml if a role needs a different model.
+//
+// Read-only defense-in-depth (#84): triage/plan/verify append
+// `--disallowedTools Edit Write NotebookEdit` so the write tools are physically
+// removed from the agent's context — their "read-only" is enforced by the
+// permission layer, not just by prompt self-discipline. `--dangerously-skip-
+// permissions` is KEPT on all roles (headless read-only Bash — grep/go doc/git
+// ls-files — needs it to run); deny rules take precedence over bypassPermissions,
+// so the two coexist and deny wins. execute is unchanged: it needs to write.
+// Bash remains a potential write channel; worktree isolation (#68 P0) contains
+// in-repo writes, and out-of-repo Bash actions are accepted residual risk.
 var defaultConfig = `
 models:
-  triage:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  plan:    { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  triage:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
+  plan:    { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
   execute: { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  verify:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
+  verify:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
