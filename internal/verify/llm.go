@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 
+	"loop-eng/internal/model"
 	"loop-eng/internal/skill"
 )
 
@@ -17,14 +18,25 @@ type LLM struct {
 	// 假驳回就是它看主仓库（HEAD 干净）而不是 worktree 所致。空 = 默认 cwd
 	// （旧装配/纯测试），行为与引入前一致。Tier 接口签名不变。
 	Dir string
+	// Usage 是 tier-2 真实 token 的落库旁路：verify.Chain 的 Tier 接口是冻结契约
+	// （Check 不带 usage 返回），故 LLM 用这个指针把 Skill.RunIn 返回的 model.Usage
+	// 带回调用方（SubLoop 在 verify step 的 AppendStep 读它落 steps.tokens_in/out）。
+	// 值接收者拷贝进 Chain 的 tiers 切片时共享同一指针，所以即便 Check 按值调用，
+	// 写入也对调用方可见。nil（既有测试以 LLM{Skill:...} 裸构造时）→ 不写，绝不 panic。
+	Usage *model.Usage
 }
 
 func (l LLM) Check(ctx context.Context, diff string, criteria []string, priorFailure string) (VerifyResult, error) {
-	out, _, err := l.Skill.RunIn(ctx, skill.VerifyInput{
+	out, u, err := l.Skill.RunIn(ctx, skill.VerifyInput{
 		Diff:               diff,
 		AcceptanceCriteria: criteria,
 		PriorFailureSignal: priorFailure,
 	}, l.Dir)
+	// 旁路写 usage 必须在 err 分支之前：parse/调用错误也消耗了 token，落库要反映真值。
+	// nil 守卫是必须的——既有测试以 LLM{Skill:...}（Usage 为 nil）构造。
+	if l.Usage != nil {
+		*l.Usage = u
+	}
 	if err != nil {
 		return VerifyResult{}, err
 	}

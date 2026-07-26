@@ -131,6 +131,41 @@ func TestLLMCheckSynthesizesDetailOnEmptyReason(t *testing.T) {
 	}
 }
 
+// TestLLMCheckPopulatesUsage 单元级钉死 usage 旁路契约（修 verify step 行恒为 0）：
+// LLM{Usage:&model.Usage{}, Skill:...} 调 Check 后 *Usage 等于 Skill.Run 返回的
+// model.Usage（非零真值）。Tier.Check 冻结签名不动——usage 经指针旁路带出。既有
+// nil Usage 不崩（TestLLMCheckSynthesizesDetailOnEmptyReason 等用 LLM{Skill:...}
+// 裸构造，Usage 为 nil）由那些用例覆盖。
+func TestLLMCheckPopulatesUsage(t *testing.T) {
+	fake := model.NewFake(map[string]string{
+		"VERIFY:": mustJSONStr(skill.VerifyOutput{Passed: true, Reason: "ok"}),
+	})
+	vs := LLM{
+		Usage: &model.Usage{},
+		Skill: skill.Skill[skill.VerifyInput, skill.VerifyOutput]{
+			Name:       "verify",
+			PromptTmpl: "VERIFY:",
+			ParseJSON:  parseVerifyOutput,
+			Model:      fake,
+		},
+	}
+	if _, err := vs.Check(context.Background(), "diff", []string{"c"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	// 旁路写的必须等于 Skill.Run 返回的 model.Usage（fake 推导：TokensIn=len(prompt),
+	// TokensOut=len(out)）。同一 skill+input 两次 Run 渲染同一 prompt → usage 一致。
+	_, want, err := vs.Skill.Run(context.Background(), skill.VerifyInput{Diff: "diff", AcceptanceCriteria: []string{"c"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *vs.Usage != want {
+		t.Fatalf("usage bypass = %+v, want Skill.Run's %+v", *vs.Usage, want)
+	}
+	if vs.Usage.TokensIn == 0 || vs.Usage.TokensOut == 0 {
+		t.Fatalf("usage must be non-zero, got %+v", *vs.Usage)
+	}
+}
+
 // ---- Chain 填充 Tiers（spec §4.6 逐 tier 落盘）----
 
 type stubTier struct {
