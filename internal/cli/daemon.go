@@ -32,6 +32,17 @@ func NewDaemonCmd() *cobra.Command {
 		Short: "常驻 loop 引擎（轮询工单 + 单活跃子 loop + park/resume）",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := mustLoad(repo)
+			// 单实例保护：在 <repo>/.loop/daemon.lock 上取独占 flock。两个 daemon 指向同一
+			// 仓库会在同一 tick 各拿到 FIFO 队首 → 双 worktree / 双份 token / 竞争 FF-merge。
+			// 第二个实例取不到锁 → return err，cobra 以非 0 退出并把原因打印到 stderr；锁由
+			// flock 绑在 fd 上，RunE 全程持有，进程退出（含被杀）内核自动释放，重启无残留。
+			// run-once 刻意不加锁：它是人工单发，且不经 NextReadyTask/FIFO 派发（直接
+			// ch.ListNewTasks→sl.Run），与 issue 第 3 条一致。
+			lockFile, err := daemon.AcquireLock(repo)
+			if err != nil {
+				return err
+			}
+			defer lockFile.Close()
 			st := mustOpenState(repo)
 			defer st.Close()
 
