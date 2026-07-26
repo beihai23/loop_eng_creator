@@ -130,6 +130,15 @@ func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput, llm verify.LLM)
 			ScriptBody: s.Body,
 		})
 	}
+	// Bind tier-2's model call to the attempt worktree (#81): an agentic verify
+	// agent must ground-check against the tree execute actually edited, not the
+	// daemon's clean base repo (which silently produced "主仓库无此文件" false
+	// rejections). tiersFor is the single injection point holding wt, and it runs
+	// AFTER resolveAgentHints returns the (possibly agent-hint-overridden) llm, so
+	// both the default wiring and the override path carry Dir=wt — the override
+	// copies sl.VerifyLLM and swaps Skill.Model, then Dir is stamped here. Empty wt
+	// would no-op via RunIn's Call fallback; production always passes a real tree.
+	llm.Dir = wt
 	tiers = append(tiers, llm)
 	// tier-3：M3 注入了真人审 tier（HumanTier）就用它；否则 Tier3Human 时挂 HumanStub
 	// 自动通过占位。HumanStub 不再产 NeedsHuman，故 M1/M2 的 done/blocked 路径不受影响。

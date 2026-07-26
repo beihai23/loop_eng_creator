@@ -12,14 +12,22 @@ import (
 // LLM 本身不持有执行态。
 type LLM struct {
 	Skill skill.Skill[skill.VerifyInput, skill.VerifyOutput]
+	// Dir binds the verify model call to the attempt's worktree (its cwd) so an
+	// agentic verify agent's ground-check reads the tree execute actually edited,
+	// not the daemon's clean base repo (#81: verify used to reject with "主仓库无
+	// 此文件" because it stood in the wrong directory). Empty (zero value) → RunIn
+	// falls back to plain Model.Call, so old production wiring and pure tests that
+	// never set Dir are unchanged. Injected only by SubLoop.tiersFor — the single
+	// place holding the attempt worktree.
+	Dir string
 }
 
 func (l LLM) Check(ctx context.Context, diff string, criteria []string, priorFailure string) (VerifyResult, error) {
-	out, _, err := l.Skill.Run(ctx, skill.VerifyInput{
+	out, _, err := l.Skill.RunIn(ctx, skill.VerifyInput{
 		Diff:               diff,
 		AcceptanceCriteria: criteria,
 		PriorFailureSignal: priorFailure,
-	})
+	}, l.Dir)
 	if err != nil {
 		return VerifyResult{}, err
 	}
