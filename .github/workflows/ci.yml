@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Match Makefile test/vet/build: pure-Go build (modernc sqlite driver, no CGO).
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # tracks go.mod → 1.25.6
+          cache: true
+          cache-dependency-path: go.sum
+
+      - run: go vet ./...
+      - run: go build ./...
+      # go test deliberately does NOT enable the real-binary provider smokes in
+      # test/e2e/agent_smoke_test.go. Those need LOOP_ENG_AGENT_SMOKE=1 AND a live
+      # provider CLI on PATH (claude/codex/opencode/kimi/kilo) with real auth and
+      # balance — costly, slow, and flaky on rate-limiting (opencode's Insufficient
+      # Balance is a live example), so running them on every CI push would endanger
+      # the all-green gate. The smoke tests t.Skip unless that env is set, so this
+      # step runs only the deterministic suite. Smoke locally when you have a binary
+      # and creds:
+      #   LOOP_ENG_AGENT_SMOKE=1 go test ./test/e2e/...
+      - run: go test ./...
