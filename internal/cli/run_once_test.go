@@ -254,4 +254,15 @@ func TestApplyTaskAgent(t *testing.T) {
 	if got := applyTaskAgent(base, "no-such-provider"); got != base {
 		t.Fatal("unknown agent must fall back to cfg unchanged (no crash)")
 	}
+
+	// ReadOnly intent survives a provider switch (forProvider carries ReadOnly),
+	// so a read-only role is NOT silently relaxed to writable when a task opts
+	// into a different provider.
+	roBase := &config.Config{Models: config.Models{
+		Plan: config.ModelRef{Provider: "claude", Binary: "claude", Cmd: []string{"--disallowedTools"}, ReadOnly: true},
+	}}
+	roOver := applyTaskAgent(roBase, "codex")
+	if !roOver.Models.Plan.ReadOnly {
+		t.Fatalf("forProvider must carry ReadOnly across provider switch: got %+v", roOver.Models.Plan)
+	}
 }

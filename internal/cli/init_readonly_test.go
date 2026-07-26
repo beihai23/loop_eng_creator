@@ -10,31 +10,27 @@ import (
 	"loop-eng/internal/config"
 )
 
-// TestDefaultConfigReadonlyToolset 钉死默认 config 的只读工具集（#84 只读纵深）。
-// config.Load 解析 defaultConfig 后：
-//   - triage / plan / verify 的 Cmd 同时含 --dangerously-skip-permissions 与
-//     --disallowedTools Edit Write NotebookEdit（写工具从 agent 上下文物理移除，
-//     「只读」由权限层强制，非仅靠 prompt 自觉）；
-//   - execute 的 Cmd 仍只有 --dangerously-skip-permissions、不含 --disallowedTools
-//     （它需要写）；
+// TestDefaultConfigReadonlyToolset 钉死默认 config 的气密只读契约
+// （#airtight：plan/triage/verify 即便走 Bash 也写不到主仓库）。config.Load 解析
+// defaultConfig 后：
+//   - triage / plan / verify 的 ReadOnly==true、Cmd 含 --disallowedTools Edit
+//     Write NotebookEdit、Cmd 绝不含 --dangerously-skip-permissions（bypass 与
+//     plan mode 互斥，只读赢——profile 会注入 --permission-mode plan，故 config
+//     不再带 bypass）；
+//   - execute 的 ReadOnly==false、Cmd 含 --dangerously-skip-permissions、不含
+//     --disallowedTools / plan（它需要写，不受只读 profile 影响）；
 //   - 四角色 provider 仍为 claude（开箱行为不变）。
 //
-// 未来误改 defaultConfig（如漏掉某个 token、误给 execute 加 --disallowedTools、
-// 改了 provider）会让此测试变红。
+// 未来误改 defaultConfig（如漏掉 readonly、给只读角色留 bypass、误给 execute 加
+// --disallowedTools、改了 provider）会让此测试变红。
 func TestDefaultConfigReadonlyToolset(t *testing.T) {
 	var cfg config.Config
 	if err := yaml.Unmarshal([]byte(defaultConfig), &cfg); err != nil {
 		t.Fatalf("parse defaultConfig: %v", err)
 	}
 
-	// 三只读角色必须带的 token 集（精确元素，非子串）。
-	readonlyWant := []string{
-		"--dangerously-skip-permissions",
-		"--disallowedTools",
-		"Edit",
-		"Write",
-		"NotebookEdit",
-	}
+	// 三只读角色：ReadOnly=true、带写工具黑名单、绝不含 bypass。
+	readonlyCmdWant := []string{"--disallowedTools", "Edit", "Write", "NotebookEdit"}
 	for _, r := range []struct {
 		name string
 		ref  config.ModelRef
@@ -46,25 +42,33 @@ func TestDefaultConfigReadonlyToolset(t *testing.T) {
 		if r.ref.Provider != "claude" {
 			t.Errorf("models.%s.provider: want claude, got %q（开箱行为须不变）", r.name, r.ref.Provider)
 		}
-		for _, want := range readonlyWant {
+		if !r.ref.ReadOnly {
+			t.Errorf("models.%s.readonly: want true（只读 profile 触发位）", r.name)
+		}
+		for _, want := range readonlyCmdWant {
 			if !cmdHas(r.ref.Cmd, want) {
-				t.Errorf("models.%s.cmd 缺少 %q（只读工具集）: got %v", r.name, want, r.ref.Cmd)
+				t.Errorf("models.%s.cmd 缺少 %q（写工具黑名单）: got %v", r.name, want, r.ref.Cmd)
 			}
+		}
+		if cmdHas(r.ref.Cmd, "--dangerously-skip-permissions") {
+			t.Errorf("models.%s.cmd 不得含 --dangerously-skip-permissions（与 plan mode 互斥）: got %v", r.name, r.ref.Cmd)
 		}
 	}
 
-	// execute 保留全部写权限：含 --dangerously-skip-permissions，但绝不含
-	// --disallowedTools / Edit / Write / NotebookEdit。
+	// execute 保留全部写权限：ReadOnly=false、含 bypass、绝不含写工具黑名单 / plan。
 	ex := cfg.Models.Execute
 	if ex.Provider != "claude" {
 		t.Errorf("models.execute.provider: want claude, got %q（开箱行为须不变）", ex.Provider)
 	}
+	if ex.ReadOnly {
+		t.Errorf("models.execute.readonly: want false（execute 需要写，不受只读 profile 影响）")
+	}
 	if !cmdHas(ex.Cmd, "--dangerously-skip-permissions") {
 		t.Errorf("models.execute.cmd 缺少 --dangerously-skip-permissions: got %v", ex.Cmd)
 	}
-	for _, disallowed := range []string{"--disallowedTools", "Edit", "Write", "NotebookEdit"} {
+	for _, disallowed := range []string{"--disallowedTools", "Edit", "Write", "NotebookEdit", "plan", "--permission-mode"} {
 		if cmdHas(ex.Cmd, disallowed) {
-			t.Errorf("models.execute.cmd 不应含 %q（execute 需要写权限）: got %v", disallowed, ex.Cmd)
+			t.Errorf("models.execute.cmd 不应含 %q（execute 不被注入只读 profile）: got %v", disallowed, ex.Cmd)
 		}
 	}
 }
@@ -74,11 +78,12 @@ func TestDefaultConfigReadonlyToolset(t *testing.T) {
 // YAML 结构被误改后上层测试仍侥幸通过。
 func TestDefaultConfigEmbedsReadonlyMarkers(t *testing.T) {
 	for _, want := range []string{
-		"--dangerously-skip-permissions",
+		"--dangerously-skip-permissions", // execute 行仍带（execute 可写）
 		"--disallowedTools",
 		"Edit",
 		"Write",
 		"NotebookEdit",
+		"readonly: true",
 		"provider: claude",
 	} {
 		if !strings.Contains(defaultConfig, want) {

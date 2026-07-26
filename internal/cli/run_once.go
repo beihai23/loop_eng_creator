@@ -264,12 +264,18 @@ func applyTaskAgent(cfg *config.Config, agent string) *config.Config {
 
 // forProvider resets a ModelRef to a provider's defaults: provider+binary set to
 // the provider name, model name kept, cmd dropped (the old provider's native
-// flags don't apply to the new one).
+// flags don't apply to the new one). ReadOnly is carried across: a task-level
+// agent override (applyTaskAgent, e.g. `agent: codex`) or a step-level hint
+// (agentForRole) must NOT silently relax a read-only role back to writable — the
+// claude profile re-applies on the new provider, and other providers' read-only
+// profiles are not yet implemented (not a regression: they had no read-only
+// enforcement before either).
 func forProvider(ref config.ModelRef, provider string) config.ModelRef {
 	return config.ModelRef{
 		Provider: provider,
 		Binary:   provider,
 		Name:     ref.Name,
+		ReadOnly: ref.ReadOnly,
 	}
 }
 
