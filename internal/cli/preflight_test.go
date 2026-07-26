@@ -127,10 +127,17 @@ func TestProviderPreflightUnknownProvider(t *testing.T) {
 		Plan: config.ModelRef{Provider: "no-such-provider-zzz", Binary: "no-such-provider-zzz"},
 	}}
 	issues := providerPreflight(cfg)
-	if len(issues) == 0 {
-		t.Fatal("providerPreflight must flag an unknown provider")
+	// The unset roles default to claude; when claude is not on PATH (e.g. the CI
+	// runner) they also emit "binary not found" issues. Search the whole list for
+	// the plan/unknown-provider issue instead of indexing [0], so the test does
+	// not depend on claude being installed — mirrors TestProviderPreflight's loop.
+	var found bool
+	for _, msg := range issues {
+		if strings.Contains(msg, "plan") && strings.Contains(msg, "no-such-provider-zzz") {
+			found = true
+		}
 	}
-	if !strings.Contains(issues[0], "plan") || !strings.Contains(issues[0], "no-such-provider-zzz") {
-		t.Fatalf("issue must name role+provider; got %v", issues)
+	if !found {
+		t.Fatalf("providerPreflight must report models.plan (no-such-provider-zzz) as unknown; got %v", issues)
 	}
 }
