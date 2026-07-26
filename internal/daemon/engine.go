@@ -219,8 +219,20 @@ func (e *Engine) tick(ctx context.Context) error {
 				shortTaskID(ready.ID), ready.IssueRef, gate.Difficulty)
 		}
 	}
-	if err := e.Store.AppendTransition(ready.ID, "new", "running", "dispatched"); err != nil {
+	// new→running 是单实例正确性的命门：用 ClaimTask 的原子条件更新（WHERE
+	// status='new'）取代读出 NextReadyTask → AppendTransition(running) 的
+	// read-modify-write 窗口。两个 engine 实例各 tick 一次同一 task 时，只有先到的一
+	// 方 RowsAffected()==1 真正领到 running、进 RunTask；另一方 !claimed 直接 return，
+	// 绝不 UpdateStatus / RunTask（不会产生第二个 worktree / 双份 token）。兜底纵深：
+	// 实例锁（daemon.AcquireLock）是前门，这里是后门——锁被手删/绕过时仍只有一方领到。
+	claimed, err := e.Store.ClaimTask(ready.ID)
+	if err != nil {
 		return err
+	}
+	if !claimed {
+		e.logf("[daemon] tick dispatch: task %s (%s) already claimed by another instance — skip",
+			shortTaskID(ready.ID), ready.IssueRef)
+		return nil
 	}
 	e.logf("[daemon] tick dispatch: task %s (%s) → running", shortTaskID(ready.ID), ready.IssueRef)
 	// 派发即在 channel 上标出「正在处理」（loop:running）。打标点选 daemon 派发处

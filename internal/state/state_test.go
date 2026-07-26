@@ -892,3 +892,96 @@ func TestTaskBodyRoundTrip(t *testing.T) {
 		t.Fatalf("NextReadyTask body 未读回: %q", next.Body)
 	}
 }
+
+// TestClaimTaskOnlyOneWinner pins 验收#2 的数据层契约：new→running 是单语句条件
+// UPDATE（WHERE status='new'），同一 task 至多一方领到 running。ClaimTask 是 daemon
+// 单实例正确性的兜底纵深——实例锁（daemon.AcquireLock）被绕过（手删锁文件）时，仍
+// 只有 RowsAffected()==1 的一方真正派发。覆盖：
+//   - 串行：首次 claim → (true,nil)，status 翻 running 并写一条 new→running transition
+//     （trace 与旧 AppendTransition 派发路径同构）；再次 claim 同一 task → (false,nil)，
+//     不写任何东西（trace 不被污染）。
+//   - 并发 burst：16 路 goroutine 抢同一 new task，SQLite WAL + busy_timeout 串行化条件
+//     UPDATE，WHERE status='new' 是唯一裁决点 → 仍至多一个 win。
+func TestClaimTaskOnlyOneWinner(t *testing.T) {
+	s, err := Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.InsertTask(TaskRow{IssueRef: "race-1", Description: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 串行：第一次 win（翻 running + 写 transition），第二次 lose。
+	w1, err := s.ClaimTask(id)
+	if err != nil {
+		t.Fatalf("first ClaimTask: %v", err)
+	}
+	if !w1 {
+		t.Fatal("first ClaimTask on a new task must win")
+	}
+	for _, r := range mustListStatuses(t, s) {
+		if r.ID == id && r.Status != "running" {
+			t.Fatalf("after win, task status = %q, want running", r.Status)
+		}
+	}
+	trs, err := s.Transitions(id)
+	if err != nil {
+		t.Fatalf("transitions: %v", err)
+	}
+	if len(trs) != 1 || trs[0].From != "new" || trs[0].To != "running" {
+		t.Fatalf("win must record exactly one new→running transition, got %+v", trs)
+	}
+
+	w2, err := s.ClaimTask(id)
+	if err != nil {
+		t.Fatalf("second ClaimTask: %v", err)
+	}
+	if w2 {
+		t.Fatal("second ClaimTask on an already-running task must lose → (false,nil)")
+	}
+	// lose 不写新 transition（裁决点 RowsAffected()==0 已 rollback，trace 不被污染）。
+	if trs2, _ := s.Transitions(id); len(trs2) != 1 {
+		t.Fatalf("losing claim must not append a transition, got %d", len(trs2))
+	}
+
+	// 并发 burst（新 task）：仍至多一个 win。
+	id2, err := s.InsertTask(TaskRow{IssueRef: "race-2", Description: "d"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wins := make(chan bool, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := s.ClaimTask(id2)
+			if err == nil {
+				wins <- ok
+			}
+		}()
+	}
+	wg.Wait()
+	close(wins)
+	n := 0
+	for w := range wins {
+		if w {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("concurrent claim: exactly one winner expected, got %d", n)
+	}
+}
+
+func mustListStatuses(t *testing.T, s *Store) []StatusRow {
+	t.Helper()
+	rows, err := s.ListStatuses()
+	if err != nil {
+		t.Fatalf("list statuses: %v", err)
+	}
+	return rows
+}
