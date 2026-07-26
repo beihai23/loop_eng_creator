@@ -478,16 +478,27 @@ func (s *Store) AppendStep(r StepRow) error {
 }
 
 func (s *Store) AppendTransition(taskID, from, to, reason string) error {
-	_, err := s.db.Exec(
-		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
-		 VALUES(?,?,?,?,?,?)`,
-		newID("tr"), taskID, from, to, reason, nowISO())
+	// Atomic: the transitions INSERT and the task_status UPDATE must both land or
+	// neither — a crash between two bare Execs left a transitions row (e.g.
+	// "running → cancelled") while task_status still said "running" (trace ≠
+	// status). Mirrors InsertTask's Begin/Commit pattern.
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
-		to, nowISO(), taskID)
-	return err
+	if _, err := tx.Exec(
+		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
+		 VALUES(?,?,?,?,?,?)`,
+		newID("tr"), taskID, from, to, reason, nowISO()); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
+		to, nowISO(), taskID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // ClaimTask atomically transitions a task from "new" to "running" only if it is
