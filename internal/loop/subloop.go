@@ -339,7 +339,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 文本一致；渲染失败（模板错）时 Plan.Run 同样会报 render 错，这里留空即可。
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.RunIn(ctx, planIn, wt)
-		sl.Budget.AfterCall(u)
+		planBErr := sl.Budget.AfterCall(u)
 		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
 		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
 		// 可重试失败——不进 execute（否则 execute 只能靠战报上下文瞎续，浪费整轮
@@ -376,6 +376,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			}
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
+		}
+		// post-call 执法（#98）：plan 调用本身成功但单次真实用量超 PerCall → 记 plan
+		// step（含真实 TokensIn/Out，审计轨迹完整）后以 blocked 终结，不进 execute/verify
+		// （不继续烧）。plan 自身 err 已在上方 err!=nil 分支走既有重试/escalate 路径，
+		// 只有 plan 成功但超 PerCall 才在此 block——与 BeforeCall 预算闸语义对齐。
+		if planBErr != nil {
+			isolation.Discard(sl.Repo, wt)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "blocked", "budget: "+planBErr.Error()), nil
 		}
 		if emptyPlan {
 			// priorFailure 用中文锚点「plan 产出空计划」：MaxRetries 耗尽时 blocked
@@ -475,7 +484,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := exec.Exec(ctx, wt, execPrompt)
-		sl.Budget.AfterCall(u2)
+		execBErr := sl.Budget.AfterCall(u2)
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=execute fail: %v", sid, err)
@@ -502,6 +511,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}{Out: execOut, Diff: diff})
 		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", ModelRef: execModelRef, InputJSON: execPrompt, OutputJSON: string(rec), TokensIn: u2.TokensIn, TokensOut: u2.TokensOut})
 		sl.logf("[subloop] %s phase=execute done", sid)
+		// post-call 执法（#98）：execute 调用本身成功但单次真实用量超 PerCall → 记 execute
+		// step（含真实 TokensIn/Out）后以 blocked 终结，不进 verify/下一轮（不继续烧）。
+		// execute 自身 err 已在上方 err!=nil 分支走既有重试路径，只有 execute 成功但超
+		// PerCall 才在此 block——与 plan 段、BeforeCall 预算闸（line 431-435）语义对齐。
+		if execBErr != nil {
+			isolation.Discard(sl.Repo, wt)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "blocked", "budget: "+execBErr.Error()), nil
+		}
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
 		if ok, _ := sl.Store.CancelRequested(taskID); ok {

@@ -40,8 +40,8 @@ models:
   execute: { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
   verify:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
 budget:
-  per_call_tokens: 20000
-  per_task_tokens: 200000
+  per_call_tokens: 100000
+  per_task_tokens: 1000000
   max_retries: 3
 verify:
   tier3_human: true

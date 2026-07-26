@@ -32,8 +32,20 @@ func (e *Enforcer) BeforeCall(estimate int) error {
 	return nil
 }
 
-func (e *Enforcer) AfterCall(u model.Usage) {
+// AfterCall accounts the real usage of a completed call. The running tally
+// (spent) is always incremented — PerTask headroom still relies on it via the
+// next BeforeCall. Post-call enforcement (#98): if a single call's real usage
+// (TokensIn+TokensOut) strictly exceeds PerCall, it returns ErrPerCall so the
+// loop can abort instead of continuing to burn the budget on subsequent calls.
+// `==` PerCall is NOT a violation (strict >), mirroring BeforeCall's
+// `estimate > PerCall` boundary. PerTask is NOT re-checked here — that remains
+// BeforeCall's headroom responsibility (separation of concerns).
+func (e *Enforcer) AfterCall(u model.Usage) error {
 	e.spent += u.TokensIn + u.TokensOut
+	if used := u.TokensIn + u.TokensOut; used > e.PerCall {
+		return fmt.Errorf("%w: used=%d per_call=%d", ErrPerCall, used, e.PerCall)
+	}
+	return nil
 }
 
 // Spent returns the running total of tokens accounted via AfterCall. Exposed

@@ -35,12 +35,22 @@ type Client struct {
 // Call implements model.Client. It runs the budget pre-check, delegates to
 // Base, then accounts the real usage. On pre-check failure it returns the
 // Enforcer error WITHOUT calling Base (the LLM call is never made).
+//
+// Post-call enforcement (#98): after delegating, if Base itself succeeded (err
+// == nil) but the single call's real usage exceeded PerCall, the Enforcer error
+// is returned instead — the tokens are already burned (the call cannot be
+// rolled back), but surfacing ErrPerCall lets the loop abort instead of
+// continuing to burn the budget on subsequent verify/retry calls. When Base
+// itself errors, that error wins: the call already failed so a budget violation
+// is moot, and the next BeforeCall headroom check will catch cumulative overspend.
 func (c *Client) Call(ctx context.Context, prompt string) (string, model.Usage, error) {
 	if err := c.Enf.BeforeCall(c.Enf.PerCall); err != nil {
 		return "", model.Usage{}, err
 	}
 	out, u, err := c.Base.Call(ctx, prompt)
-	c.Enf.AfterCall(u)
+	if berr := c.Enf.AfterCall(u); berr != nil && err == nil {
+		return out, u, berr
+	}
 	return out, u, err
 }
 
@@ -61,18 +71,24 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, model.Usage, 
 // a DirClient and dir is non-empty (the production agentClient →
 // AgentRequest.Workdir → adapter cmd.Dir=dir path), else plain Call (test fakes,
 // clients without dir support, empty dir) — then AfterCall the real usage so the
-// tally still converges on truth.
+// tally still converges on truth. Post-call enforcement mirrors Call too: if the
+// real single-call usage exceeds PerCall while Base succeeded, ErrPerCall is
+// returned so the loop aborts rather than burning more budget (#98).
 func (c *Client) CallIn(ctx context.Context, dir, prompt string) (string, model.Usage, error) {
 	if err := c.Enf.BeforeCall(c.Enf.PerCall); err != nil {
 		return "", model.Usage{}, err
 	}
 	if dc, ok := c.Base.(model.DirClient); ok && dir != "" {
 		out, u, err := dc.CallIn(ctx, dir, prompt)
-		c.Enf.AfterCall(u)
+		if berr := c.Enf.AfterCall(u); berr != nil && err == nil {
+			return out, u, berr
+		}
 		return out, u, err
 	}
 	out, u, err := c.Base.Call(ctx, prompt)
-	c.Enf.AfterCall(u)
+	if berr := c.Enf.AfterCall(u); berr != nil && err == nil {
+		return out, u, berr
+	}
 	return out, u, err
 }
 
