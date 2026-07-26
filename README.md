@@ -1,5 +1,7 @@
 # loop-eng
 
+[![CI](https://github.com/beihai23/loop_eng_creator/actions/workflows/ci.yml/badge.svg)](https://github.com/beihai23/loop_eng_creator/actions/workflows/ci.yml)
+
 `loop-eng` 让一个 LLM 自己跑「写代码 → 自测 → 收尾」的闭环：你丢一个工单（GitHub issue 或本地文件），它计划、执行、独立验证、写回成一条能 merge 的分支——模型说了不算，独立验证层说了算。
 
 典型用法：把一个 issue 变成一条已验证的 PR、让一个常驻进程自动消化你的 inbox、在预算护栏内反复重试直到验证通过。每一步都落盘，事后可逐帧回放。
