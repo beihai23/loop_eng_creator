@@ -673,14 +673,14 @@ func (e *Engine) drainCommands(ctx context.Context) error {
 }
 
 // applyCommand 把单条 TUI 命令翻译成 transition（spec §7）：
-//   - resume（needs-review/blocked）→ X→new 并把 payload 落盘为 resume 反馈。
+//   - resume（needs-review/blocked/needs-info/needs-human-decision/cancelled）→ X→new 并把 payload 落盘为 resume 反馈。
 //   - cancel（new/needs-info/needs-review/blocked）→ X→cancelled。
-//   - running/done/cancelled → 不动作（running 由 SubLoop 自查；其余已终态）。
+//   - running/done/error → 不动作（running 由 SubLoop 自查；done/error 已终态）。
 func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
 	cur, _ := e.statusOf(c.TaskID)
 	switch c.Verb {
 	case "resume":
-		if cur == "needs-review" || cur == "blocked" || cur == "needs-info" || cur == "needs-human-decision" {
+		if cur == "needs-review" || cur == "blocked" || cur == "needs-info" || cur == "needs-human-decision" || cur == "cancelled" {
 			if err := e.Store.SetResumeFeedback(c.TaskID, c.Payload); err != nil {
 				return err
 			}
