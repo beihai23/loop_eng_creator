@@ -424,6 +424,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// execute/verify 本轮用哪个 agent 由 plan 的 hint（如有）决定，优先级
 		// step → task（已烘进 role agent）→ role → 默认。
 		exec, execModelRef, llm, verifyModelRef := sl.resolveAgentHints(sid, planOut.AgentHints)
+		// tier-2 token 旁路（修 verify step 行恒为 0）：在 resolve 之后给本轮 LLM 挂一个
+		// usage 指针——base 与 override 两条路径统一覆盖（override 在 resolveAgentHints 里
+		// 复制 sl.VerifyLLM 值时 Usage 还是 nil，这里补上；随后值拷贝进 Chain 的 tiers 共享
+		// 同一指针，Check 写回的 model.Usage 就能被下面的 verify AppendStep 读到落库）。
+		llm.Usage = &model.Usage{}
 
 		// ---- execute (in the attempt's worktree, created before plan) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
@@ -529,6 +534,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			Status:     statusOf2(res.Passed),
 			ModelRef:   verifyModelRef,
 			OutputJSON: string(vt),
+			// tier-2 token 落库（修 verify step 行恒为 0）：llm.Usage 由 verify.LLM.Check
+			// 旁路写回（Skill.Run 的真实 model.Usage）。tier-1 短路或 Chain 出错时 tier-2
+			// 未跑 → 指针保持零值（正确：无 LLM 调用）。仅 role=verify 的 step 行补值，
+			// verifications 表与 tier-1(Deterministic) 不受影响。
+			TokensIn:  llm.Usage.TokensIn,
+			TokensOut: llm.Usage.TokensOut,
 		})
 		// 逐 tier 落盘 verifications（spec §4.6）：best-effort，trace 不 gate loop。
 		// runID 来自 Task 2 的 StartRun 透传；短路时只落实际跑过的 tier。
