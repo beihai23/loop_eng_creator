@@ -2,6 +2,8 @@ package model
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,5 +70,27 @@ func TestKimiAgentDeliversPromptAsArgv(t *testing.T) {
 	}
 	if !strings.Contains(out, prompt) {
 		t.Fatalf("kimi agent must pass the full prompt as a positional argv element; got %q", out)
+	}
+}
+
+// TestKimiAgentFatalInsufficientBalanceAbortsImmediately pins the agent-smoke fix
+// (task #87) for the kimi 同类: a kimi "Insufficient Balance" failure — an account
+// with no credit — is FATAL. 1 attempt, ErrClaudeFatal, no 30/60/120s backoff.
+func TestKimiAgentFatalInsufficientBalanceAbortsImmediately(t *testing.T) {
+	withNoBackoff(t)
+	bin, countDir := writeFakeFatalBinary(t, "fake-kimi-balance",
+		"Error: Insufficient Balance")
+	a, err := NewAgent(config.ModelRef{Provider: "kimi", Binary: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = AsExecuter(a).Exec(context.Background(), t.TempDir(), "do the task")
+	if !errors.Is(err, ErrClaudeFatal) {
+		t.Fatalf("kimi balance error must be ErrClaudeFatal; got: %v", err)
+	}
+	countBytes, _ := os.ReadFile(filepath.Join(countDir, "count"))
+	attempts := len(strings.Split(strings.TrimSpace(string(countBytes)), "\n"))
+	if attempts != 1 {
+		t.Fatalf("kimi balance error must abort after 1 attempt (no retry), got %d", attempts)
 	}
 }
