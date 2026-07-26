@@ -5,6 +5,7 @@ diff:
 {{.AcceptanceCriteria}}
 
 只输出 JSON：{"passed":bool,"reason":"...","failing_criteria":["..."]}
+（你的写工具 Edit / Write / NotebookEdit 已被 `--disallowedTools` 从上下文里物理移除——你只需读 diff 与验收标准、输出 JSON，无需也不必写任何文件。）
 铁律：
 1. 你不知道、也不关心执行端怎么想的；只对 diff 和标准负责。
 2. 逐条核对每个验收标准。任何一条在 diff 中没有对应、充分的实现 → passed=false，并在 failing_criteria 列出该条。
