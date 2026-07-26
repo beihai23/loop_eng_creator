@@ -165,12 +165,16 @@ func TestEscalateBlockedDetailHasHelpFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert: %v", err)
 	}
+	runID, err := st.StartRun(taskID)
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
 	sl := &SubLoop{
 		Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
 		Channel: channel.NewLocal(t.TempDir()),
 	}
 	task := channel.Task{Ref: "Z", Description: "零增益任务"}
-	out := sl.escalateZeroGain(context.Background(), taskID, task, 2,
+	out := sl.escalateZeroGain(context.Background(), taskID, task, runID, 2,
 		"execute 返回 4 个值，plan 冻结 3 个值", "归一签名", "")
 	if out.Status != "blocked" {
 		t.Fatalf("escalateZeroGain 应产 blocked, got %s", out.Status)

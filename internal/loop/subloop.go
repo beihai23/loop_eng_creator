@@ -713,7 +713,13 @@ func (sl *SubLoop) recordRetryGate(runID string, attempt int, sig, prevSig strin
 // helpOutput 产出零增益升级战报的结构化求助。Help skill 已接线（Model!=nil）且 Run 成功 →
 // 用其 HelpOutput；否则退回 synthesizeHelp 兜底（测试不接线 Help 时走此路，Help 出错时也走
 // 此路——blocked 战报始终带 stuck_at/tried/need_from_human）。
-func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt int, priorFailure string) skill.HelpOutput {
+//
+// 记账（spec §8.8）：help 的 Model 经 buildModels 装饰成 *budget.Client，复用本 run 的
+// Enforcer（与 plan/execute/verify 同一个）——BeforeCall(PerCall) 在模型调用前强制、AfterCall
+// 把真实 token 计入 spent。这里只在调用前落一行预算估算（AppendBudget）+ 调用后落一行 help
+// step（role=help，tokens_in/out）；绝不再手动 AfterCall（装饰器已计，否则与 plan/execute 重复
+// 计）。runID 透传自 SubLoop.Run 的 StartRun。
+func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt int, priorFailure, runID string) skill.HelpOutput {
 	if sl.Help.Model != nil {
 		in := skill.HelpInput{
 			Task:            task.Description,
@@ -721,7 +727,15 @@ func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt in
 			AttemptsSummary: fmt.Sprintf("已重试 %d 轮，连续失败签名相同（零增益）", attempt),
 			LastError:       truncateStr(priorFailure, 500),
 		}
-		if out, _, err := sl.Help.Run(ctx, in); err == nil {
+		// 调用前记一行预算估算（best-effort，trace 不 gate）。BeforeCall 由装饰器在 Call 内强制。
+		_ = sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
+		out, u, err := sl.Help.Run(ctx, in) // 装饰器自行 BeforeCall(PerCall)+AfterCall(u)
+		_ = sl.Store.AppendStep(state.StepRow{
+			RunID: runID, Seq: attempt*10 + 10, Role: "help",
+			Status: statusOf(err), Error: errStr(err),
+			TokensIn: u.TokensIn, TokensOut: u.TokensOut,
+		})
+		if err == nil {
 			return out
 		}
 	}
@@ -732,9 +746,9 @@ func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt in
 // （「重试零增益提前终止…」+ help 的 stuck_at/tried/need_from_human + sceneWT 非空时的
 // worktree 保留注记）、经 report 写回。sceneWT 非空时被驳回的 worktree 不丢弃（供人排查；
 // GC 按 TTL 回收）。
-func (sl *SubLoop) escalateZeroGain(ctx context.Context, taskID string, task channel.Task, attempt int, priorFailure, sig, sceneWT string) Outcome {
+func (sl *SubLoop) escalateZeroGain(ctx context.Context, taskID string, task channel.Task, runID string, attempt int, priorFailure, sig, sceneWT string) Outcome {
 	_ = sl.Store.ClearInFlight()
-	help := sl.helpOutput(ctx, task, attempt, priorFailure)
+	help := sl.helpOutput(ctx, task, attempt, priorFailure, runID)
 	detail := "重试零增益提前终止（连续两轮失败签名相同，重试不会自愈）。签名: " + sig + "\n" + formatHelp(help)
 	if sceneWT != "" {
 		detail += "\n（被驳回实现的 worktree 保留于 " + sceneWT + "，供排查/复用；GC 将按 TTL 清理）"
@@ -755,7 +769,7 @@ func (sl *SubLoop) escalateIfZeroGain(ctx context.Context, taskID, ref string, t
 	escalate := zeroGain(*prevSig, sig)
 	sl.recordRetryGate(runID, attempt, sig, *prevSig, newReply, diffChanged, escalate)
 	if escalate {
-		return sl.escalateZeroGain(ctx, taskID, task, attempt, priorFailure, sig, sceneWT), true
+		return sl.escalateZeroGain(ctx, taskID, task, runID, attempt, priorFailure, sig, sceneWT), true
 	}
 	*prevSig = sig
 	return Outcome{}, false
