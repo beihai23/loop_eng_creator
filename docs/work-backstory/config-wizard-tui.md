@@ -1,8 +1,8 @@
 ---
 arc: config-wizard-tui
 started: c17f93e
-status: active
-commits: []
+status: resolved
+commits: [4c9c9ee]
 ---
 
 # 配置向导 TUI 化 + 标签前缀模型（config 体验重构）
