@@ -54,6 +54,13 @@ type ModelRef struct {
 	Via      string   `yaml:"via"`
 	Binary   string   `yaml:"binary"`
 	Cmd      []string `yaml:"cmd"`
+	// ReadOnly is the declarative read-only switch: a role that sets it (the
+	// triage/plan/verify roles) asks the provider to impose its read-only
+	// profile (claude: --permission-mode plan + write tools disallowed). The
+	// provider factory reads it; it is NOT itself a cmd flag. omitempty keeps
+	// zero-value (false) out of the YAML, so existing config.yaml parses with
+	// zero migration and execute (ReadOnly=false) round-trips unchanged.
+	ReadOnly bool `yaml:"readonly,omitempty"`
 }
 
 type Budget struct {

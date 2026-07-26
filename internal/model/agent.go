@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 
@@ -75,7 +76,11 @@ type ProviderFactory func(config.ModelRef) Agent
 // with no provider field keeps today's `claude -p` out-of-box behavior.
 var Providers = map[string]ProviderFactory{
 	"claude": func(ref config.ModelRef) Agent {
-		return &claudeAgent{c: NewClaudeClient(binaryOf(ref, "claude"), ref.Name, ref.Cmd)}
+		args := ref.Cmd
+		if ref.ReadOnly {
+			args = claudeReadOnlyProfile(args)
+		}
+		return &claudeAgent{c: NewClaudeClient(binaryOf(ref, "claude"), ref.Name, args)}
 	},
 	"codex":    func(ref config.ModelRef) Agent { return newCodexAgent(ref) },
 	"opencode": func(ref config.ModelRef) Agent { return newOpencodeAgent(ref) },
@@ -152,6 +157,48 @@ func binaryOf(ref config.ModelRef, def string) string {
 		return ref.Binary
 	}
 	return def
+}
+
+// claudeReadOnlyProfile transforms a claude argv into an airtight read-only
+// profile, so a ReadOnly role (triage/plan/verify) physically cannot modify the
+// main repo — not even via Bash (`echo > file`, `sed -i`, or an out-of-repo
+// absolute path write). This is the hard guarantee that complements worktree
+// isolation (worktree contains in-repo writes; this blocks writes outright).
+//
+// It strips:
+//   - --dangerously-skip-permissions (=bypassPermissions). bypass is mutually
+//     exclusive with plan mode, and only one of the two can win — read-only wins,
+//     so bypass is removed even if a user mis-configured it back in.
+//   - any prior --permission-mode <x> and --permission-mode=<x> (the space form's
+//     value is dropped together with the flag), so our injection is authoritative.
+//
+// Then it appends --permission-mode plan (Bash, Edit, Write, … all run read-only
+// at the permission layer — verified against real claude: read-only Bash returns
+// normally; `touch /tmp/x` is rejected and the file is not created). As
+// defense-in-depth against plan-mode tool-set drift, when cmd carries no
+// --disallowedTools it also appends --disallowedTools Edit Write NotebookEdit.
+func claudeReadOnlyProfile(cmd []string) []string {
+	out := make([]string, 0, len(cmd)+8)
+	for i := 0; i < len(cmd); i++ {
+		switch a := cmd[i]; {
+		case a == "--dangerously-skip-permissions":
+			continue // bypass: mutually exclusive with plan mode; read-only wins
+		case a == "--permission-mode":
+			if i+1 < len(cmd) {
+				i++ // drop the separate value too
+			}
+			continue
+		case strings.HasPrefix(a, "--permission-mode="):
+			continue // drop the combined form
+		default:
+			out = append(out, a)
+		}
+	}
+	out = append(out, "--permission-mode", "plan")
+	if !slices.Contains(out, "--disallowedTools") {
+		out = append(out, "--disallowedTools", "Edit", "Write", "NotebookEdit")
+	}
+	return out
 }
 
 // checkBinary is the shared binary half of Agent.Check: it verifies the
