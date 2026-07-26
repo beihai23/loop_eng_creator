@@ -2,8 +2,34 @@ package channel
 
 import (
 	"context"
+	"log"
 	"time"
 )
+
+// maxRefsPerTick caps how many refs a single daemon tick will poll for
+// replies/states. The daemon previously issued one network call per ref
+// (each with its own 3× retry / 2s-4s backoff), so a busy tick with many
+// parked/blocked tasks could stall dispatch for minutes on a network blip.
+// Capping keeps a single tick bounded: over the cap, the excess is deferred
+// to the next tick (logged, not silently dropped) so the batched/concurrent
+// fetch stays O(cap) wall-clock. The value is chosen well above any realistic
+// single-project parked-task count (50) while keeping one tick's network
+// budget predictable.
+const maxRefsPerTick = 50
+
+// capRefs bounds refs to maxRefsPerTick. When refs exceed the cap the first
+// maxRefsPerTick are kept and the overflow is logged (label names the caller
+// so the log line is attributable) — nothing is silently dropped, the tail
+// just waits for the next tick. Pure function: callers can use it without a
+// receiver (channel methods feed it their own label).
+func capRefs(label string, refs []string) []string {
+	if len(refs) <= maxRefsPerTick {
+		return refs
+	}
+	log.Printf("%s: %d refs > cap %d，本轮只拉前 %d，余下下 tick 再来（非静默丢弃）",
+		label, len(refs), maxRefsPerTick, maxRefsPerTick)
+	return refs[:maxRefsPerTick]
+}
 
 type Task struct {
 	Ref                string
@@ -36,7 +62,17 @@ type Task struct {
 	Agent string
 }
 
-type Reply struct{ Body string }
+// Reply is one human-side comment surfaced back to the daemon. Body is the
+// verbatim comment text. CreatedAt is the comment's RFC3339 time (empty when
+// the channel can't report it). Carrying CreatedAt on the Reply itself —
+// instead of only filtering inside the channel — lets the daemon batch-fetch
+// ALL of a tick's replies (since=zero) and then re-filter per task against
+// each task's own last_comment_at, which is the premise of the batched
+// pollTaskReplies: one network round-trip for N refs, N client-side filters.
+type Reply struct {
+	Body      string
+	CreatedAt string // RFC3339; empty when the channel has no value
+}
 
 // TaskState is the channel-side view of a single task's status — used by the
 // daemon reconcile step to detect human-driven state changes (reopen, un-label)
