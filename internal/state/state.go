@@ -478,16 +478,87 @@ func (s *Store) AppendStep(r StepRow) error {
 }
 
 func (s *Store) AppendTransition(taskID, from, to, reason string) error {
-	_, err := s.db.Exec(
-		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
-		 VALUES(?,?,?,?,?,?)`,
-		newID("tr"), taskID, from, to, reason, nowISO())
+	// Atomic: the transitions INSERT and the task_status UPDATE must both land or
+	// neither — a crash between two bare Execs left a transitions row (e.g.
+	// "running → cancelled") while task_status still said "running" (trace ≠
+	// status). Mirrors InsertTask's Begin/Commit pattern.
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
-		to, nowISO(), taskID)
-	return err
+	if _, err := tx.Exec(
+		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
+		 VALUES(?,?,?,?,?,?)`,
+		newID("tr"), taskID, from, to, reason, nowISO()); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
+		to, nowISO(), taskID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClaimTask atomically transitions a task from "new" to "running" only if it is
+// still "new", closing the read-modify-write race between NextReadyTask and the
+// running mark. A single conditional UPDATE inside one transaction is the
+// primitive: WHERE task_id=? AND status='new' matches exactly one row when the
+// task is still claimable and zero rows once any caller has won it, so under
+// concurrent claimers (two daemon instances on one repo, or the instance lock
+// bypassed by a hand-deleted lock file) only one caller can possibly win — every
+// loser sees RowsAffected()==0.
+//
+// This is the daemon's defense-in-depth for single-instance correctness. The
+// front door is the instance flock (daemon.AcquireLock); ClaimTask is the back
+// stop: even with the lock bypassed, two dispatchers ticking the same FIFO head
+// cannot both enter RunTask, because only one UPDATE affects a row. SQLite WAL +
+// busy_timeout serializes the writers, so the conditional UPDATE is the
+// decision point — no two callers ever see RowsAffected()==1 for the same task.
+//
+// On a win the new→running transition is recorded inside the SAME transaction
+// (same reason the old AppendTransition dispatch path used), keeping the
+// lifecycle trace consistent and atomic with the status flip. Returns
+// (true, nil) on a successful claim; (false, nil) when the task was no longer
+// "new" (already claimed / parked / cancelled) — the caller treats that as
+// "lost the race, skip dispatch".
+func (s *Store) ClaimTask(taskID string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(
+		`UPDATE task_status SET status='running', updated_at=? WHERE task_id=? AND status='new'`,
+		nowISO(), taskID)
+	if err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	if n == 0 {
+		// Not 'new' anymore: another instance/runner already claimed it, or it
+		// was parked/cancelled between NextReadyTask and here. Write nothing —
+		// no transition, no status flip — so the winner's trace stays clean.
+		tx.Rollback()
+		return false, nil
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
+		 VALUES(?,?,?,?,?,?)`,
+		newID("tr"), taskID, "new", "running", "dispatched", nowISO()); err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	return true, nil
 }
 
 // RequeueOrphanedRunning resets every task stuck in status="running" back to

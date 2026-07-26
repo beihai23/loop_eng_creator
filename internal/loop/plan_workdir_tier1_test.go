@@ -70,20 +70,15 @@ func TestTier1PlanRunsInAttemptWorktree(t *testing.T) {
 	if out.Status != "done" {
 		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
 	}
-	// planDirs records EVERY CallIn on the shared recorder: plan (idx 0) and —
-	// since the #81 fix binds tier-2 verify to the same worktree via LLM.Dir —
-	// verify (idx 1). execute goes through Exec (execDirs). All three must land in
-	// the SAME attempt worktree; verify sharing it is exactly the #81 fix.
 	if len(rec.planDirs) != 2 || len(rec.execDirs) != 1 {
-		t.Fatalf("want 2 CallIn (plan+verify) + 1 execute call, got planDirs=%d exec=%d", len(rec.planDirs), len(rec.execDirs))
+		t.Fatalf("want 2 dir-bound skill calls (plan+verify) + 1 execute, got plan=%d exec=%d", len(rec.planDirs), len(rec.execDirs))
 	}
-	if rec.planDirs[0] == "" {
-		t.Fatal("plan must run inside the attempt worktree (RunIn dir), got empty dir")
-	}
-	// plan (idx 0) and verify (idx 1) both bind the attempt worktree execute ran in.
 	for i, d := range rec.planDirs {
+		if d == "" {
+			t.Fatalf("skill call %d must run inside the attempt worktree (RunIn dir), got empty dir", i)
+		}
 		if d != rec.execDirs[0] {
-			t.Fatalf("planDirs[%d]=%q must equal the attempt/execute worktree %q", i, d, rec.execDirs[0])
+			t.Fatalf("plan/verify/execute must share the attempt worktree: call %d dir=%q exec=%q", i, d, rec.execDirs[0])
 		}
 	}
 	if rec.planDirs[0] != out.Worktree {

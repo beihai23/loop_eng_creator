@@ -33,6 +33,26 @@ func TestKeySwitchAndCancel(t *testing.T) {
 	}
 }
 
+// TestKeyResumeOnCancelled 锁定「在 cancelled 任务上按 r 会写 resume 命令」，
+// 防止日后给 r 键加状态门槛把 cancelled 重新挡掉（cancel 后反悔的自助通道）。
+// TUI 代码本身无需改动：model.go 的 r 键对 issueResume 无状态门槛。
+func TestKeyResumeOnCancelled(t *testing.T) {
+	st, _ := state.Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	tid, _ := st.InsertTask(state.TaskRow{IssueRef: "#1", Description: "d"})
+	_ = st.AppendTransition(tid, "new", "cancelled", "cancelled by TUI")
+
+	m := New(st, nil)
+	m.selTask = tid
+
+	mr, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	_ = mr
+	pending, _ := st.PendingCommands()
+	if len(pending) != 1 || pending[0].Verb != "resume" || pending[0].TaskID != tid {
+		t.Fatalf("resume command not written for cancelled task: %+v", pending)
+	}
+}
+
 // TestTabKeyAutoSelectsCursorRow 守住：在总览直接按 t（没先按 Enter）时，
 // 自动把光标行选为 selTask，否则轨迹/详情会落到「（未选中任务）」。
 func TestTabKeyAutoSelectsCursorRow(t *testing.T) {

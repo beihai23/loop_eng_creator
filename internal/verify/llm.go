@@ -12,13 +12,10 @@ import (
 // LLM 本身不持有执行态。
 type LLM struct {
 	Skill skill.Skill[skill.VerifyInput, skill.VerifyOutput]
-	// Dir binds the verify model call to the attempt's worktree (its cwd) so an
-	// agentic verify agent's ground-check reads the tree execute actually edited,
-	// not the daemon's clean base repo (#81: verify used to reject with "主仓库无
-	// 此文件" because it stood in the wrong directory). Empty (zero value) → RunIn
-	// falls back to plain Model.Call, so old production wiring and pure tests that
-	// never set Dir are unchanged. Injected only by SubLoop.tiersFor — the single
-	// place holding the attempt worktree.
+	// Dir 是 tier-2 模型调用的工作目录（attempt 的 worktree，由 tiersFor 注入）。
+	// agentic 的 verify（如 kimi）会拿 diff 对照文件系统 ground-check——#81 的
+	// 假驳回就是它看主仓库（HEAD 干净）而不是 worktree 所致。空 = 默认 cwd
+	// （旧装配/纯测试），行为与引入前一致。Tier 接口签名不变。
 	Dir string
 }
 

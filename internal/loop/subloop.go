@@ -130,14 +130,8 @@ func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput, llm verify.LLM)
 			ScriptBody: s.Body,
 		})
 	}
-	// Bind tier-2's model call to the attempt worktree (#81): an agentic verify
-	// agent must ground-check against the tree execute actually edited, not the
-	// daemon's clean base repo (which silently produced "主仓库无此文件" false
-	// rejections). tiersFor is the single injection point holding wt, and it runs
-	// AFTER resolveAgentHints returns the (possibly agent-hint-overridden) llm, so
-	// both the default wiring and the override path carry Dir=wt — the override
-	// copies sl.VerifyLLM and swaps Skill.Model, then Dir is stamped here. Empty wt
-	// would no-op via RunIn's Call fallback; production always passes a real tree.
+	// tier-2 也进 worktree：agentic verify 会拿 diff 对照文件系统 ground-check，
+	// 它必须站在改动真实发生的树里（#81 假驳回的病根：在主仓库根做 ground-check）。
 	llm.Dir = wt
 	tiers = append(tiers, llm)
 	// tier-3：M3 注入了真人审 tier（HumanTier）就用它；否则 Tier3Human 时挂 HumanStub
@@ -204,11 +198,15 @@ func (sl *SubLoop) resolveAgentHints(sid string, hints *skill.AgentHints) (model
 	return exec, execRef, llm, verifyRef
 }
 
-// planExecEstimate is the conservative per-call token estimate SubLoop feeds
-// the plan and execute BeforeCall pre-checks. AppendBudget logs the same value
-// so the durable budget_ledger row records exactly the estimate the Enforcer
-// checked (spec §8.8).
-const planExecEstimate = 1000
+// Before plan/execute calls SubLoop reserves a FULL PerCall of headroom under
+// the per-task cap — BeforeCall(sl.Budget.PerCall), not a tiny fixed estimate.
+// A call's real size is unknowable up front, so reserving PerCall guarantees the
+// next call cannot push cumulative spend past PerTask by more than the configured
+// per-call ceiling. The old fixed estimate (1000) was far smaller than a real
+// execute call (tens of thousands), so the per-task pre-check only tripped AFTER
+// an overshoot — proven by #86 (spent=266844, per_task=200000, estimate=1000).
+// AppendBudget logs the same PerCall value so the ledger records the estimate
+// the Enforcer checked (spec §8.8).
 
 // Run executes the plan→execute→verify→writeback loop for one task.
 //
@@ -311,13 +309,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- plan ----
 		sl.logf("[subloop] %s phase=plan start", sid)
 		_ = sl.Store.SetInFlight(taskID, "plan")
-		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
+		if err := sl.Budget.BeforeCall(sl.Budget.PerCall); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
 		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
@@ -430,13 +428,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- execute (in the attempt's worktree, created before plan) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
 		_ = sl.Store.SetInFlight(taskID, "execute")
-		if err := sl.Budget.BeforeCall(planExecEstimate); err != nil {
+		if err := sl.Budget.BeforeCall(sl.Budget.PerCall); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
 		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(runID, "call", "tokens", planExecEstimate, sl.Budget.PerCall)
+		sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(effTask.AcceptanceCriteria) + "\n"
@@ -544,6 +542,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			if errors.Is(err, model.ErrClaudeFatal) {
 				_ = sl.Store.ClearInFlight()
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
+			}
+			// 预算类错误（budget.Client 拒付 tier-2）→ 立即 blocked，不进重试循环：
+			// 重跑 plan+execute 只会让预算更糟（#86/#87 实战：verify 被拒付后空烧两轮
+			// plan+execute 才撞墙）。它与 plan/execute BeforeCall 的预算闸语义对齐。
+			if errors.Is(err, budget.ErrPerCall) || errors.Is(err, budget.ErrPerTask) {
+				_ = sl.Store.ClearInFlight()
+				return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 			}
 			priorFailure = "verify error: " + err.Error()
 			// 增益门槛（verify error）：同签名连续失败 → 零增益升级 blocked。wt 已 Discard。
