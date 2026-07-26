@@ -47,3 +47,12 @@ type Channel interface {
 	CloseIssue(ctx context.Context, ref string) error
 	GetTaskStates(ctx context.Context, refs []string) (map[string]TaskState, error)
 }
+
+// StatusLabeler is an optional Channel capability: channels that move status
+// via labels (GitHub) expose how a loop status maps to a label name, so
+// consumers (daemon reconcile) never hardcode the label family — especially
+// under a custom label_prefix ("ai:running" instead of "loop:running").
+// Channels without label semantics (Local) simply don't implement it.
+type StatusLabeler interface {
+	StatusLabel(status string) string
+}

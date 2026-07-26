@@ -110,6 +110,30 @@ func TestConfigCmdGithubFlow(t *testing.T) {
 	}
 }
 
+// TestConfigCmdGithubFlowGuidance 钉死「小白向引导文案不回归」：github 流程的输出
+// 必须带开场定向、task_label 的用途解释（「总开关」）、以及收尾的下一步指引——
+// 这些是 #UX 重设计的核心交付，静默丢失（如 refactor 删了 print）要能红。
+func TestConfigCmdGithubFlowGuidance(t *testing.T) {
+	dir := t.TempDir()
+	in := strings.NewReader("2\nmyorg/myrepo\n\n")
+	var out bytes.Buffer
+	if err := runConfigInteractive(in, &out, dir); err != nil {
+		t.Fatalf("github flow: %v", err)
+	}
+	for _, want := range []string{
+		"配置向导",       // 开场定向
+		"任务来源",       // channel 是什么
+		"总开关",         // task_label 的用途解释（评测点的核心缺失）
+		"preflight",      // 状态标签谁来检查
+		"干活引擎",       // coding-agent 是什么
+		"loop-eng doctor", // 收尾下一步
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("guidance text missing %q; out=\n%s", want, out.String())
+		}
+	}
+}
+
 func TestConfigCmdLinearFlowKeyNotInConfig(t *testing.T) {
 	dir := t.TempDir()
 	// 选 2：写 .loop/linear.key

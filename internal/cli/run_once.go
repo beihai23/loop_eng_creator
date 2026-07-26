@@ -128,7 +128,9 @@ func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
 		}
 		return ch, nil
 	case "github":
-		return channel.NewGitHub(cfg.Channel.Repo, cfg.Channel.TaskLabel), nil
+		gh := channel.NewGitHub(cfg.Channel.Repo, cfg.Channel.TaskLabel)
+		gh.LabelPrefix = cfg.Channel.LabelPrefix // 空 = 默认 "loop:"（channel 内部归一）
+		return gh, nil
 	case "linear":
 		key := os.Getenv(channel.LinearAPIKeyEnv)
 		if key == "" {

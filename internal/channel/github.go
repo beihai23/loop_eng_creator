@@ -35,10 +35,13 @@ var loopStatusNames = []string{
 
 // GitHub is a channel.Channel backed by the authenticated `gh` CLI (no SDK,
 // no stored token — reuses the operator's `gh auth`). Issues with TaskLabel
-// are tasks; comments are battle reports; status moves via labels loop:<status>.
+// are tasks; comments are battle reports; status moves via labels <prefix><status>.
 type GitHub struct {
 	Repo      string // owner/name
 	TaskLabel string // e.g. "loop:task"
+	// LabelPrefix 是状态标签族前缀（空 = "loop:"）。多实例共存时各实例用各自
+	// 前缀（"ai:" → ai:running…）——互斥剥离只碰自己前缀的标签，不碰别家。
+	LabelPrefix string
 
 	// ghFunc, when non-nil, replaces the real `gh` exec for every call. It is
 	// the test seam — production leaves it nil so gh() runs the real retried
@@ -49,6 +52,19 @@ type GitHub struct {
 	// runs at most once per GitHub instance — lazily from the first UpdateStatus.
 	ensureOnce sync.Once
 }
+
+// prefix returns the effective status-label prefix ("loop:" when unset).
+func (g *GitHub) prefix() string {
+	if g.LabelPrefix != "" {
+		return g.LabelPrefix
+	}
+	return "loop:"
+}
+
+// StatusLabel renders the repo label for one loop status (e.g. "loop:running",
+// or "ai:running" under a custom prefix). It backs channel.StatusLabeler so the
+// daemon never hardcodes the label family.
+func (g *GitHub) StatusLabel(status string) string { return g.prefix() + status }
 
 func NewGitHub(repo, taskLabel string) *GitHub {
 	return &GitHub{Repo: repo, TaskLabel: taskLabel}
@@ -132,16 +148,21 @@ func (g *GitHub) PostComment(ctx context.Context, ref, body string) error {
 }
 
 // statusLabelsToRemove 算出 UpdateStatus 需要先摘掉的旧状态标签：labels 中所有
-// 带 "loop:" 前缀、既不等于 taskLabel（loop:task 是任务身份证，永不动）也不等于
-// "loop:"+newStatus（正要打上的新标签）的标签。状态标签互斥——任意时刻一个 issue
-// 最多一个 loop:<status>（修 #30 同时挂 loop:done + loop:blocked 的可信度问题）。
+// 带本实例 prefix（loop: 或自定义前缀）、既不等于 taskLabel（任务身份证，永不动）
+// 也不等于 prefix+newStatus（正要打上的新标签）的标签。状态标签互斥——任意时刻
+// 一个 issue 最多一个 <prefix><status>（修 #30 同时挂两个状态标签的可信度问题）。
+// 别家前缀（如另一实例的 loop:）一律不碰——多实例共存时互不误删（#72 评审发现
+// 的边缘 bug：按硬编码 "loop:" 剥会误删别实例的任务身份证）。
 // 纯函数，便于 tier-1 直接钉互斥语义；签名固定，测试与之对齐。
-func statusLabelsToRemove(labels []string, newStatus, taskLabel string) []string {
-	keep := "loop:" + newStatus
+func statusLabelsToRemove(labels []string, newStatus, taskLabel, prefix string) []string {
+	if prefix == "" {
+		prefix = "loop:"
+	}
+	keep := prefix + newStatus
 	var out []string
 	for _, l := range labels {
-		if !strings.HasPrefix(l, "loop:") {
-			continue // 非 loop 体系的标签（人打的、仓库自有的）一律不碰
+		if !strings.HasPrefix(l, prefix) {
+			continue // 非本实例前缀的标签（人打的、仓库自有的、别实例的）一律不碰
 		}
 		if l == taskLabel || l == keep {
 			continue
@@ -162,7 +183,7 @@ func (g *GitHub) EnsureLabels(ctx context.Context) {
 	g.ensureOnce.Do(func() {
 		names := make([]string, 0, len(loopStatusNames)+1)
 		for _, s := range loopStatusNames {
-			names = append(names, "loop:"+s)
+			names = append(names, g.prefix()+s)
 		}
 		if g.TaskLabel != "" {
 			names = append(names, g.TaskLabel)
@@ -188,7 +209,7 @@ func (g *GitHub) EnsureLabels(ctx context.Context) {
 func (g *GitHub) UpdateStatus(ctx context.Context, ref, status string) error {
 	g.EnsureLabels(ctx)
 
-	add := "loop:" + status
+	add := g.prefix() + status
 	remove := g.currentStatusLabelsToRemove(ctx, ref, status)
 
 	// remove first, in its own edit. Best-effort: a stale/racy remove must not
@@ -225,7 +246,7 @@ func (g *GitHub) currentStatusLabelsToRemove(ctx context.Context, ref, status st
 	for _, l := range v.Labels {
 		labels = append(labels, l.Name)
 	}
-	return statusLabelsToRemove(labels, status, g.TaskLabel)
+	return statusLabelsToRemove(labels, status, g.TaskLabel, g.prefix())
 }
 
 func (g *GitHub) CloseIssue(ctx context.Context, ref string) error {

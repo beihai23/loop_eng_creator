@@ -457,7 +457,12 @@ func (e *Engine) reconcile(ctx context.Context) error {
 				}
 			}
 		case "blocked":
+			// 状态标签名从 channel 取（自定义 label_prefix 时不是 loop:blocked）；
+			// 无标签语义的 channel（Local）回落默认族名。
 			blockLabel := "loop:blocked"
+			if sl, ok := e.Channel.(channel.StatusLabeler); ok {
+				blockLabel = sl.StatusLabel("blocked")
+			}
 			hasBlockLabel := false
 			for _, l := range s.Labels {
 				if l == blockLabel {

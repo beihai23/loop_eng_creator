@@ -22,6 +22,10 @@ type Channel struct {
 	Provider  string `yaml:"provider"`   // "" | "local" | "github" | "linear"
 	Repo      string `yaml:"repo"`       // "owner/name"（github 必填）
 	TaskLabel string `yaml:"task_label"` // issue 过滤标签（github 必填）
+	// LabelPrefix 是 loop:<status> 状态标签族的前缀（github），空 = "loop:"。
+	// 多实例共存同一仓库或组织命名规范时自定义（如 "ai:" → ai:running/ai:done…）。
+	// 与 TaskLabel 独立：身份标签可以单独是任何名字，状态族只看前缀。
+	LabelPrefix string `yaml:"label_prefix,omitempty"`
 	// Inbox 是 local provider 的 inbox 路径（相对 repo 根），空 = 默认 "inbox"。
 	Inbox string `yaml:"inbox,omitempty"`
 	// Linear 是 linear provider 的配置块；指针为 nil 时整块省略。

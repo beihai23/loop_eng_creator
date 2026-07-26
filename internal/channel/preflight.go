@@ -97,15 +97,27 @@ func (g *GitHub) Preflight(ctx context.Context) ([]PreflightIssue, error) {
 }
 
 // requiredLabels is the full loop label set Preflight checks for, in a stable
-// order: the status family (loopStatusNames order) then the task identity label.
-// Stable order → deterministic checklist output.
+// order: the status family (loopStatusNames order, under the instance's prefix)
+// then the task identity label. Stable order → deterministic checklist output.
 func (g *GitHub) requiredLabels() []string {
+	return RequiredGitHubLabels(g.prefix(), g.TaskLabel)
+}
+
+// RequiredGitHubLabels returns the full label set a loop-eng GitHub channel
+// needs in the repo: the status family under prefix (empty prefix = "loop:")
+// plus the task identity label (configurable, e.g. a custom "ai:task").
+// Exported so the config wizard can offer to create the same set Preflight
+// will later check (single source).
+func RequiredGitHubLabels(prefix, taskLabel string) []string {
+	if prefix == "" {
+		prefix = "loop:"
+	}
 	required := make([]string, 0, len(loopStatusNames)+1)
 	for _, s := range loopStatusNames {
-		required = append(required, "loop:"+s)
+		required = append(required, prefix+s)
 	}
-	if g.TaskLabel != "" {
-		required = append(required, g.TaskLabel)
+	if taskLabel != "" {
+		required = append(required, taskLabel)
 	}
 	return required
 }

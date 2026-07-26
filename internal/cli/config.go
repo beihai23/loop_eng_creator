@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"loop-eng/internal/config"
 	"loop-eng/internal/model"
@@ -27,10 +28,15 @@ func NewConfigCmd() *cobra.Command {
 	var repo string
 	cmd := &cobra.Command{
 		Use:   "config",
-		Short: "交互式配置 loop-eng（脚手架 + channel provider 引导）",
+		Short: "交互式配置向导（任务来源 + 干活引擎；脚手架 + 逐步讲解）",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if repo == "" {
 				repo, _ = os.Getwd()
+			}
+			// TTY → 全屏向导（bubbletea，alt-screen）；管道/脚本 → 行模式
+			// （保持 piped-stdin 脚本兼容，config_test.go 的输入契约不变）。
+			if isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd()) {
+				return runConfigWizard(repo)
 			}
 			return runConfigInteractive(cmd.InOrStdin(), cmd.OutOrStdout(), repo)
 		},
@@ -63,6 +69,15 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		return err
 	}
 
+	// 开场定向：小白用户最需要的是「我接下来要配什么、为什么」的全景图，
+	// 而不是一上来就被追问一堆看不懂的字段。
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "loop-eng 配置向导 —— 只需要配好两件事：")
+	fmt.Fprintln(out, "  ① 任务来源（channel）：loop-eng 从哪里领任务、把战报写回哪里（GitHub Issue / Linear / 本地目录）")
+	fmt.Fprintln(out, "  ② 干活引擎（coding agent）：实际思考和改代码的 AI CLI（claude / codex / kimi …）")
+	fmt.Fprintln(out, "提示：[] 里是默认值，直接回车即采用；Ctrl-C 可随时退出。")
+	fmt.Fprintln(out)
+
 	r := bufio.NewReader(in)
 	provider, err := pickProvider(r, out)
 	if err != nil {
@@ -82,6 +97,8 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		} else if !ghAuthed() {
 			fmt.Fprintln(out, "检测到 gh 未登录，请先执行: gh auth login")
 		}
+		fmt.Fprintln(out, "GitHub 仓库（owner/名称）：loop-eng 从这个仓库的 Issues 领任务，")
+		fmt.Fprintln(out, "并把进度、验证结果和战报评论写回同一个仓库。")
 		repoDef := cfg.Channel.Repo
 		repoName, err := promptLine(r, out, "GitHub repo (owner/name)", repoDef)
 		if err != nil {
@@ -91,6 +108,14 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		if labelDef == "" {
 			labelDef = "loop:task"
 		}
+		// task_label 是小白最容易卡住的字段——必须说清三件事：它是干什么的
+		// （派发给 AI 的开关）、默认值是什么、配套状态标签谁来检查。
+		fmt.Fprintln(out, "任务标签（task_label）：loop-eng 只处理带这个标签的 issue。")
+		fmt.Fprintln(out, "想交给 AI 的任务就打上它；没打的 issue 永远不会被自动执行——")
+		fmt.Fprintln(out, "这是你控制「哪些任务交给 AI」的总开关。")
+		fmt.Fprintln(out, "运行时还会用到 loop:running / loop:done / loop:blocked 等状态标签；")
+		fmt.Fprintln(out, "daemon 启动时会自动体检（preflight）并列出缺失标签的创建清单。")
+		fmt.Fprintln(out, "没有特殊需求的话，直接回车用默认即可。")
 		label, err := promptLine(r, out, "task_label", labelDef)
 		if err != nil {
 			return err
@@ -115,6 +140,7 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 			projDef = cfg.Channel.Linear.Project
 			teamDef = cfg.Channel.Linear.Team
 		}
+		fmt.Fprintln(out, "Linear 项目：loop-eng 从这个项目领任务（issue 带上任务标签，默认同 GitHub 流程）。")
 		project, err := promptLine(r, out, "Linear project (name 或 uuid)", projDef)
 		if err != nil {
 			return err
@@ -123,6 +149,9 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		if err != nil {
 			return err
 		}
+		fmt.Fprintln(out, "状态映射（status_map）：loop-eng 的内部状态（running/done/blocked 等）")
+		fmt.Fprintln(out, "要对应到你 team 里的 WorkflowState 名称。格式 type=state，逗号分隔；")
+		fmt.Fprintln(out, "留空 = 按状态类型自动对应，大多数 team 不需要改。")
 		statusMapIn, err := promptLine(r, out, "status_map（type=state 逗号串，空=默认）", "")
 		if err != nil {
 			return err
@@ -156,6 +185,8 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 		if inboxDef == "" {
 			inboxDef = "inbox"
 		}
+		fmt.Fprintln(out, "inbox 目录：把任务写成 markdown 文件放进这个目录，loop-eng 会轮询领取——")
+		fmt.Fprintln(out, "适合先本地试用，不碰任何外部服务。")
 		inbox, err := promptLine(r, out, "inbox 路径", inboxDef)
 		if err != nil {
 			return err
@@ -168,7 +199,13 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 	// 复用 pickProvider 的 non-interactive-safe 语义——scope 行空/EOF（含 piped
 	// stdin 在 channel 步用尽后的尾部 EOF）→ 保持现状、继续 Save，故现有 piped
 	// stdin 脚本零回归。channel provider 为空时已在上方提前 return，根本不触达这里。
-	scope, err := promptLine(r, out, "coding-agent provider 配置方式 (1=全局, 2=逐角色)", "")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "── 第 2 步 · 干活引擎（coding agent）──")
+	fmt.Fprintln(out, "loop-eng 自己不思考，它调用 AI CLI 干活。内部分四个环节：")
+	fmt.Fprintln(out, "  triage（任务分诊）→ plan（规划方案）→ execute（动手改代码）→ verify（独立验证）")
+	fmt.Fprintln(out, "可以四个环节用同一个引擎（简单），也可以分开指定（进阶：比如 verify 用")
+	fmt.Fprintln(out, "不同厂商的引擎做交叉验证，独立性更强）。")
+	scope, err := promptLine(r, out, "coding-agent provider 配置方式 (1=全局同一个, 2=逐角色分别选)", "")
 	if err != nil {
 		return err
 	}
@@ -188,7 +225,7 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 	case "2":
 		// 逐角色：每个角色独立选，空=保持该角色现状。
 		for _, role := range roles {
-			fmt.Fprintf(out, "当前 %s provider: %s\n", role, roleProvider(cfg, role))
+			fmt.Fprintf(out, "── %s（%s）· 当前 provider: %s ──\n", role, roleMeaning(role), roleProvider(cfg, role))
 			prov, err := pickAgentProvider(r, out)
 			if err != nil {
 				return err
@@ -202,7 +239,21 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 	if err := config.Save(cfgPath, cfg); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "配置已写入 %s（provider=%s）\n", cfgPath, provider)
+	// 收尾：告诉用户配置落在哪、生效了什么、接下来干什么——当前流程在一句
+	// 「已写入」后戛然而止，小白不知道下一步。
+	fmt.Fprintln(out)
+	fmt.Fprintf(out, "配置已写入 %s（channel=%s）\n", cfgPath, provider)
+	fmt.Fprintln(out, "接下来：")
+	fmt.Fprintln(out, "  1. loop-eng doctor   —— 体检：检查各引擎 CLI 是否装好登录、任务/状态标签是否齐全")
+	fmt.Fprintln(out, "  2. loop-eng daemon   —— 启动常驻循环，开始自动领任务")
+	switch provider {
+	case "github":
+		fmt.Fprintf(out, "  3. 给想交给 AI 的 issue 打上 %s 标签，daemon 下一个 tick 就会领走\n", cfg.Channel.TaskLabel)
+	case "local":
+		fmt.Fprintf(out, "  3. 把任务写成 markdown 文件放进 %s/，daemon 下一个 tick 就会领走\n", cfg.Channel.Inbox)
+	case "linear":
+		fmt.Fprintln(out, "  3. 在 Linear 项目里给任务打上配置的任务标签，daemon 下一个 tick 就会领走")
+	}
 	return nil
 }
 
@@ -212,10 +263,12 @@ func runConfigInteractive(in io.Reader, out io.Writer, repo string) error {
 // config". Invalid input reprints the menu and reads again.
 func pickProvider(r *bufio.Reader, out io.Writer) (string, error) {
 	for {
-		fmt.Fprintln(out, "选择 channel provider:")
-		fmt.Fprintln(out, "  1) local   — 本地 inbox/ 目录，零外部依赖")
-		fmt.Fprintln(out, "  2) github  — GitHub Issues（经 gh CLI）")
-		fmt.Fprintln(out, "  3) linear  — Linear（GraphQL API）")
+		fmt.Fprintln(out, "── 第 1 步 · 任务来源（channel）──")
+		fmt.Fprintln(out, "loop-eng 是一个自动干活的循环：领任务 → 规划 → 改代码 → 验证 → 汇报。")
+		fmt.Fprintln(out, "「任务来源」就是它领任务、写回战报的地方。选择 channel provider:")
+		fmt.Fprintln(out, "  1) local   — 本地 inbox/ 目录：任务写成文件放进去即可，零外部依赖，适合先试用")
+		fmt.Fprintln(out, "  2) github  — GitHub Issues：给 issue 打个标签就派发，战报写回 issue 评论（需要 gh CLI）")
+		fmt.Fprintln(out, "  3) linear  — Linear：从 Linear 项目领任务（需要 API key）")
 		fmt.Fprint(out, "> ")
 		line, err := r.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -237,6 +290,36 @@ func pickProvider(r *bufio.Reader, out io.Writer) (string, error) {
 	}
 }
 
+// agentProviderDesc annotates each registered coding-agent provider with a
+// one-line novice-facing description for the config menu. Presentation copy
+// lives here (cli layer); the provider SET stays single-sourced in
+// model.RegisteredProviders — a new provider appears in the menu as its bare
+// name until someone writes its one-liner here.
+var agentProviderDesc = map[string]string{
+	"claude":   "Anthropic Claude Code（默认；最成熟的接入路径）",
+	"codex":    "OpenAI Codex CLI",
+	"kimi":     "Kimi Code CLI",
+	"kilo":     "Kilo Code CLI",
+	"opencode": "opencode（开源，可接多家模型）",
+}
+
+// roleMeaning returns the novice-facing one-liner for a SubLoop role, used by
+// the per-role provider walkthrough so the user knows what they are picking an
+// engine FOR.
+func roleMeaning(role string) string {
+	switch role {
+	case "triage":
+		return "任务分诊：判断任务信息够不够、适不适合自动做"
+	case "plan":
+		return "规划：读代码、定实现方案和验收脚本"
+	case "execute":
+		return "执行：在隔离 worktree 里动手改代码"
+	case "verify":
+		return "验证：独立复核改动是否满足验收标准"
+	}
+	return ""
+}
+
 // pickAgentProvider prints the coding-agent provider menu (drawn dynamically
 // from the model registry) and reads one line. Accepts a 1-based number OR the
 // provider name, case-insensitively and trimmed. Empty line or EOF returns
@@ -249,9 +332,13 @@ func pickProvider(r *bufio.Reader, out io.Writer) (string, error) {
 func pickAgentProvider(r *bufio.Reader, out io.Writer) (string, error) {
 	names := model.RegisteredProviders()
 	for {
-		fmt.Fprintln(out, "选择 coding-agent provider:")
+		fmt.Fprintln(out, "选择 coding-agent provider（引擎 CLI 需已安装并登录）：")
 		for i, n := range names {
-			fmt.Fprintf(out, "  %d) %s\n", i+1, n)
+			if desc := agentProviderDesc[n]; desc != "" {
+				fmt.Fprintf(out, "  %d) %s — %s\n", i+1, n, desc)
+			} else {
+				fmt.Fprintf(out, "  %d) %s\n", i+1, n)
+			}
 		}
 		fmt.Fprint(out, "> ")
 		line, err := r.ReadString('\n')

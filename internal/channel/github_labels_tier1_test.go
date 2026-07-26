@@ -17,6 +17,7 @@ package channel
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -229,5 +230,52 @@ func TestGitHubEnsureLabelsIsBestEffort(t *testing.T) {
 	rec.mu.Unlock()
 	if gotCreates != wantCreates {
 		t.Fatalf("EnsureLabels issued %d label creates, want %d (no short-circuit on failure); calls=%v", gotCreates, wantCreates, rec.calls)
+	}
+}
+
+// TestTier1UpdateStatusCustomPrefix：LabelPrefix=ai: 的实例打 ai:running、创建
+// ai:* 状态族 + 任务标签——整组标签随前缀派生（自定义前缀端到端的最小证据）。
+func TestTier1UpdateStatusCustomPrefix(t *testing.T) {
+	labelsJSON := []byte(`{"labels":[{"name":"ai:task"},{"name":"ai:blocked"}]}`)
+	rec := &ghRecorder{resp: func(args []string) ([]byte, error) {
+		if ghClassify(args) == "issue-view" {
+			return labelsJSON, nil
+		}
+		return nil, nil
+	}}
+	g := &GitHub{Repo: "owner/repo", TaskLabel: "ai:task", LabelPrefix: "ai:", ghFunc: rec.run}
+	if err := g.UpdateStatus(context.Background(), "42", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.hasCall("issue", "edit", "--add-label", "ai:running") {
+		t.Fatalf("UpdateStatus must add ai:running under custom prefix; calls=%v", rec.calls)
+	}
+	if !rec.hasCall("issue", "edit", "--remove-label", "ai:blocked") {
+		t.Fatalf("UpdateStatus must remove old ai: status; calls=%v", rec.calls)
+	}
+	if !rec.hasCall("label", "create", "ai:running", "--force") || !rec.hasCall("label", "create", "ai:task", "--force") {
+		t.Fatalf("EnsureLabels must create the ai: family + task label; calls=%v", rec.calls)
+	}
+}
+
+// TestTier1RequiredGitHubLabelsPrefix：preflight/向导共用的所需标签集合随前缀
+// 派生（ai: → ai:running… + ai:task）；空前缀回落 loop:。
+func TestTier1RequiredGitHubLabelsPrefix(t *testing.T) {
+	got := RequiredGitHubLabels("ai:", "ai:task")
+	for _, want := range []string{"ai:running", "ai:done", "ai:blocked", "ai:task"} {
+		found := false
+		for _, n := range got {
+			if n == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("RequiredGitHubLabels(ai:) missing %q: %v", want, got)
+		}
+	}
+	for _, n := range got {
+		if strings.HasPrefix(n, "loop:") {
+			t.Fatalf("custom-prefix set must not contain loop: labels: %v", got)
+		}
 	}
 }
