@@ -44,5 +44,38 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, model.Usage, 
 	return out, u, err
 }
 
-// Compile-time guard: Client is a model.Client.
+// CallIn implements model.DirClient, making *budget.Client transparent to the
+// dir-binding machinery (skill.RunIn → DirClient.CallIn). This is the
+// production-load-bearing piece of the #81 fix: the verify skill's Model is
+// ALWAYS *budget.Client in the assembled SubLoop (run-once, daemon, and the
+// subloop agent-hint override all wrap the agent this way), so unless
+// *budget.Client implements DirClient, RunIn's `Model.(model.DirClient)`
+// assertion fails and SILENTLY degrades to Call — the model call then runs in
+// the daemon's cwd (the clean base repo), and an agentic verify agent's
+// ground-check sees the wrong tree (#81's false "主仓库无此文件" rejections).
+// Setting LLM.Dir alone is not enough; this method makes the chain hold in
+// production, not just in tests using a bare DirClient fake.
+//
+// Semantics mirror Call exactly: BeforeCall(PerCall) budget pre-check (rejects
+// WITHOUT calling Base when over budget), delegate to Base — CallIn when Base is
+// a DirClient and dir is non-empty (the production agentClient →
+// AgentRequest.Workdir → adapter cmd.Dir=dir path), else plain Call (test fakes,
+// clients without dir support, empty dir) — then AfterCall the real usage so the
+// tally still converges on truth.
+func (c *Client) CallIn(ctx context.Context, dir, prompt string) (string, model.Usage, error) {
+	if err := c.Enf.BeforeCall(c.Enf.PerCall); err != nil {
+		return "", model.Usage{}, err
+	}
+	if dc, ok := c.Base.(model.DirClient); ok && dir != "" {
+		out, u, err := dc.CallIn(ctx, dir, prompt)
+		c.Enf.AfterCall(u)
+		return out, u, err
+	}
+	out, u, err := c.Base.Call(ctx, prompt)
+	c.Enf.AfterCall(u)
+	return out, u, err
+}
+
+// Compile-time guards: Client is a model.Client AND a model.DirClient.
 var _ model.Client = (*Client)(nil)
+var _ model.DirClient = (*Client)(nil)
