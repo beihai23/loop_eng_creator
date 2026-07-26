@@ -685,6 +685,100 @@ func TestDrainCommandsResumeIdempotentTerminal(t *testing.T) {
 	}
 }
 
+// TestDrainCommandsCrashMidIdempotent 钉死 drainCommands 的 crash-中途幂等契约
+// （原 applyCommand + MarkCommandApplied 两步非事务的原子替代）。构造旧两步代码的
+// crash 残留态：任务 blocked 上挂一条 pending resume 命令，先用 AppendTransition
+// 模拟旧 applyCommand 已提交 transition（status 已翻 new）但 crash 在 MarkCommandApplied
+// 之前（命令仍 pending）；再调 drainCommands（= 重启重 drain）。断言 transitions 行数
+// 不变（无重复）、无 from_status="" 的行（无错 from_status）、命令现已 applied。
+// 并附 happy-path 双 drain：fresh resume-on-blocked 连 drain 两次只产一条 blocked→new。
+func TestDrainCommandsCrashMidIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	eng := &Engine{Channel: &scriptedChannel{}, Store: st, Interval: time.Second}
+
+	id, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#1", Description: "d"})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := st.AppendTransition(id, "new", "blocked", "exhausted"); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	if err := st.InsertCommand(id, "resume", "retry fix Z"); err != nil {
+		t.Fatalf("insert cmd: %v", err)
+	}
+
+	// 模拟旧两步代码的 crash 残留：applyCommand 已提交 transition（blocked→new，
+	// status 已翻 new）但 crash 落在 MarkCommandApplied 之前——命令仍 pending。
+	if err := st.AppendTransition(id, "blocked", "new", "tui resume: retry fix Z"); err != nil {
+		t.Fatalf("simulate pre-crash transition: %v", err)
+	}
+
+	transBefore, err := st.Transitions(id)
+	if err != nil {
+		t.Fatalf("transitions before: %v", err)
+	}
+	before := len(transBefore)
+
+	// 重启重 drain：命令幂等标记 applied，不写重复 transition（task 已不在 resumable 集）。
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	transAfter, err := st.Transitions(id)
+	if err != nil {
+		t.Fatalf("transitions after: %v", err)
+	}
+	if len(transAfter) != before {
+		t.Fatalf("re-drain wrote a duplicate transition: before=%d after=%d %+v", before, len(transAfter), transAfter)
+	}
+	for _, tr := range transAfter {
+		if tr.From == "" {
+			t.Fatalf("transition with empty from_status (wrong from_status): %+v", tr)
+		}
+	}
+	pend, err := st.PendingCommands()
+	if err != nil {
+		t.Fatalf("pending cmds: %v", err)
+	}
+	if len(pend) != 0 {
+		t.Fatalf("pending=%d want 0 (crash-restart re-drain must mark applied)", len(pend))
+	}
+
+	// Happy-path 双 drain：fresh resume-on-blocked 连 drain 两次只产一条 blocked→new。
+	id2, err := st.InsertTask(state.TaskRow{IssueRef: "o/r#2", Description: "d"})
+	if err != nil {
+		t.Fatalf("insert id2: %v", err)
+	}
+	if err := st.AppendTransition(id2, "new", "blocked", "exhausted"); err != nil {
+		t.Fatalf("park id2: %v", err)
+	}
+	if err := st.InsertCommand(id2, "resume", "go"); err != nil {
+		t.Fatalf("insert cmd id2: %v", err)
+	}
+	countBlockedToNew := func() int {
+		trans, err := st.Transitions(id2)
+		if err != nil {
+			t.Fatalf("transitions id2: %v", err)
+		}
+		n := 0
+		for _, tr := range trans {
+			if tr.To == "new" && tr.From == "blocked" {
+				n++
+			}
+		}
+		return n
+	}
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain id2 #1: %v", err)
+	}
+	if err := eng.drainCommands(context.Background()); err != nil {
+		t.Fatalf("drain id2 #2: %v", err)
+	}
+	if n := countBlockedToNew(); n != 1 {
+		t.Fatalf("fresh resume-on-blocked double drain: blocked→new transitions=%d want exactly 1", n)
+	}
+}
+
 // growingChannel models a channel whose visible task set grows over time:
 // ListNewTasks always returns the *current* snapshot (no per-call advance), and
 // add() appends a task mid-flight. This simulates a human filing a new issue

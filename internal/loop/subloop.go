@@ -230,7 +230,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			return Outcome{Status: "error"}, err
 		}
 	}
-	sl.Store.AppendTransition(taskID, "", "running", "dispatched")
+	// 派发 transition（new→running）仅在 run-once 路径写：daemon 路径
+	// （PreinsertedTaskID 非空）已由 engine.ClaimTask 写过同一条（from=new），
+	// 这里再写一条会是 ""→running 的重复派发（from 错、且与 engine 双写）。
+	// from_status 用 "new"（InsertTask 刚把任务置 new），不再吞 error。
+	if sl.PreinsertedTaskID == "" {
+		if err := sl.Store.AppendTransition(taskID, "new", "running", "dispatched"); err != nil {
+			return Outcome{Status: "error"}, err
+		}
+	}
 
 	// →running 即在 channel 上标出「正在处理」（loop:running）。SubLoop.Run 是所有
 	// 执行路径（daemon 派发 + cli run-once）的漏斗，在这里打标覆盖 run-once——它
@@ -981,9 +989,16 @@ func improvementSuggestions(task channel.Task, res verify.VerifyResult) []string
 // status itself is unchanged — a writeback failure does not flip a done to a
 // blocked.
 func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task, status, detail string) Outcome {
-	if err := sl.Store.AppendTransition(taskID, "running", status, detail); err != nil {
-		fmt.Fprintf(os.Stderr, "writeback error: AppendTransition failed: %v\n", err)
-		detail += " [writeback partial: transition: " + err.Error() + "]"
+	// 终态 transition（running→status）仅在 run-once 路径写：daemon 路径
+	// （PreinsertedTaskID 非空）的终态 transition 交给 engine（engine.tick 在 RunTask
+	// 返回后写，reason=detail）——engine 是 daemon 路径唯一的 transition 写者。report
+	// 的其余写回（PostComment/SetLastCommentAt/UpdateStatus）两路径都照常执行（daemon
+	// 路径仍需 channel 战报 + 打标）。
+	if sl.PreinsertedTaskID == "" {
+		if err := sl.Store.AppendTransition(taskID, "running", status, detail); err != nil {
+			fmt.Fprintf(os.Stderr, "writeback error: AppendTransition failed: %v\n", err)
+			detail += " [writeback partial: transition: " + err.Error() + "]"
+		}
 	}
 	if err := sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: PostComment failed: %v\n", err)

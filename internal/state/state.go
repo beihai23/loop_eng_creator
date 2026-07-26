@@ -1032,6 +1032,108 @@ func (s *Store) MarkCommandApplied(cmdID string) error {
 	return err
 }
 
+// ApplyCommand is the atomic replacement for the daemon's old two-step
+// applyCommand (write a transition) + MarkCommandApplied: it marks the command
+// applied AND writes the resulting status transition (and optional resume
+// feedback) inside ONE transaction, so a crash can never land between the
+// transition and the applied mark. A re-drain of an already-applied command
+// (crash-restart) is a complete no-op (applied=false, transitioned=false) — the
+// conditional `applied_at IS NULL` mark is the gate, so the same command can be
+// drained again safely with no duplicate transition.
+//
+// The state read is sunk INTO the transaction (SELECT status inside the same tx
+// that marks applied), so the recorded from_status is always the task's true
+// status at apply time — never a stale read from before the tx. Mirrors
+// ClaimTask's conditional-UPDATE-in-one-tx pattern.
+//
+// fromStatus is the allow-list of statuses this command may transition from
+// (the verb's resumable/cancellable set). When the task's current status is not
+// in fromStatus (terminal/running), no transition is written — but applied is
+// still marked (so the command does not re-drain forever). A nil fromStatus
+// (unknown verb) marks applied without ever writing a transition.
+//
+// Returns applied=true on the first apply (the command was pending and is now
+// marked), applied=false on a re-drain (already applied → no-op). transitioned
+// is true only when a transition was actually written this call.
+func (s *Store) ApplyCommand(cmdID, taskID string, fromStatus []string, toStatus, reason, feedback string) (applied, transitioned bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, false, err
+	}
+	// ① Conditional mark applied: only the first apply flips applied_at from NULL.
+	// A re-drain (crash-restart) hits RowsAffected==0 → applied=false → the whole
+	// call is a no-op (no transition, no feedback), exactly the idempotent contract.
+	res, err := tx.Exec(`UPDATE commands SET applied_at=? WHERE id=? AND applied_at IS NULL`,
+		nowISO(), cmdID)
+	if err != nil {
+		tx.Rollback()
+		return false, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		tx.Rollback()
+		return false, false, err
+	}
+	if n == 0 {
+		// Already applied — re-drain. Write nothing; the command stays applied.
+		tx.Rollback()
+		return false, false, nil
+	}
+	// ② Read the task's status INSIDE the same tx (consistent): the recorded
+	// from_status is exactly the status at apply time. ErrNoRows (no task_status
+	// row) → commit the applied mark, write no transition.
+	var cur string
+	if err := tx.QueryRow(`SELECT status FROM task_status WHERE task_id=?`, taskID).Scan(&cur); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if err := tx.Commit(); err != nil {
+				return false, false, err
+			}
+			return true, false, nil
+		}
+		tx.Rollback()
+		return false, false, err
+	}
+	// ③ If the task's status is in the allow-list, flip it conditionally
+	// (WHERE status=cur) and record the transition inside the same tx. The
+	// conditional flip makes a re-drain a true no-op even if the command were
+	// re-applied after the status already moved on. feedback (resume payload) is
+	// written to parked_detail so the next SubLoop Run pops it as priorFailure.
+	for _, from := range fromStatus {
+		if from != cur {
+			continue
+		}
+		flip, ferr := tx.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=? AND status=?`,
+			toStatus, nowISO(), taskID, cur)
+		if ferr != nil {
+			tx.Rollback()
+			return false, false, ferr
+		}
+		fn, _ := flip.RowsAffected()
+		if fn > 0 {
+			if _, ierr := tx.Exec(
+				`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
+				 VALUES(?,?,?,?,?,?)`,
+				newID("tr"), taskID, cur, toStatus, reason, nowISO()); ierr != nil {
+				tx.Rollback()
+				return false, false, ierr
+			}
+			if feedback != "" {
+				if _, ferr := tx.Exec(`UPDATE task_status SET parked_detail=? WHERE task_id=?`,
+					feedback, taskID); ferr != nil {
+					tx.Rollback()
+					return false, false, ferr
+				}
+			}
+			transitioned = true
+		}
+		break
+	}
+	if err := tx.Commit(); err != nil {
+		return false, false, err
+	}
+	return true, transitioned, nil
+}
+
 // CancelRequested reports whether a pending (unapplied) cancel command exists
 // for a task. SubLoop self-checks this at phase boundaries so a running task
 // stops cooperatively at the next phase (spec §4.5/§7).

@@ -1704,3 +1704,124 @@ func TestSubLoopValidPlanNoRegression(t *testing.T) {
 		}
 	}
 }
+
+// TestSubLoopDaemonPathNoDuplicateTransitions 钉死 daemon 路径下 SubLoop 写零条
+// 生命周期 transition：派发（new→running）由 engine.ClaimTask 写过，终态
+// （running→status）交给 engine——SubLoop 在 daemon 路径（PreinsertedTaskID 非空）
+// 两者都跳过，engine 是唯一 transition 写者（与其 docstring 契约一致）。
+//
+// 对照 run-once 路径（PreinsertedTaskID=""）仍写 new→running + running→done 各一条，
+// 行为不变。复用既有 initRepo/mkSkill/model.NewFake/budget.New/validPlanJSON helpers。
+func TestSubLoopDaemonPathNoDuplicateTransitions(t *testing.T) {
+	task := channel.Task{Ref: "70", Description: "d", AcceptanceCriteria: []string{"c"}}
+
+	// runSubLoop 装配一个全 pass 的 SubLoop，按 daemon 标志决定是否预派发，跑完后返回
+	// 该 task 的 transitions。daemon 路径用 PreinsertedTaskID 固定 taskID；run-once 路径
+	// SubLoop 自行 InsertTask，故跑完后从唯一的 task_status 行读回 taskID。
+	runSubLoop := func(t *testing.T, daemon bool) []state.TransitionRow {
+		t.Helper()
+		repo := initRepo(t)
+		st, _ := state.Open(t.TempDir() + "/s.db")
+		defer st.Close()
+
+		fake := model.NewFake(map[string]string{
+			"PLAN:":    validPlanJSON(),
+			"EXECUTE:": "ok",
+			"VERIFY:":  mustJSON(skill.VerifyOutput{Passed: true}),
+		})
+		var preinserted string
+		if daemon {
+			taskID, err := st.InsertTask(state.TaskRow{
+				IssueRef: task.Ref, Description: task.Description,
+				TaskType: task.TaskType, Source: "daemon", Criteria: task.AcceptanceCriteria,
+			})
+			if err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+			// 模拟 engine 已派发——ClaimTask 写 new→running、置 status=running。
+			claimed, err := st.ClaimTask(taskID)
+			if err != nil || !claimed {
+				t.Fatalf("ClaimTask: claimed=%v err=%v", claimed, err)
+			}
+			preinserted = taskID
+		}
+		sl := &SubLoop{
+			Repo: repo, Store: st, Budget: budget.New(100000, 1000000, 3),
+			Execute:    fake,
+			Plan:       mkSkill[skill.PlanInput, skill.PlanOutput]("PLAN:", fake),
+			VerifyLLM:  verify.LLM{Skill: mkSkill[skill.VerifyInput, skill.VerifyOutput]("VERIFY:", fake)},
+			Tier3Human: true,
+			Channel:    channel.NewLocal(t.TempDir()),
+		}
+		sl.PreinsertedTaskID = preinserted // "" → run-once 路径
+
+		out, err := sl.Run(context.Background(), task)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if out.Status != "done" {
+			t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
+		}
+		// 读回 transitions 的 taskID：daemon 路径即预插入的；run-once 路径 SubLoop 自建，
+		// 取唯一的 task_status 行。
+		tid := preinserted
+		if tid == "" {
+			statuses, err := st.ListStatuses()
+			if err != nil || len(statuses) != 1 {
+				t.Fatalf("run-once: want exactly 1 task status, got %d (err %v)", len(statuses), err)
+			}
+			tid = statuses[0].ID
+		}
+		trans, err := st.Transitions(tid)
+		if err != nil {
+			t.Fatalf("transitions: %v", err)
+		}
+		return trans
+	}
+
+	// ---- daemon 路径：SubLoop 写零条生命周期 transition ----
+	daemonTrans := runSubLoop(t, true)
+	// 派发行仅一条且为 new→running（ClaimTask 写的那条）。
+	var dispatch int
+	var runningToDone int
+	for _, tr := range daemonTrans {
+		if tr.From == "" {
+			t.Fatalf("daemon path: transition with empty from_status: %+v", tr)
+		}
+		if tr.From == "new" && tr.To == "running" {
+			dispatch++
+		}
+		if tr.From == "running" && tr.To == "done" {
+			runningToDone++
+		}
+	}
+	if dispatch != 1 {
+		t.Fatalf("daemon path: new→running dispatch transitions=%d want exactly 1 (no \"\"→running dup, no second dispatch): %+v", dispatch, daemonTrans)
+	}
+	// report 在 daemon 路径跳过终态 transition——SubLoop 不得写 running→done。
+	if runningToDone != 0 {
+		t.Fatalf("daemon path: SubLoop wrote running→done (%d) — report must skip terminal transition in daemon path: %+v", runningToDone, daemonTrans)
+	}
+
+	// ---- run-once 路径：仍写 new→running + running→done 各一条（行为不变）----
+	onceTrans := runSubLoop(t, false)
+	var onceDispatch, onceDone int
+	for _, tr := range onceTrans {
+		if tr.From == "" {
+			t.Fatalf("run-once path: transition with empty from_status: %+v", tr)
+		}
+		if tr.From == "new" && tr.To == "running" {
+			onceDispatch++
+		}
+		if tr.From == "running" && tr.To == "done" {
+			onceDone++
+		}
+	}
+	if onceDispatch != 1 {
+		t.Fatalf("run-once path: new→running dispatch transitions=%d want 1: %+v", onceDispatch, onceTrans)
+	}
+	if onceDone != 1 {
+		t.Fatalf("run-once path: running→done terminal transitions=%d want 1: %+v", onceDone, onceTrans)
+	}
+}
+

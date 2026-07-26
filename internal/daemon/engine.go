@@ -261,7 +261,11 @@ func (e *Engine) tick(ctx context.Context) error {
 	} else {
 		e.logf("[daemon] tick done: task %s → %s", shortTaskID(ready.ID), status)
 	}
-	return e.Store.AppendTransition(ready.ID, "running", status, "ran")
+	// 终态 transition 的 reason 用 outcome detail（verify 结果/失败原因），不再用
+	// 占位 "ran"：daemon 路径下 report 已不再写终态 transition（engine 是唯一写者），
+	// engine 须把有意义的 detail 落进 trace，否则 observability 回退。transient-infra
+	// 分支（上面 running→new）保持其原 reason 不变。
+	return e.Store.AppendTransition(ready.ID, "running", status, detail)
 }
 
 // ingest pulls new tasks from the channel into the durable FIFO, deduped by
@@ -661,10 +665,12 @@ func joinReplies(rs []channel.Reply) string {
 	return strings.Join(parts, " | ")
 }
 
-// drainCommands applies every pending TUI command (resume/cancel) and marks it
-// applied (spec §4.2/§7)。幂等：目标已终态（done/cancelled）或 running（由 SubLoop
-// 自查处理）的命令只回写 applied_at，不产生 transition。单条命令出错则中断本轮
-// drain，下 tick 从尚未 applied 的行重试。
+// drainCommands applies every pending TUI command (resume/cancel) atomically
+// (spec §4.2/§7)。每条命令单次调用 Store.ApplyCommand：transition + applied 标记 +
+// （可选）feedback 收进一个事务，crash 不可能落在 transition 与 applied 之间。幂等：
+// 目标已终态（done/cancelled）或 running（由 SubLoop 自查处理）的命令只回写
+// applied_at，不产生 transition；重 drain 同一命令（crash 重启后）是完全 no-op。单条
+// 命令出错则中断本轮 drain，下 tick 从尚未 applied 的行重试。
 func (e *Engine) drainCommands(ctx context.Context) error {
 	cmds, err := e.Store.PendingCommands()
 	if err != nil {
@@ -674,9 +680,6 @@ func (e *Engine) drainCommands(ctx context.Context) error {
 		if err := e.applyCommand(ctx, c); err != nil {
 			return err
 		}
-		if err := e.Store.MarkCommandApplied(c.ID); err != nil {
-			return err
-		}
 	}
 	if len(cmds) > 0 {
 		e.logf("[daemon] tick commands: drained %d", len(cmds))
@@ -684,26 +687,27 @@ func (e *Engine) drainCommands(ctx context.Context) error {
 	return nil
 }
 
-// applyCommand 把单条 TUI 命令翻译成 transition（spec §7）：
-//   - resume（needs-review/blocked/needs-info/needs-human-decision/cancelled）→ X→new 并把 payload 落盘为 resume 反馈。
-//   - cancel（new/needs-info/needs-review/blocked）→ X→cancelled。
-//   - running/done/error → 不动作（running 由 SubLoop 自查；done/error 已终态）。
+// applyCommand 把单条 TUI 命令按动词算出 effect 后单次调用 Store.ApplyCommand（spec
+// §7）：transition + applied + feedback 同事务，状态读下沉到事务内（不再调
+// e.statusOf）。终态/running 任务上的命令 ApplyCommand 内部判定 from_status 不在白名单
+// → 只回写 applied、不产生 transition（幂等）。
+//   - resume（needs-review/blocked/needs-info/needs-human-decision/cancelled）→ X→new，payload 落盘为 resume 反馈。
+//   - cancel（new/needs-info/needs-human-decision/needs-review/blocked）→ X→cancelled。
+//   - 未知 verb → ApplyCommand(fromStatus=nil) 仅标记 applied，不写 transition（防永久重 drain）。
 func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
-	cur, _ := e.statusOf(c.TaskID)
 	switch c.Verb {
 	case "resume":
-		if cur == "needs-review" || cur == "blocked" || cur == "needs-info" || cur == "needs-human-decision" || cur == "cancelled" {
-			if err := e.Store.SetResumeFeedback(c.TaskID, c.Payload); err != nil {
-				return err
-			}
-			return e.Store.AppendTransition(c.TaskID, cur, "new", "tui resume: "+c.Payload)
-		}
+		_, _, err := e.Store.ApplyCommand(c.ID, c.TaskID,
+			[]string{"needs-review", "blocked", "needs-info", "needs-human-decision", "cancelled"},
+			"new", "tui resume: "+c.Payload, c.Payload)
+		return err
 	case "cancel":
-		switch cur {
-		case "new", "needs-info", "needs-human-decision", "needs-review", "blocked":
-			return e.Store.AppendTransition(c.TaskID, cur, "cancelled", "cancelled by TUI")
-		}
-		// running → SubLoop 自查处理；done/cancelled → 已终态
+		_, _, err := e.Store.ApplyCommand(c.ID, c.TaskID,
+			[]string{"new", "needs-info", "needs-human-decision", "needs-review", "blocked"},
+			"cancelled", "cancelled by TUI", "")
+		return err
 	}
-	return nil
+	// 未知 verb：仅标记 applied，不写 transition（防永久重 drain）。
+	_, _, err := e.Store.ApplyCommand(c.ID, c.TaskID, nil, "", "", "")
+	return err
 }
