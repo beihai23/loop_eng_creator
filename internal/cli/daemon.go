@@ -60,7 +60,7 @@ func NewDaemonCmd() *cobra.Command {
 				// 任务级 agent override：daemon 从 issue 摄取的 task.Agent 覆盖各角色 provider
 				// （agent: codex → 该任务全程用 codex）。未知 provider 静默回落 config 默认。
 				taskCfg := applyTaskAgent(cfg, task.Agent)
-				exec, plan, verifySkill, _ := buildModels(taskCfg, models, bz)
+				exec, plan, verifySkill, _, help := buildModels(taskCfg, models, bz)
 
 				// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
 				// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
@@ -70,6 +70,7 @@ func NewDaemonCmd() *cobra.Command {
 					Budget:            bz,
 					Execute:           exec,
 					Plan:              plan,
+					Help:              help,
 					VerifyLLM:         verify.LLM{Skill: verifySkill},
 					Tier3Human:        taskCfg.Verify.Tier3Human,
 					Channel:           ch,
@@ -125,7 +126,7 @@ func NewDaemonCmd() *cobra.Command {
 			// Triage 门：派发前对 FIFO 队首分诊（spec triage/gate）。buildModels 需要
 			// 一个 Enforcer，但 triage 本身不走 budget（per-run 作用域，triage 在 run
 			// 之前；一次小调用/次派发）——只为构建 skill 传一个独立的 Enforcer。
-			_, _, _, triageSkill := buildModels(cfg, models, budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries))
+			_, _, _, triageSkill, _ := buildModels(cfg, models, budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries))
 			triageFn := func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error) {
 				out, _, err := triageSkill.Run(ctx, skill.TriageInput{
 					TaskDescription:    task.Description,
