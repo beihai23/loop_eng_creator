@@ -64,3 +64,15 @@ type Channel interface {
 type StatusLabeler interface {
 	StatusLabel(status string) string
 }
+
+// MergeChecker is an optional Channel capability for channels that integrate
+// done work via a pull-request-style flow (GitHub). IsPRMerged reports whether
+// the PR opened from the given head branch has been merged. The daemon's
+// reconcile step uses it to auto-close an issue left OPEN pending merge: once
+// the branch's PR merges, the next tick closes the issue (closing the
+// "done-before-integrated" gap — #72/#75 had PRs merged only after their issues
+// were already closed). Channels without PR semantics (Local, Linear) simply
+// don't implement it; reconcile then leaves the issue alone (no merge to detect).
+type MergeChecker interface {
+	IsPRMerged(ctx context.Context, branch string) (bool, error)
+}

@@ -452,9 +452,36 @@ func (e *Engine) reconcile(ctx context.Context) error {
 		switch cur {
 		case "done":
 			if s.IsOpen {
-				e.logf("[daemon] reconcile: done task %s (#%s) reopened on channel → re-queue", task.ID, ref)
-				if err := e.Store.AppendTransition(task.ID, "done", "new", "reconcile: channel reopened"); err != nil {
-					return err
+				if task.LandBranch != "" {
+					// 非空 land_branch = done 任务故意留 issue OPEN 等合并（PR 已建 /
+					// LAND PARTIAL / land 失败 / commit 失败哨兵）。不重排队——等 PR 合并。
+					// channel 实现 MergeChecker（GitHub）且该分支 PR 已 merged → 关 issue
+					//（自迁移记 reason，task_status 仍 done）；未 merged / 查询出错 / channel
+					// 无合并检测能力（Local/Linear）→ 不动，等下一 tick 再查。
+					if mc, ok := e.Channel.(channel.MergeChecker); ok {
+						merged, merr := mc.IsPRMerged(ctx, task.LandBranch)
+						if merr != nil {
+							e.logf("[daemon] reconcile: done task %s (#%s) IsPRMerged(%s) error: %v (leave open, retry next tick)",
+								task.ID, ref, task.LandBranch, merr)
+						}
+						if merr == nil && merged {
+							e.logf("[daemon] reconcile: done task %s (#%s) PR %s merged → close issue",
+								task.ID, ref, task.LandBranch)
+							if err := e.Channel.CloseIssue(ctx, ref); err != nil {
+								e.logf("[daemon] reconcile: CloseIssue #%s failed: %v", ref, err)
+							}
+							if err := e.Store.AppendTransition(task.ID, "done", "done",
+								"reconcile: PR merged → issue closed"); err != nil {
+								return err
+							}
+						}
+					}
+				} else {
+					// land_branch 空 = 旧 reopen 语义（本地直落已关 issue、被人 reopen）→ 重排队（回归不变）。
+					e.logf("[daemon] reconcile: done task %s (#%s) reopened on channel → re-queue", task.ID, ref)
+					if err := e.Store.AppendTransition(task.ID, "done", "new", "reconcile: channel reopened"); err != nil {
+						return err
+					}
 				}
 			}
 		case "blocked":

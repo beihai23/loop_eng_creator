@@ -77,21 +77,26 @@ func NewRunOnceCmd() *cobra.Command {
 				AgentForRole:    agentForRole(cfg),
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
-			// Integrate done work: prefer a GitHub PR. push 最终失败 → LAND PARTIAL
-			//（不 FF-merge、保留 branch、detail+评论带标记）；其他 PR 失败 → FF-merge 兜底。
+			// Integrate done work + decide close-vs-defer (finalizeLand). Same
+			// close-vs-defer logic as the daemon: a local FF-merge success closes
+			// the issue; a PR / LAND PARTIAL / land-failure leaves it OPEN with a
+			// 「待合并」note (the issue is no longer closed by SubLoop.report()).
+			// run-once is one-shot (no reconcile), so it does not record a
+			// land_branch — a PR left open here is closed by hand or a later daemon
+			// run, not by a reconcile tick.
 			if err == nil && out.Status == "done" && out.Branch != "" {
 				prTitle := prTitleFor(tasks[0].Title, tasks[0].Description, tasks[0].Ref)
 				prBody := prBodyFor(tasks[0].Title, tasks[0].Ref)
 				prURL, prErr := createPR(repo, cfg.Channel.Repo, out.Branch, out.Worktree, prTitle, prBody)
-				if prErr != nil {
-					logf := func(format string, args ...any) {
-						fmt.Fprintf(os.Stderr, format+"\n", args...)
-					}
-					if extra := handlePRFailure(context.Background(), ch, tasks[0].Ref, repo, out.Worktree, out.Branch, prErr, logf); extra != "" {
-						out.Detail += "\n" + extra
-					}
-				} else {
+				if prErr == nil {
 					fmt.Printf("PR created: %s\n", prURL)
+				}
+				logf := func(format string, args ...any) {
+					fmt.Fprintf(os.Stderr, format+"\n", args...)
+				}
+				res := finalizeLand(context.Background(), ch, tasks[0].Ref, repo, out.Worktree, out.Branch, prURL, prErr, logf)
+				if res.Note != "" {
+					out.Detail += "\n" + res.Note
 				}
 			}
 			fmt.Printf("outcome: %s — %s\n", out.Status, out.Detail)
