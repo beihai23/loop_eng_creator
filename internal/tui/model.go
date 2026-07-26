@@ -184,7 +184,15 @@ func (m Model) View() string {
 		if m.selTask == "" {
 			return "（未选中任务）\n"
 		}
-		return windowLines(RenderDetail(m.store, m.cfg, m.selTask), m.detailScroll, m.height)
+		// body 走可滚动窗口（height-1 行），detailHints 作 footer 钉在第 height 行——内容
+		// 高于窗口时滚到底仍见按键提示（issue 第 2 点）。height<=0（非 TTY）不裁剪，全文 +
+		// footer（可重定向）。clampDetailScroll 仍按 len(lines)-height 钳制：body 末尾 trailing
+		// 换行使末行（预算行）在最大滚动处仍可见，footer 紧随其后占第 height 行。
+		body := RenderDetail(m.store, m.cfg, m.selTask)
+		if m.height > 0 {
+			return windowLines(body, m.detailScroll, m.height-1) + "\n" + detailHints()
+		}
+		return body + "\n" + detailHints()
 	case tabTrace:
 		if m.selTask == "" {
 			return "（未选中任务）\n"

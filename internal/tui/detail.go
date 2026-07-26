@@ -66,17 +66,18 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	// 内容可能很长（含战报/issue 评论），详情 tab 支持 j/k 滚动查看（model.go）。
 	if runOK {
 		planPrompt, execPrompt, _ := st.InitialPrompts(runID)
-		b.WriteString("\n初始提示词（最近一次启动）:\n")
-		b.WriteString("  [plan]\n")
+		b.WriteString("\n" + detailHeader("初始提示词（最近一次启动）:") + "\n")
+		// [plan]/[execute] 子标签 cyan+bold：在大量提示词墙内提供颜色锚点，定位两段输入边界。
+		b.WriteString("  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("[plan]") + "\n")
 		b.WriteString(indentBlock(planPrompt))
-		b.WriteString("  [execute]\n")
+		b.WriteString("  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6")).Render("[execute]") + "\n")
 		b.WriteString(indentBlock(execPrompt))
 	}
 
 	// 验收方式（逐 tier 状态扫描内存切片 vers）
 	// 列对齐用 lipgloss Width（tier 号 / label 固定宽截断 / 状态末列），不再空格凑——
 	// CJK label（人审 / plan 未产出）也能对齐；状态按 ✓绿/✗红/—faint 着色（spec §6）。
-	b.WriteString("\n" + lipglossBold.Render("验收方式:") + "\n")
+	b.WriteString("\n" + detailHeader("验收方式:") + "\n")
 	for _, tv := range verifyTiers(cfg, vers) {
 		tierCol := lipgloss.NewStyle().Width(detailTierW).Render(fmt.Sprintf("tier-%d", tv.Tier))
 		labelCol := lipgloss.NewStyle().Width(detailLabelW).Render(tv.Label)
@@ -85,7 +86,7 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	}
 
 	// 验收标准
-	b.WriteString("\n" + lipglossBold.Render("验收标准:") + "\n")
+	b.WriteString("\n" + detailHeader("验收标准:") + "\n")
 	for _, c := range t.Criteria {
 		b.WriteString("  • " + c + "\n")
 	}
@@ -108,13 +109,47 @@ func RenderDetail(st *state.Store, cfg *config.Config, taskID string) string {
 	// 接近上限时黄/红提示——见 budgetLine）
 	used, limit := budgetUsed(st, cfg, taskID, runID)
 	b.WriteString("\n" + budgetLine(used, limit) + "\n")
-	b.WriteString("\n[j/k] 滚动   [r] resume   [x] cancel   [t] 看轨迹   [Esc] 回总览\n")
+	// 按键提示已从 body 移除——由 model.View() 作 footer（detailHints）钉底，内容再长也
+	// 无需滚到末尾才看到（issue 第 2 点）。
 	return b.String()
 }
 
 // —— 辅助（同文件）——
 
 var lipglossBold = lipglossNewBold()
+
+// detailAccent 是详情页章节标题的 cyan accent（左侧 ▍ 色条）：TrueColor 下渲染
+// \x1b[36m（与既有 Color("2")→\x1b[32m、Color("9")→\x1b[91m 同源映射）。它作为独立
+// styled run 只渲染色条，标题本身仍走 lipglossBold——故 \x1b[1m 紧贴标题文本的既有契约
+// 保留；Ascii 降级下颜色剥离、▍ 字符与标题文本不丢，大量文字中章节仍可辨识（issue 第 1 点）。
+var detailAccent = lipgloss.NewStyle().Foreground(lipgloss.Color("6")) // cyan
+
+// detailHeader 渲染章节标题：cyan accent 色条 + bold 标题。色条与标题是两个独立
+// styled run，故 \x1b[1m 紧贴标题文本（detail_aligncolor_tier1 / detail_render 的
+// bold-header 断言不变）。
+func detailHeader(title string) string {
+	return detailAccent.Render("▍ ") + lipglossBold.Render(title)
+}
+
+// detailHints 渲染详情页底栏按键提示（键 bold + 描述 faint，复刻 overview hintsLine 样式）。
+// 独立于 RenderDetail 的滚动 body——View() 把它作 footer 钉在第 height 行，内容再长也
+// 无需滚到末尾才看到（issue 第 2 点）。
+func detailHints() string {
+	pairs := []struct{ key, desc string }{
+		{"j/k", "滚动"},
+		{"r", "resume"},
+		{"x", "cancel"},
+		{"t", "轨迹"},
+		{"Esc", "总览"},
+	}
+	var segs []string
+	for _, p := range pairs {
+		segs = append(segs,
+			lipgloss.NewStyle().Bold(true).Render(p.key)+
+				lipgloss.NewStyle().Faint(true).Render(" "+p.desc))
+	}
+	return strings.Join(segs, "  ")
+}
 
 // 验收方式 tier 行列宽（显示单元格）：tier 号 / label 固定宽（CJK 友好，超长按显示
 // 宽截断）/ status 为末列不固定宽。用 lipgloss Width 对齐，不再空格凑（spec §6）。
