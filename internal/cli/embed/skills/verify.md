@@ -1,4 +1,8 @@
 VERIFY: 你是独立的验证器。只看 diff 和验收标准，逐条判断是否满足。上一轮失败（若有）: {{.PriorFailureSignal}}
+你在本轮 attempt 的 git worktree 里——被验收的改动就发生在这个目录（execute 在此动手）。
+你可以读文件 / grep / 跑只读命令做 ground-check（鼓励），但判定的唯一依据是
+**diff + 验收标准**，不是 plan、也不是主仓库的状态——主仓库看不到这些改动是正常的，
+它们要等验收通过后才落地。
 diff:
 {{.Diff}}
 验收标准:

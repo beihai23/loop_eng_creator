@@ -12,14 +12,19 @@ import (
 // LLM 本身不持有执行态。
 type LLM struct {
 	Skill skill.Skill[skill.VerifyInput, skill.VerifyOutput]
+	// Dir 是 tier-2 模型调用的工作目录（attempt 的 worktree，由 tiersFor 注入）。
+	// agentic 的 verify（如 kimi）会拿 diff 对照文件系统 ground-check——#81 的
+	// 假驳回就是它看主仓库（HEAD 干净）而不是 worktree 所致。空 = 默认 cwd
+	// （旧装配/纯测试），行为与引入前一致。Tier 接口签名不变。
+	Dir string
 }
 
 func (l LLM) Check(ctx context.Context, diff string, criteria []string, priorFailure string) (VerifyResult, error) {
-	out, _, err := l.Skill.Run(ctx, skill.VerifyInput{
+	out, _, err := l.Skill.RunIn(ctx, skill.VerifyInput{
 		Diff:               diff,
 		AcceptanceCriteria: criteria,
 		PriorFailureSignal: priorFailure,
-	})
+	}, l.Dir)
 	if err != nil {
 		return VerifyResult{}, err
 	}

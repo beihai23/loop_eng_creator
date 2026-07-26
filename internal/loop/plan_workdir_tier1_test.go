@@ -70,14 +70,16 @@ func TestTier1PlanRunsInAttemptWorktree(t *testing.T) {
 	if out.Status != "done" {
 		t.Fatalf("want done, got %s (%s)", out.Status, out.Detail)
 	}
-	if len(rec.planDirs) != 1 || len(rec.execDirs) != 1 {
-		t.Fatalf("want 1 plan + 1 execute call, got plan=%d exec=%d", len(rec.planDirs), len(rec.execDirs))
+	if len(rec.planDirs) != 2 || len(rec.execDirs) != 1 {
+		t.Fatalf("want 2 dir-bound skill calls (plan+verify) + 1 execute, got plan=%d exec=%d", len(rec.planDirs), len(rec.execDirs))
 	}
-	if rec.planDirs[0] == "" {
-		t.Fatal("plan must run inside the attempt worktree (RunIn dir), got empty dir")
-	}
-	if rec.planDirs[0] != rec.execDirs[0] {
-		t.Fatalf("plan and execute must share the attempt worktree: plan=%q exec=%q", rec.planDirs[0], rec.execDirs[0])
+	for i, d := range rec.planDirs {
+		if d == "" {
+			t.Fatalf("skill call %d must run inside the attempt worktree (RunIn dir), got empty dir", i)
+		}
+		if d != rec.execDirs[0] {
+			t.Fatalf("plan/verify/execute must share the attempt worktree: call %d dir=%q exec=%q", i, d, rec.execDirs[0])
+		}
 	}
 	if rec.planDirs[0] != out.Worktree {
 		t.Fatalf("plan worktree should be the preserved done worktree: plan=%q out=%q", rec.planDirs[0], out.Worktree)

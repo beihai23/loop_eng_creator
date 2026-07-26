@@ -130,6 +130,9 @@ func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput, llm verify.LLM)
 			ScriptBody: s.Body,
 		})
 	}
+	// tier-2 也进 worktree：agentic verify 会拿 diff 对照文件系统 ground-check，
+	// 它必须站在改动真实发生的树里（#81 假驳回的病根：在主仓库根做 ground-check）。
+	llm.Dir = wt
 	tiers = append(tiers, llm)
 	// tier-3：M3 注入了真人审 tier（HumanTier）就用它；否则 Tier3Human 时挂 HumanStub
 	// 自动通过占位。HumanStub 不再产 NeedsHuman，故 M1/M2 的 done/blocked 路径不受影响。
@@ -535,6 +538,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			if errors.Is(err, model.ErrClaudeFatal) {
 				_ = sl.Store.ClearInFlight()
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
+			}
+			// 预算类错误（budget.Client 拒付 tier-2）→ 立即 blocked，不进重试循环：
+			// 重跑 plan+execute 只会让预算更糟（#86/#87 实战：verify 被拒付后空烧两轮
+			// plan+execute 才撞墙）。它与 plan/execute BeforeCall 的预算闸语义对齐。
+			if errors.Is(err, budget.ErrPerCall) || errors.Is(err, budget.ErrPerTask) {
+				_ = sl.Store.ClearInFlight()
+				return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 			}
 			priorFailure = "verify error: " + err.Error()
 			// 增益门槛（verify error）：同签名连续失败 → 零增益升级 blocked。wt 已 Discard。
