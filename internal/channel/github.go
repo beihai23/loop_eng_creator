@@ -254,6 +254,28 @@ func (g *GitHub) CloseIssue(ctx context.Context, ref string) error {
 	return err
 }
 
+// IsPRMerged reports whether any PR opened from the given head branch has been
+// merged into the base. It backs channel.MergeChecker so the daemon's reconcile
+// step can auto-close an issue left OPEN pending merge once the branch's PR
+// lands. `gh pr list --head <branch> --state merged` returns one row per merged
+// PR for that head; len > 0 means the branch's work has been integrated. Errors
+// (gh unavailable, no such branch) surface as (false, err) — reconcile logs and
+// treats them as "not merged yet" (waits for the next tick rather than closing).
+func (g *GitHub) IsPRMerged(ctx context.Context, branch string) (bool, error) {
+	out, err := g.gh(ctx, "pr", "list", "--repo", g.Repo,
+		"--head", branch, "--state", "merged", "--limit", "1", "--json", "number")
+	if err != nil {
+		return false, err
+	}
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(out, &prs); err != nil {
+		return false, fmt.Errorf("parse gh pr list merged: %w", err)
+	}
+	return len(prs) > 0, nil
+}
+
 func (g *GitHub) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
 	out := make(map[string][]Reply, len(refs))
 	for _, ref := range refs {

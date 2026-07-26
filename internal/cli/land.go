@@ -145,6 +145,67 @@ func handlePRFailure(ctx context.Context, ch channel.Channel, issueRef, repo, wt
 	return extra
 }
 
+// LandResult is finalizeLand's decision: whether the done work is fully
+// integrated, and — if not — which branch it still lives on (so the caller can
+// record it for the daemon's merge-pending reconcile). Note is appended to the
+// done battle-report detail (empty = clean integration, nothing to surface).
+type LandResult struct {
+	Integrated bool   // true = work landed on main (local FF-merge); issue closed. false = still pending (PR/partial/land-fail); issue left OPEN.
+	Branch     string // when !Integrated, the branch the work lives on (recorded as land_branch); empty when Integrated (branch was FF-merged + discarded).
+	Note       string // appended to the done detail; e.g. "PR 待合并：<url>" or the LAND PARTIAL marker.
+}
+
+// finalizeLand turns a createPR result into a close-vs-defer decision — the
+// single place that decides whether a done task's issue closes now or stays open
+// pending merge. It does NOT call createPR itself (the caller passes prURL/prErr)
+// so the three-way decision is unit-testable in isolation.
+//
+// Decision (mirrors the DoD: PR path defers, local-FF-merge path closes):
+//   - prErr == nil (PR created): issue stays OPEN; post "PR 待合并：<url>，合并后
+//     自动关闭" so the operator knows a merge is expected; return Branch for the
+//     caller to record (reconcile closes the issue once the PR merges).
+//   - errors.Is(prErr, ErrPushFailed) (LAND PARTIAL): handlePRFailure keeps the
+//     branch + worktree and posts the partial marker; issue stays OPEN; Branch
+//     returned for reconcile to poll.
+//   - any other gh-side failure: handlePRFailure runs the local land() FF-merge
+//     fallback. extra == "" → the local merge succeeded → the work is integrated
+//     → CloseIssue now (Integrated=true, regression: local direct-land still
+//     closes the issue). extra != "" → land failed (non-FF) → issue stays OPEN,
+//     Branch returned.
+//
+// ch may be nil (caller has no channel); the close/comment side-effects are then
+// skipped but the decision (Integrated/Branch/Note) is still returned.
+func finalizeLand(ctx context.Context, ch channel.Channel, issueRef, repo, worktree, branch, prURL string, prErr error, logf func(format string, args ...any)) LandResult {
+	// PR 创建成功：工作尚未合并——issue 留开，发「待合并」评论（含 URL + 合并后自动关闭）。
+	if prErr == nil {
+		note := "PR 待合并：" + prURL + "，合并后自动关闭"
+		if ch != nil {
+			if err := ch.PostComment(ctx, issueRef, note); err != nil {
+				logf("PR 待合并 comment failed for %s: %v", issueRef, err)
+			}
+		}
+		return LandResult{Integrated: false, Branch: branch, Note: note}
+	}
+	// createPR 失败：LAND PARTIAL（push 失败）或本地 FF-merge 兜底，都由 handlePRFailure 统一决策。
+	extra := handlePRFailure(ctx, ch, issueRef, repo, worktree, branch, prErr, logf)
+	if errors.Is(prErr, ErrPushFailed) {
+		// LAND PARTIAL：issue 留开，branch + worktree 保留待手动 push。
+		return LandResult{Integrated: false, Branch: branch, Note: extra}
+	}
+	// 其他 gh 侧失败：handlePRFailure 已走 land() FF-merge 兜底。
+	// extra=="" → 本地合并成功 → 集成完成 → 关 issue（本地直落回归：done 后照旧关 issue）。
+	// extra!="" → land 失败 → issue 留开、branch 保留。
+	if extra == "" {
+		if ch != nil {
+			if err := ch.CloseIssue(ctx, issueRef); err != nil {
+				logf("CloseIssue after local FF-merge failed for %s: %v", issueRef, err)
+			}
+		}
+		return LandResult{Integrated: true, Branch: "", Note: ""}
+	}
+	return LandResult{Integrated: false, Branch: branch, Note: extra}
+}
+
 // createPR pushes the committed worktree branch to origin, creates a GitHub PR,
 // and cleans up the worktree. Returns the PR URL on success. The push is
 // retried on transient network errors (SSH/VPN blips — see #57); a push that
