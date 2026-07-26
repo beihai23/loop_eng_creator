@@ -2,6 +2,8 @@ package model
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,5 +70,27 @@ func TestKiloAgentDeliversPromptAsArgv(t *testing.T) {
 	}
 	if !strings.Contains(out, prompt) {
 		t.Fatalf("kilo agent must pass the full prompt as a positional argv element; got %q", out)
+	}
+}
+
+// TestKiloAgentFatalInsufficientBalanceAbortsImmediately pins the agent-smoke fix
+// (task #87) for the kilo 同类: a kilo "Insufficient Balance" failure — an account
+// with no credit — is FATAL. 1 attempt, ErrClaudeFatal, no 30/60/120s backoff.
+func TestKiloAgentFatalInsufficientBalanceAbortsImmediately(t *testing.T) {
+	withNoBackoff(t)
+	bin, countDir := writeFakeFatalBinary(t, "fake-kilo-balance",
+		"Error: Insufficient Balance")
+	a, err := NewAgent(config.ModelRef{Provider: "kilo", Binary: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = AsExecuter(a).Exec(context.Background(), t.TempDir(), "do the task")
+	if !errors.Is(err, ErrClaudeFatal) {
+		t.Fatalf("kilo balance error must be ErrClaudeFatal; got: %v", err)
+	}
+	countBytes, _ := os.ReadFile(filepath.Join(countDir, "count"))
+	attempts := len(strings.Split(strings.TrimSpace(string(countBytes)), "\n"))
+	if attempts != 1 {
+		t.Fatalf("kilo balance error must abort after 1 attempt (no retry), got %d", attempts)
 	}
 }

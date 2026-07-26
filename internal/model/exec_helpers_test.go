@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -53,4 +54,29 @@ func writeFakeArgvBinary(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// writeFakeFatalBinary writes a stand-in executable that consumes stdin,
+// appends one tally line per invocation to <countDir>/count (mirrors
+// retry_test.go's writeFakeBinaryFailing proven count pattern), prints msg to
+// stdout via a single-quoted printf, and exits 1 — the exact shape of a
+// provider emitting a fatal config/env/balance signal. Every provider's
+// fatal-short-circuit test uses it to assert runWithRetry aborted after exactly
+// 1 attempt with the error wrapped in ErrClaudeFatal. Returns the binary path
+// and the count dir the caller reads <countDir>/count from.
+func writeFakeFatalBinary(t *testing.T, name, msg string) (bin, countDir string) {
+	t.Helper()
+	countDir = t.TempDir()
+	bin = filepath.Join(countDir, name)
+	// Single-quote msg so printf emits it verbatim; escape any embedded single
+	// quote via the standard '\'' shuffle (this is why this file imports strings).
+	quoted := "'" + strings.ReplaceAll(msg, "'", `'\''`) + "'"
+	script := "#!/bin/sh\ncat >/dev/null\n" +
+		"N=$(cat \"" + countDir + "/count\" 2>/dev/null | wc -l | tr -d ' '); N=$((N+1)); printf \"%s\\n\" \"$N\" >> \"" + countDir + "/count\"\n" +
+		"printf '%s\\n' " + quoted + "\n" +
+		"exit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, countDir
 }

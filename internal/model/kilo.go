@@ -106,19 +106,28 @@ func (a *kiloAgent) runOnce(ctx context.Context, dir, model, prompt string) (str
 }
 
 // fatalKiloSignals are lowercased substrings that mark a non-retryable kilo
-// auth/credential failure. Mirrors fatalCodexSignals's role for codex. Note: a
-// kilo timeout (exit 124) is intentionally NOT a fatal signal — it is retryable
-// and rides the shared retry loop.
+// failure. Besides auth/credential (mirrors fatalCodexSignals for codex), this
+// also covers the balance/quota class ("Insufficient Balance" / out-of-quota)
+// that an account with no credit emits — retry cannot heal it, so it is fatal
+// (ErrClaudeFatal short-circuit, no 30/60/120s backoff burn). Note: a kilo
+// timeout (exit 124) is intentionally NOT a fatal signal — it is retryable and
+// rides the shared retry loop.
 var fatalKiloSignals = []string{
 	"authentication", "unauthorized", "not authorized",
 	"401", "403",
 	"api key", "api_key", "apikey",
 	"credential", "not logged in", "login required", "please log in",
 	"invalid api key", "missing api key",
+	// balance/quota class: no credit on the account. Never self-heals on retry.
+	"insufficient balance", "insufficient_balance",
+	"out of balance", "no balance",
+	"quota", "usage limit", "usage_limit",
 }
 
 // isFatalKiloError reports whether kilo's combined output looks like a
-// non-retryable auth/credential failure (so ErrClaudeFatal short-circuits it).
+// non-retryable failure — auth/credential OR an account balance/quota error
+// ("Insufficient Balance" / out-of-quota) retry cannot heal. ErrClaudeFatal
+// short-circuits it either way. (A kilo timeout/exit-124 stays retryable.)
 func isFatalKiloError(stderr, stdout string) bool {
 	s := strings.ToLower(stderr + " " + stdout)
 	for _, sig := range fatalKiloSignals {
