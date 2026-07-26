@@ -11,12 +11,17 @@ import (
 func initRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// Config commands target the repo with `-C dir` (NOT a trailing positional dir,
+	// which `git config` silently applies to the CWD's repo, not this one). Without
+	// a local identity the init commit falls back to the ambient global identity —
+	// present on dev machines, ABSENT on the CI runner, where `git commit` then
+	// fails "Author identity unknown". Setting it locally makes the test hermetic.
 	for _, c := range [][]string{
-		{"git", "init", "-q"},
-		{"git", "config", "user.email", "t@t"},
-		{"git", "config", "user.name", "t"},
+		{"git", "init", "-q", dir},
+		{"git", "-C", dir, "config", "user.email", "t@t"},
+		{"git", "-C", dir, "config", "user.name", "t"},
 	} {
-		if out, err := exec.Command(c[0], append(c[1:], dir)...).CombinedOutput(); err != nil {
+		if out, err := exec.Command(c[0], c[1:]...).CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 	}
