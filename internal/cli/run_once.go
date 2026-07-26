@@ -153,13 +153,17 @@ func buildChannel(cfg *config.Config, repo string) (channel.Channel, error) {
 // (spec §8.1 / 裁决 I — M1 simplifies plan/execute/verify to one claude -p
 // path, no API branch, no anthropic SDK).
 //
-// The verify skill's Model is wrapped in a budget.Client sharing the SAME
-// *Enforcer passed to SubLoop.Budget. This closes the Task 12 carry-forward
-// gap: verify.Chain's frozen Tier interface takes no Enforcer, so without
-// the decorator the verify LLM Call would bypass BeforeCall/AfterCall and
-// its tokens would never accrue into spent (spec §8.8 deviation). plan and
-// execute keep the raw client because SubLoop already budget-wraps those
-// two manually — wrapping them again would double-count.
+// The verify, triage, and help skills' Models are each wrapped in a
+// budget.Client (Role = "verify"|"triage"|"help") sharing the SAME *Enforcer
+// passed in (run-once: SubLoop.Budget's bz; daemon triage: a dispatch-level
+// triageBz). This closes the spec §8.8 deviation: verify.Chain's frozen Tier
+// interface takes no Enforcer, and triage/help used to bypass the budget
+// entirely, so their LLM Calls would skip BeforeCall/Record and their tokens
+// never accrued into spent. The decorator fixes all three — its Estimate(Role)
+// pre-check and Record(Role) accounting gate each call and feed the per-call
+// brake a real estimate. plan and execute keep the raw client because SubLoop
+// already budget-wraps those two manually (Estimate/BeforeCall/Record), so
+// wrapping them again here would double-count.
 func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	exec model.Executer,
 	plan skill.Skill[skill.PlanInput, skill.PlanOutput],
@@ -182,9 +186,9 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 		})
 		exec = f
 		plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: f}
-		vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: f, Enf: bz}}
-		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: f}
-		help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: f}
+		vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: f, Enf: bz, Role: "verify"}}
+		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: &budget.Client{Base: f, Enf: bz, Role: "triage"}}
+		help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: &budget.Client{Base: f, Enf: bz, Role: "help"}}
 		return
 	}
 	// real: dispatch each role's agent by config.ModelRef.Provider via NewAgent
@@ -198,12 +202,15 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	// frozen Tier takes no Enforcer, so the decorator is how verify's Call accrues).
 	exec = model.AsExecuter(mustAgent(cfg.Models.Execute))
 	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.AsClient(mustAgent(cfg.Models.Plan))}
-	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Verify)), Enf: bz}}
-	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: model.AsClient(mustAgent(cfg.Models.Triage))}
+	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Verify)), Enf: bz, Role: "verify"}}
+	// triage/help 不再裸 AsClient：经 budget.Client 装饰器（与 verify 同款）受预算约束并记账。
+	// 二者与 verify 共用同一个 bz（run-once 单任务；daemon 的 triage 用派发级 triageBz），
+	// 故 token 进 budget_ledger 且受 per-call+per-task 闸约束，不再 bypass 预算。
+	triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Triage)), Enf: bz, Role: "triage"}}
 	// help 复用 triage 的 agent：config.Models 无 Help 字段（已核实只有 Triage/Plan/Execute/
 	// Verify），help 与 triage 同属分类/诊断类，按 spec §8.8 原设计接线上（模板/类型早就在，
 	// 本次补接线）。零增益 blocked 战报由此产出结构化 stuck_at/tried/need_from_human。
-	help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: model.AsClient(mustAgent(cfg.Models.Triage))}
+	help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Triage)), Enf: bz, Role: "help"}}
 	return
 }
 

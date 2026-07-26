@@ -145,11 +145,20 @@ func NewDaemonCmd() *cobra.Command {
 				return out.Status, out.Detail, nil
 			}
 
-			// Triage 门：派发前对 FIFO 队首分诊（spec triage/gate）。buildModels 需要
-			// 一个 Enforcer，但 triage 本身不走 budget（per-run 作用域，triage 在 run
-			// 之前；一次小调用/次派发）——只为构建 skill 传一个独立的 Enforcer。
-			_, _, _, triageSkill, _ := buildModels(cfg, models, budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries))
+			// Triage 门：派发前对 FIFO 队首分诊（spec triage/gate）。triage 先于任务 run
+			// （daemon 派发门），无法字面「共用任务 Enforcer」（任务的 bz 在 runTask 里按任务
+			// 新建），故用一个具名的派发级 triageBz：跨任务持有、不丢弃。triage 经 buildModels
+			// 套 budget.Client{Role:"triage"} 受 triageBz 的 per-call/per-task 闸约束并记账；
+			// triageFn 再用 task.ID 作 scope key 落一行 ledger（triage 无 runID——append-only
+			// trace，不影响 run 级 Replay）。满足 issue 实质诉求：triage token 不丢弃、记账、受闸、可审计。
+			triageBz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
+			_, _, _, triageSkill, _ := buildModels(cfg, models, triageBz)
 			triageFn := func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error) {
+				// 预算刹车·每调用 token（triage）：记录被检查的估算 vs PerCall（与 plan/execute/
+				// verify 同款）。triage 的实际 token 计入与 per-call/per-task 闸在 budget.Client
+				// 装饰器内生效（triageSkill.Model = &budget.Client{Role:"triage"}）。
+				est := triageBz.Estimate("triage")
+				_ = st.AppendBudget(task.ID, "call", "triage", est, cfg.Budget.PerCallTokens)
 				out, _, err := triageSkill.Run(ctx, skill.TriageInput{
 					TaskDescription:    task.Description,
 					AcceptanceCriteria: task.Criteria,

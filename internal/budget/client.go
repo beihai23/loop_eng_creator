@@ -11,36 +11,38 @@ import (
 // verify.Chain's Tier interface is frozen (takes no Enforcer), so the verify
 // skill's LLM Call — invoked inside Chain → verify.LLM.Check → skill.Run →
 // Model.Call — used to bypass the budget entirely, deviating from spec §8.8
-// ("每次模型调用前强制").
+// ("每次模型调用前强制"). The same decorator now backs triage and help too, so all
+// five roles' Model calls are budgeted uniformly.
 //
-// Wiring (Task 14 run-once): the verify skill's Model is wrapped by this
-// decorator sharing the SAME *Enforcer handed to SubLoop.Budget. plan and
-// execute keep using the raw client — SubLoop already budget-wraps those two
-// manually (Task 12), so wrapping them again here would double-count.
-// Net: plan + execute + verify all budgeted, no double-count. Full unification
-// (single choke point, removing SubLoop's manual calls) is deferred to M3.
-//
-// Estimate policy: BeforeCall uses Enf.PerCall as the pre-check estimate.
-// PerCall is the configured upper bound for a single LLM call, so it is the
-// largest estimate the Enforcer will admit — using it guarantees the verify
-// Call is subject to BOTH the per-call cap (estimate > PerCall is impossible
-// by construction) AND the per-task running tally (spent + PerCall must fit
-// under PerTask). Actual tokens are accounted in AfterCall from the real
-// Usage returned by Base, so the tally converges on truth after each Call.
+// Estimate policy: the pre-check estimate is Enf.Estimate(Role) — the role's
+// last observed per-call usage × a safety factor, falling back to a per-role
+// conservative floor on the first call. Unlike the old BeforeCall(PerCall) (an
+// estimate that equaled the cap and so could never exceed it), this estimate
+// tracks reality and CAN exceed PerCall, so the per-call brake actually fires.
+// The failure direction is "block" (spec §8.8): when in doubt, refuse. After a
+// Call the real usage is recorded against Role via Enf.Record, which both
+// accrues the per-task tally and primes the next Estimate.
 type Client struct {
 	Base model.Client
 	Enf  *Enforcer
+	// Role is the budget role this Client speaks as ("verify" | "triage" |
+	// "help"). It drives Estimate (per-role floor/history) and Record (per-role
+	// last-usage). plan/execute are budgeted by SubLoop directly and do not go
+	// through this decorator, so they have no Client/Role here.
+	Role string
 }
 
-// Call implements model.Client. It runs the budget pre-check, delegates to
-// Base, then accounts the real usage. On pre-check failure it returns the
-// Enforcer error WITHOUT calling Base (the LLM call is never made).
+// Call implements model.Client. It runs the budget pre-check using the role's
+// real estimate, delegates to Base, then records the real usage against Role.
+// On pre-check failure it returns the Enforcer error WITHOUT calling Base (the
+// LLM call is never made).
 func (c *Client) Call(ctx context.Context, prompt string) (string, model.Usage, error) {
-	if err := c.Enf.BeforeCall(c.Enf.PerCall); err != nil {
+	est := c.Enf.Estimate(c.Role)
+	if err := c.Enf.BeforeCall(est); err != nil {
 		return "", model.Usage{}, err
 	}
 	out, u, err := c.Base.Call(ctx, prompt)
-	c.Enf.AfterCall(u)
+	c.Enf.Record(c.Role, u)
 	return out, u, err
 }
 
@@ -56,23 +58,26 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, model.Usage, 
 // Setting LLM.Dir alone is not enough; this method makes the chain hold in
 // production, not just in tests using a bare DirClient fake.
 //
-// Semantics mirror Call exactly: BeforeCall(PerCall) budget pre-check (rejects
-// WITHOUT calling Base when over budget), delegate to Base — CallIn when Base is
-// a DirClient and dir is non-empty (the production agentClient →
-// AgentRequest.Workdir → adapter cmd.Dir=dir path), else plain Call (test fakes,
-// clients without dir support, empty dir) — then AfterCall the real usage so the
-// tally still converges on truth.
+// Semantics mirror Call exactly: BeforeCall(Estimate(Role)) budget pre-check
+// (rejects WITHOUT calling Base when over budget — the estimate now tracks the
+// role's real last usage × safety, so it can exceed PerCall and the per-call
+// brake fires for real), delegate to Base — CallIn when Base is a DirClient and
+// dir is non-empty (the production agentClient → AgentRequest.Workdir → adapter
+// cmd.Dir=dir path), else plain Call (test fakes, clients without dir support,
+// empty dir) — then Record the real usage against Role so the tally accrues and
+// the next Estimate reflects reality.
 func (c *Client) CallIn(ctx context.Context, dir, prompt string) (string, model.Usage, error) {
-	if err := c.Enf.BeforeCall(c.Enf.PerCall); err != nil {
+	est := c.Enf.Estimate(c.Role)
+	if err := c.Enf.BeforeCall(est); err != nil {
 		return "", model.Usage{}, err
 	}
 	if dc, ok := c.Base.(model.DirClient); ok && dir != "" {
 		out, u, err := dc.CallIn(ctx, dir, prompt)
-		c.Enf.AfterCall(u)
+		c.Enf.Record(c.Role, u)
 		return out, u, err
 	}
 	out, u, err := c.Base.Call(ctx, prompt)
-	c.Enf.AfterCall(u)
+	c.Enf.Record(c.Role, u)
 	return out, u, err
 }
 
