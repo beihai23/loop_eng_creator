@@ -100,6 +100,7 @@ func parseIssuesJSON(raw []byte) ([]Task, error) {
 		t := parseLocalTask(is.Body) // 复用 M1 的 body 解析（## 任务/type:/- [ ]）
 		t.Ref = strconv.Itoa(is.Number)
 		t.CreatedAt = is.CreatedAt // issue 提交时间（RFC3339），驱动 FIFO 按提交时间排序
+		t.Title = is.Title         // issue 标题：PR 标题的源头（区别于 Description=正文首行）
 		if t.Description == "" {
 			t.Description = is.Title // body 没解析出 desc 则回落 title
 		}

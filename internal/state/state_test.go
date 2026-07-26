@@ -822,7 +822,7 @@ func TestUpdateTaskSpec(t *testing.T) {
 	defer st.Close()
 	id, _ := st.InsertTask(TaskRow{IssueRef: "9", Description: "v1", Criteria: []string{"a"}, Body: "正文 v1 全文"})
 
-	if err := st.UpdateTaskSpec(id, "v2 edited", []string{"a", "b"}, "正文 v2 全文"); err != nil {
+	if err := st.UpdateTaskSpec(id, "v2 edited", []string{"a", "b"}, "正文 v2 全文", "v2 标题"); err != nil {
 		t.Fatal(err)
 	}
 	specs, err := st.TaskSpecsByRef()
@@ -836,11 +836,37 @@ func TestUpdateTaskSpec(t *testing.T) {
 	if got.Body != "正文 v2 全文" {
 		t.Fatalf("body 未回写: %q", got.Body)
 	}
+	if got.Title != "v2 标题" {
+		t.Fatalf("title 未回写: %q", got.Title)
+	}
 	if got.UpdatedAt == "" {
 		t.Fatalf("updated_at 未填充: %+v", got)
 	}
 	if got.ID != id {
 		t.Fatalf("TaskSpecsByRef 应携带 id: got %q want %q", got.ID, id)
+	}
+}
+
+// TestTaskRowCarriesTitle 钉死 issue 标题的 DB 贯通：InsertTask 带 Title →
+// NextReadyTask 读回同一标题。daemon 的派发路径从 state.TaskRow（不是
+// channel.Task）读 Title，这是「issue 标题 → PR 标题」修复跨过 state 层的一段
+// （修 #74/#76：正文以 # 目标 节开头时 PR 标题错取正文 bullet）。COALESCE(title,'')
+// 让旧库（title 列 NULL / 建表前）读成空串不报错。
+func TestTaskRowCarriesTitle(t *testing.T) {
+	st, _ := Open(t.TempDir() + "/state.db")
+	defer st.Close()
+	if _, err := st.InsertTask(TaskRow{IssueRef: "42", Title: "Fix login bug", Description: "distilled body line"}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := st.NextReadyTask()
+	if err != nil || !ok {
+		t.Fatalf("NextReadyTask: ok=%v err=%v", ok, err)
+	}
+	if got.Title != "Fix login bug" {
+		t.Fatalf("Title not carried through DB: got %q", got.Title)
+	}
+	if got.Description != "distilled body line" {
+		t.Fatalf("Description should still read back: got %q", got.Description)
 	}
 }
 

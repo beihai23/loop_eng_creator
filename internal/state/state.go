@@ -13,8 +13,8 @@ import (
 type Store struct{ db *sql.DB }
 
 type TaskRow struct {
-	ID, IssueRef, Description, TaskType, Source string
-	Criteria                                    []string
+	ID, IssueRef, Title, Description, TaskType, Source string
+	Criteria                                           []string
 	// CreatedAt is the task's issue-submission time (RFC3339), used to order the
 	// dispatch FIFO by submission time rather than by ingest time. InsertTask
 	// writes it into the existing created_at column; a zero value falls back to
@@ -46,7 +46,7 @@ type TaskRow struct {
 var schema = []string{
 	`CREATE TABLE IF NOT EXISTS tasks(
 			id TEXT PRIMARY KEY,
-			issue_ref TEXT, description TEXT, task_type TEXT, source TEXT,
+			issue_ref TEXT, title TEXT, description TEXT, task_type TEXT, source TEXT,
 			acceptance_criteria_json TEXT, created_at TEXT, updated_at TEXT)`,
 	`CREATE TABLE IF NOT EXISTS task_status(
 			task_id TEXT PRIMARY KEY, status TEXT, parked_detail TEXT, updated_at TEXT)`,
@@ -124,6 +124,10 @@ func Open(path string) (*Store, error) {
 	// Best-effort: add agent to tasks — 任务级 coding-agent override（issue frontmatter
 	// `agent: codex`）。幂等：旧 DB 已有该列时 ALTER 报 duplicate-column，被忽略。
 	db.Exec(`ALTER TABLE tasks ADD COLUMN agent TEXT`)
+	// Best-effort: add title to tasks — issue 标题（区别于 description=正文首行），
+	// PR 标题的源头（修 #74/#76：正文以 # 目标 节开头时 PR 标题错取正文 bullet）。
+	// 幂等：旧 DB 已有该列时 ALTER 报 duplicate-column，被忽略；COALESCE(title,'') 读回空串。
+	db.Exec(`ALTER TABLE tasks ADD COLUMN title TEXT`)
 	// Best-effort: add land_branch to tasks — done 任务故意留 issue OPEN 等合并时记录的
 	// 分支（PR 已建 / LAND PARTIAL / land 失败 / commit 失败哨兵）。幂等：旧 DB 已有该列
 	// 时 ALTER 报 duplicate-column，被忽略。
@@ -149,9 +153,9 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 		return "", err
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO tasks(id, issue_ref, description, task_type, source, acceptance_criteria_json, created_at, updated_at, body, agent)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		id, t.IssueRef, t.Description, t.TaskType, t.Source, string(crit), createdAt, now, t.Body, t.Agent); err != nil {
+		`INSERT INTO tasks(id, issue_ref, description, task_type, source, acceptance_criteria_json, created_at, updated_at, body, agent, title)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		id, t.IssueRef, t.Description, t.TaskType, t.Source, string(crit), createdAt, now, t.Body, t.Agent, t.Title); err != nil {
 		tx.Rollback()
 		return "", err
 	}
@@ -169,10 +173,10 @@ func (s *Store) InsertTask(t TaskRow) (string, error) {
 
 func (s *Store) GetTask(id string) (TaskRow, error) {
 	row := s.db.QueryRow(
-		`SELECT id, issue_ref, description, task_type, source, acceptance_criteria_json, COALESCE(body,''), COALESCE(agent,''), COALESCE(land_branch,'') FROM tasks WHERE id=?`, id)
+		`SELECT id, issue_ref, description, task_type, source, acceptance_criteria_json, COALESCE(body,''), COALESCE(agent,''), COALESCE(title,''), COALESCE(land_branch,'') FROM tasks WHERE id=?`, id)
 	var t TaskRow
 	var critJSON string
-	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.LandBranch); err != nil {
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.Title, &t.LandBranch); err != nil {
 		return t, err
 	}
 	_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
@@ -299,7 +303,7 @@ func (s *Store) IssueRefs() (map[string]bool, error) {
 // edited specs with zero extra channel reads.
 func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at, COALESCE(body,''), COALESCE(agent,''), COALESCE(land_branch,'') FROM tasks`)
+		`SELECT id, issue_ref, description, acceptance_criteria_json, updated_at, COALESCE(body,''), COALESCE(agent,''), COALESCE(title,''), COALESCE(land_branch,'') FROM tasks`)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +312,7 @@ func (s *Store) TaskSpecsByRef() (map[string]TaskRow, error) {
 	for rows.Next() {
 		var t TaskRow
 		var critJSON string
-		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt, &t.Body, &t.Agent, &t.LandBranch); err != nil {
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &critJSON, &t.UpdatedAt, &t.Body, &t.Agent, &t.Title, &t.LandBranch); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)
@@ -335,11 +339,11 @@ func (s *Store) SetLandBranch(taskID, branch string) error {
 // differs from the snapshot — never a no-op write. Runs already dispatched
 // keep their snapshot (channel.Task was built at dispatch); the new spec takes
 // effect on the next dispatch/resume.
-func (s *Store) UpdateTaskSpec(id, description string, criteria []string, body string) error {
+func (s *Store) UpdateTaskSpec(id, description string, criteria []string, body, title string) error {
 	crit, _ := json.Marshal(criteria)
 	_, err := s.db.Exec(
-		`UPDATE tasks SET description=?, acceptance_criteria_json=?, body=?, updated_at=? WHERE id=?`,
-		description, string(crit), body, nowISO(), id)
+		`UPDATE tasks SET description=?, acceptance_criteria_json=?, body=?, title=?, updated_at=? WHERE id=?`,
+		description, string(crit), body, title, nowISO(), id)
 	return err
 }
 
@@ -353,7 +357,7 @@ func (s *Store) UpdateTaskSpec(id, description string, criteria []string, body s
 // tick, one task, oldest-submitted first.
 func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.land_branch,'')
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.title,''), COALESCE(t.land_branch,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status = 'new'
@@ -361,7 +365,7 @@ func (s *Store) NextReadyTask() (TaskRow, bool, error) {
 		 LIMIT 1`)
 	var t TaskRow
 	var critJSON string
-	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.LandBranch); err != nil {
+	if err := row.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.Title, &t.LandBranch); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TaskRow{}, false, nil
 		}
@@ -413,7 +417,7 @@ func (s *Store) NeedsHumanDecisionTasks() ([]TaskRow, error) {
 // side for human-driven reversals (reopen, un-label).
 func (s *Store) TerminalTasks() ([]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.land_branch,'')
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.title,''), COALESCE(t.land_branch,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status IN ('done', 'blocked')
@@ -427,7 +431,7 @@ func (s *Store) TerminalTasks() ([]TaskRow, error) {
 
 func (s *Store) listTasksByStatus(status string) ([]TaskRow, error) {
 	rows, err := s.db.Query(
-		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.land_branch,'')
+		`SELECT t.id, t.issue_ref, t.description, t.task_type, t.source, t.acceptance_criteria_json, COALESCE(t.body,''), COALESCE(t.agent,''), COALESCE(t.title,''), COALESCE(t.land_branch,'')
 		 FROM tasks t
 		 JOIN task_status ts ON ts.task_id = t.id
 		 WHERE ts.status = ?
@@ -444,7 +448,7 @@ func scanTaskRows(rows *sql.Rows) ([]TaskRow, error) {
 	for rows.Next() {
 		var t TaskRow
 		var critJSON string
-		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.LandBranch); err != nil {
+		if err := rows.Scan(&t.ID, &t.IssueRef, &t.Description, &t.TaskType, &t.Source, &critJSON, &t.Body, &t.Agent, &t.Title, &t.LandBranch); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(critJSON), &t.Criteria)

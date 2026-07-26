@@ -10,6 +10,14 @@ type Task struct {
 	Description        string
 	AcceptanceCriteria []string
 	TaskType           string
+	// Title is the issue/ticket headline (GitHub issue title, Linear issue
+	// title; the local channel falls back to the task file's first
+	// non-`#` line). It is distinct from Description — which is the distilled
+	// first line of the BODY, not the title. The PR title prefers Title so a
+	// body that opens with a "# 目标"/"# 现状" markdown heading does not leak a
+	// mid-body bullet into the PR title (the #74/#76 bug). Empty = a task
+	// ingested before this field existed; consumers fall back to Description.
+	Title string
 	// Body is the full raw issue/ticket text. parseLocalTask only distills the
 	// first line (Description) and `- [ ]` items (AcceptanceCriteria) — the
 	// background/constraints/context prose lives here and flows to the plan and

@@ -68,6 +68,11 @@ func parseLocalTask(raw string) Task {
 			t.AcceptanceCriteria = append(t.AcceptanceCriteria, strings.TrimSpace(strings.TrimPrefix(line, "- [ ]")))
 		case line != "" && !strings.HasPrefix(line, "#") && t.Description == "":
 			t.Description = line
+			// local 通道没有独立的 issue 标题，用任务正文首个非标题行充当（与现状
+			// 一致：local 的 PR 标题仍是首行）。仅首个命中行赋值，后续命中行不动。
+			if t.Title == "" {
+				t.Title = line
+			}
 		}
 	}
 	return t
