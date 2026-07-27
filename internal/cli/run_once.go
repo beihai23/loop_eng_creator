@@ -197,9 +197,10 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	// behavior unchanged). provider: codex (or opencode/kimi/kilo once added)
 	// routes to that provider's adapter. Each Agent is bridged onto the frozen
 	// Client/Executer interfaces via AsClient/AsExecuter, so budget/skill/subloop
-	// wiring is untouched. The verify skill's Model is still wrapped in a
+	// wiring is untouched. The verify AND help skills' Models are wrapped in a
 	// budget.Client sharing bz (the Task 12 carry-forward fix — verify.Chain's
-	// frozen Tier takes no Enforcer, so the decorator is how verify's Call accrues).
+	// frozen Tier takes no Enforcer, so the decorator is how verify's Call accrues;
+	// help is wrapped the same way so its zero-gain-escalation call accrues too).
 	exec = model.AsExecuter(mustAgent(cfg.Models.Execute))
 	plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: model.AsClient(mustAgent(cfg.Models.Plan))}
 	vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Verify)), Enf: bz, Role: "verify"}}

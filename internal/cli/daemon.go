@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"loop-eng/internal/budget"
 	"loop-eng/internal/channel"
+	"loop-eng/internal/config"
 	"loop-eng/internal/daemon"
 	"loop-eng/internal/loop"
 	"loop-eng/internal/skill"
@@ -217,4 +218,63 @@ func NewDaemonCmd() *cobra.Command {
 	cmd.Flags().DurationVar(&pollInterval, "poll-interval", 60*time.Second, "轮询间隔")
 	cmd.Flags().DurationVar(&cooldown, "cooldown", 5*time.Minute, "瞬时基础设施阻塞（如上游 529 限流）后的派发冷却时长")
 	return cmd
+}
+
+// runTriage runs the triage skill for one dispatched task under a fresh per-call
+// Enforcer and records its tokens into a dedicated triage run. Triage runs BEFORE
+// the per-task SubLoop run, so it opens its own run + its own Enforcer (built
+// per-call, never the daemon-level Enforcer — reusing that would let spend
+// accumulate across tasks and globally gate triage). The triage skill's Model is
+// decorated with budget.Client here (buildModels returns triage raw) so
+// BeforeCall(PerCall) caps the call and AfterCall accrues real tokens (spec §8.8).
+// Extracted from the daemon's triageFn closure so the accounting is directly
+// unit-testable. It does NOT touch the in_flight slot or task_status — triage is
+// the dispatch gate, not the active task; the engine manages those.
+func runTriage(ctx context.Context, st *state.Store, triage skill.Skill[skill.TriageInput, skill.TriageOutput], cfg *config.Config, task state.TaskRow) (skill.TriageOutput, error) {
+	tbz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
+	triRunID, err := st.StartRun(task.ID)
+	if err != nil {
+		return skill.TriageOutput{}, err
+	}
+	dec := triage
+	dec.Model = &budget.Client{Base: triage.Model, Enf: tbz}
+	_ = st.AppendBudget(triRunID, "call", "tokens", tbz.PerCall, tbz.PerCall)
+	out, u, err := dec.Run(ctx, skill.TriageInput{
+		TaskDescription:    task.Description,
+		AcceptanceCriteria: task.Criteria,
+		TaskType:           task.TaskType,
+		Body:               task.Body, // 全文：判断「缺不缺信息」以全文为准
+	})
+	_ = st.AppendStep(state.StepRow{
+		RunID: triRunID, Seq: 1, Role: "triage",
+		Status: triStatus(err), Error: triErrStr(err),
+		TokensIn: u.TokensIn, TokensOut: u.TokensOut,
+	})
+	_ = st.EndRun(triRunID, triOutcome(err))
+	return out, err
+}
+
+// triStatus / triOutcome / triErrStr map a triage call's error to the step
+// status, run outcome, and step error string the triage accounting writes. A
+// triage run's outcome is "triage" on success (a completed triage, distinct from
+// a task run's done/blocked) vs "error" on failure.
+func triStatus(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	return "fail"
+}
+
+func triOutcome(err error) string {
+	if err == nil {
+		return "triage"
+	}
+	return "error"
+}
+
+func triErrStr(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
