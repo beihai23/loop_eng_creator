@@ -509,7 +509,7 @@ func (lc *Linear) ListNewTasks(ctx context.Context) ([]Task, error) {
 // doc §4.1, isomorphic with parseIssueCommentsJSON) so existing subloop callers
 // are unaffected. Each Reply carries CreatedAt so callers can re-filter.
 func (lc *Linear) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
-	refs, lc.repliesOff = capRefs("linear.ListReplies", refs, lc.repliesOff)
+	refs, lc.repliesOff = capRefs(refs, lc.repliesOff)
 	var b strings.Builder
 	b.WriteString("query { ")
 	for i, ref := range refs {
@@ -612,7 +612,7 @@ func (lc *Linear) GetTaskStates(ctx context.Context, refs []string) (map[string]
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	refs, lc.statesOff = capRefs("linear.GetTaskStates", refs, lc.statesOff)
+	refs, lc.statesOff = capRefs(refs, lc.statesOff)
 	var b strings.Builder
 	b.WriteString("query { ")
 	for i, ref := range refs {
