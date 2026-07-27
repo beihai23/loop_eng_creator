@@ -500,7 +500,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			sl.logRetry(sid, attempt, priorFailure)
 			continue
 		}
-		diff := worktreeDiff(sl.Repo, wt)
+		diff, derr := worktreeDiff(sl.Repo, wt)
+		if derr != nil {
+			// #99: git could not stage/diff the worktree. An empty diff would make
+			// verify reject with a hidden, WRONG cause ("execute made no changes").
+			// Surface the git error into the diff the verifier sees + log it, so the
+			// rejection exposes the real root cause.
+			sl.logf("[subloop] %s worktreeDiff failed: %v", sid, derr)
+			diff = fmt.Sprintf("[worktreeDiff 失败 — diff 不可用；根因: %v]\n(execute 的改动未能被 git 捕获，通常是 git add/diff 出错，而非 execute 没产出改动。)", derr)
+		}
 		// 捕获 execute 的完整 I/O 进 trace：之前 execOut 被 `_ = execOut` 丢弃，
 		// 导致「空 diff」时无从诊断 claude 到底返回了啥、为什么没改文件。
 		// InputJSON=execute prompt；OutputJSON={out: 模型输出, diff: 捕获的改动}。

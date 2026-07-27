@@ -40,15 +40,19 @@ func errStr(err error) string {
 // `git diff HEAD` misses untracked new files (e.g. a task that creates a new
 // file), which starves verify of any diff (found by M2 bootstrap smoke #1).
 // Run inside the worktree (裁决 C). Assumes execute did NOT commit (the execute
-// prompt forbids it); loop-eng captures the diff itself. Empty string on error.
-func worktreeDiff(repo, wt string) string {
+// prompt forbids it); loop-eng captures the diff itself. Returns (diff, error):
+// a git staging/diffing failure returns a wrapped error so callers surface the
+// root cause instead of silently feeding verify an empty diff (#99).
+func worktreeDiff(repo, wt string) (string, error) {
 	_ = repo
-	_, _ = execGit(wt, "add", "-A")
+	if _, err := execGit(wt, "add", "-A"); err != nil {
+		return "", fmt.Errorf("git add -A in worktree: %w", err)
+	}
 	out, err := execGit(wt, "--no-pager", "diff", "--cached")
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("git diff --cached in worktree: %w", err)
 	}
-	return out
+	return out, nil
 }
 
 // branchName is the worktree branch isolation.Create makes for a given task
