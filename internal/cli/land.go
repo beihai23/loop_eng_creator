@@ -3,8 +3,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"time"
@@ -243,6 +245,67 @@ func finalizeLand(ctx context.Context, ch channel.Channel, issueRef, repo, workt
 // can take the LAND PARTIAL path instead of silently FF-merging into a local
 // main that never reaches GitHub. A gh-side failure after a successful push is
 // NOT ErrPushFailed — the caller falls back to land() (FF-merge to local main).
+// headVerifyAttempts polls the PR head this many times before giving up.
+const headVerifyAttempts = 5
+
+// headVerifyWait is the delay between head-verification polls (var so tests can
+// shrink it; production sleeps real time).
+var headVerifyWait = 3 * time.Second
+
+// gitBranchTip returns the SHA of a local branch — the tip just pushed to origin
+// — or "" on error. Used to confirm a created PR's head matches the pushed tip.
+func gitBranchTip(repo, branch string) string {
+	out, err := exec.Command("git", "-C", repo, "rev-parse", branch).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// prHeadOf returns the open PR's head SHA for a branch via `gh pr list`. The PR
+// head is what GitHub (auto-merge) or a human will merge at; if it lags behind
+// the pushed tip, a merge misses commits (#97/#115).
+func prHeadOf(ghRepo, branch string) (string, error) {
+	out, err := exec.Command("gh", "pr", "list", "--repo", ghRepo, "--head", branch,
+		"--state", "open", "--json", "headRefOid", "--limit", "1").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("gh pr list --head %s: %s: %w", branch, out, err)
+	}
+	var rows []struct {
+		HeadRefOid string `json:"headRefOid"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
+		return "", fmt.Errorf("parse gh pr list: %w", err)
+	}
+	if len(rows) == 0 {
+		return "", nil
+	}
+	return rows[0].HeadRefOid, nil
+}
+
+// verifyPRHead polls fetch() until it returns wantTip (the pushed branch tip),
+// confirming the PR's headRefOid converged to the right commit. Returns nil on
+// convergence, an error if it won't within attempts. GitHub's PR↔branch head sync
+// can lag (transient; worse during API instability), and a merge at a stale head
+// misses commits pushed after PR creation (#97/#115). fetch/sleep/attempts are
+// params so tests simulate lag without shelling out or really sleeping.
+func verifyPRHead(wantTip string, fetch func() (string, error), sleep func(time.Duration), attempts int) error {
+	var last string
+	for attempt := 1; attempt <= attempts; attempt++ {
+		head, err := fetch()
+		if err == nil {
+			last = head
+			if head == wantTip {
+				return nil
+			}
+		}
+		if attempt < attempts {
+			sleep(headVerifyWait)
+		}
+	}
+	return fmt.Errorf("PR head %q != branch tip %q after %d polls — GitHub head-sync stalled; merge may miss commits (verify head==tip before merging)", last, wantTip, attempts)
+}
+
 func createPR(repo, ghRepo, branch, wt, title, body string) (string, error) {
 	if err := pushWithRetry(func() error {
 		return runGit(repo, "push", "-u", "origin", branch)
@@ -257,6 +320,16 @@ func createPR(repo, ghRepo, branch, wt, title, body string) (string, error) {
 		return "", fmt.Errorf("gh pr create: %s: %w", string(out), err)
 	}
 	prURL := strings.TrimSpace(string(out))
+	// Verify the PR's head matches the branch tip we just pushed (before Discard,
+	// while the branch ref is still resolvable). GitHub's PR↔branch head sync can
+	// lag, and a merge at a stale head misses commits (#97/#115). Non-fatal: the
+	// PR is created + push succeeded; this surfaces a stall so the operator
+	// verifies head==tip before merging. Mirrors pushWithRetry's injectable shape.
+	if tip := gitBranchTip(repo, branch); tip != "" {
+		if verr := verifyPRHead(tip, func() (string, error) { return prHeadOf(ghRepo, branch) }, time.Sleep, headVerifyAttempts); verr != nil {
+			log.Printf("createPR: %v (PR %s created — verify head==tip before merge)", verr, prURL)
+		}
+	}
 	if err := isolation.Discard(repo, wt); err != nil {
 		return prURL, fmt.Errorf("discard worktree: %w (PR created: %s)", err, prURL)
 	}
