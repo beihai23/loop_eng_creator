@@ -210,42 +210,69 @@ func (lc *Linear) gql(ctx context.Context, query string, rest ...any) error {
 			}
 		}
 	}
+	resp, err := lc.gqlSend(ctx, query, vars)
+	if err != nil {
+		return err
+	}
+	// 映射文档 §1：响应里的 GraphQL errors 数组折成 Go error（HTTP 200 也不例外）。
+	// 语义与历史逐字一致（"linear: graphql errors: <msg; msg>"），保
+	// TestLinearGQLErrorsFoldedToError / TestTier1LinearGQLErrors 通过。折叠从
+	// gqlOnce 上移到此处：gqlSend 只回原始信封，gqlBatch 才能据此容忍 per-ref
+	// "Entity not found"（stale ref）而 gql 不变。
+	if len(resp.Errors) > 0 {
+		msgs := make([]string, 0, len(resp.Errors))
+		for _, e := range resp.Errors {
+			msgs = append(msgs, e.Message)
+		}
+		return fmt.Errorf("linear: graphql errors: %s", strings.Join(msgs, "; "))
+	}
+	if out != nil && len(resp.Data) > 0 {
+		if err := json.Unmarshal(resp.Data, out); err != nil {
+			return fmt.Errorf("linear: decode data: %w", err)
+		}
+	}
+	return nil
+}
+
+// gqlSend 发一次 GraphQL 请求（含 gqlRetry 次网络/5xx 重试），返回原始 GraphQL
+// 信封——它只负责 transport + 把信封 decode 进 resp，**不再把 graphql errors 折进
+// error**（resp.Errors 原样留给调用方判读）。这样 gql 仍按「任何 error=失败」折叠
+// （gql 行为零变化），而 gqlBatch 能据此容忍 per-ref "Entity not found"。gqlOnce
+// 仍是唯一的 HTTP 发送点，由 gqlSend 在重试循环里调用。
+func (lc *Linear) gqlSend(ctx context.Context, query string, vars map[string]any) (*gqlResponse, error) {
 	key := lc.key()
 	if key == "" {
-		return fmt.Errorf("linear: API key 未设置（%s）", LinearAPIKeyEnv)
+		return nil, fmt.Errorf("linear: API key 未设置（%s）", LinearAPIKeyEnv)
 	}
 	body, err := json.Marshal(gqlRequest{Query: query, Variables: vars})
 	if err != nil {
-		return fmt.Errorf("linear: marshal request: %w", err)
+		return nil, fmt.Errorf("linear: marshal request: %w", err)
 	}
 	var lastErr error
 	for attempt := 1; attempt <= gqlRetry; attempt++ {
 		var resp gqlResponse
 		lastErr = lc.gqlOnce(ctx, body, key, &resp)
 		if lastErr == nil {
-			if out != nil && len(resp.Data) > 0 {
-				if err := json.Unmarshal(resp.Data, out); err != nil {
-					return fmt.Errorf("linear: decode data: %w", err)
-				}
-			}
-			return nil
+			return &resp, nil
 		}
 		if !isRetryable(lastErr) {
-			return lastErr
+			return nil, lastErr
 		}
 		if attempt < gqlRetry {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-time.After(time.Duration(attempt) * 150 * time.Millisecond):
 			}
 		}
 	}
-	return lastErr
+	return nil, lastErr
 }
 
-// gqlOnce 发单次请求；GraphQL errors 折成 *gqlErrors（不可重试），
-// 网络错误与 5xx 折成 *retryableError（可重试）。
+// gqlOnce 发单次请求；网络错误与 5xx 折成 *retryableError（可重试），其余
+// transport/decode 错误折成普通 error（不可重试）。注意：它不再把响应里的
+// GraphQL errors 折成 error——transport + 信封 decode 成功即返回 nil，resp.Errors
+// 原样留给调用方（gql / gqlBatch）按场景判读。
 func (lc *Linear) gqlOnce(ctx context.Context, body []byte, key string, resp *gqlResponse) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, lc.gqlEndpoint(), bytes.NewReader(body))
 	if err != nil {
@@ -273,13 +300,6 @@ func (lc *Linear) gqlOnce(ctx context.Context, body []byte, key string, resp *gq
 	if err := json.Unmarshal(raw.Bytes(), resp); err != nil {
 		return fmt.Errorf("linear: decode response: %w", err)
 	}
-	if len(resp.Errors) > 0 {
-		msgs := make([]string, 0, len(resp.Errors))
-		for _, e := range resp.Errors {
-			msgs = append(msgs, e.Message)
-		}
-		return fmt.Errorf("linear: graphql errors: %s", strings.Join(msgs, "; "))
-	}
 	return nil
 }
 
@@ -298,6 +318,54 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// gqlBatch 发一次「批量别名」查询（alias r0..rN-1 对应各 ref，GetTaskStates /
+// ListReplies 构造），返回 alias → json.RawMessage 的 map。它容忍「部分 ref 在
+// 通道中已消失」——github→linear 切换后 DB 残留的旧 GitHub issue 号，Linear 对
+// issue(id:) 回 "Entity not found"（message 子串、大小写不敏感）并把该 alias 的
+// data 置 null；gqlBatch 把这类 per-ref error 当「缺席」跳过，调用方再按 alias
+// 缺席 / isNullRaw 判定 gone（reconcile 自然跳过、不重排队）。**其余非 not-found
+// 的 graphql error（鉴权失败 / Argument Validation Error 等）仍折成 Go error**——
+// 容忍 not-found 不得顺带吞掉真实错误。
+func (lc *Linear) gqlBatch(ctx context.Context, query string) (map[string]json.RawMessage, error) {
+	resp, err := lc.gqlSend(ctx, query, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range resp.Errors {
+		if !isLinearEntityNotFound(e.Message) {
+			// 命中任一非 not-found 的 graphql error：整批按失败折叠（与 gql 同形）。
+			msgs := make([]string, 0, len(resp.Errors))
+			for _, e := range resp.Errors {
+				msgs = append(msgs, e.Message)
+			}
+			return nil, fmt.Errorf("linear: graphql errors: %s", strings.Join(msgs, "; "))
+		}
+	}
+	var data map[string]json.RawMessage
+	if len(resp.Data) > 0 {
+		if err := json.Unmarshal(resp.Data, &data); err != nil {
+			return nil, fmt.Errorf("linear: decode data: %w", err)
+		}
+	}
+	return data, nil
+}
+
+// isLinearEntityNotFound 判定一条 graphql error message 是否是 Linear 的
+// "Entity not found"——issue(id:) 对不存在的 ref（stale GitHub issue 号等）回这个，
+// 并把对应 alias 的 data 置 null。大小写不敏感子串匹配，容忍 Linear 未来微调大小写
+// 或附加上下文（如 "Entity not found: ...（hint）"）。
+func isLinearEntityNotFound(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "entity not found")
+}
+
+// isNullRaw 判定一段 json.RawMessage 是否代表「通道中不存在」（TrimSpace 后等于
+// "null" 或为空）。Entity not found 的 alias data 即 null；调用方据此把 gone ref
+// 当缺席而非失败（不 decode、不入结果 map、不会被误标 IsOpen=true）。
+func isNullRaw(raw json.RawMessage) bool {
+	t := strings.TrimSpace(string(raw))
+	return len(t) == 0 || t == "null"
 }
 
 // ---------------------------------------------------------------------------
@@ -516,15 +584,15 @@ func (lc *Linear) ListReplies(ctx context.Context, refs []string, since time.Tim
 		fmt.Fprintf(&b, "r%d: issue(id: %q) { comments { nodes { body createdAt } } } ", i, ref)
 	}
 	b.WriteString("}")
-	var data map[string]json.RawMessage
-	if err := lc.gql(ctx, b.String(), &data); err != nil {
+	data, err := lc.gqlBatch(ctx, b.String())
+	if err != nil {
 		return nil, err
 	}
 	result := make(map[string][]Reply, len(refs))
 	for i, ref := range refs {
 		raw, ok := data["r"+strconv.Itoa(i)]
-		if !ok {
-			continue // alias absent (ref errored) — leave this ref unpopulated
+		if !ok || isNullRaw(raw) {
+			continue // alias 缺席或 null（ref 已从通道消失=stale GitHub 号 / 归档 / 删除）—无评论，不入 map
 		}
 		var issue struct {
 			Comments struct {
@@ -619,15 +687,15 @@ func (lc *Linear) GetTaskStates(ctx context.Context, refs []string) (map[string]
 		fmt.Fprintf(&b, "r%d: issue(id: %q) { state { id name type } archivedAt } ", i, ref)
 	}
 	b.WriteString("}")
-	var data map[string]json.RawMessage
-	if err := lc.gql(ctx, b.String(), &data); err != nil {
+	data, err := lc.gqlBatch(ctx, b.String())
+	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]TaskState, len(refs))
 	for i, ref := range refs {
 		raw, ok := data["r"+strconv.Itoa(i)]
-		if !ok {
-			continue // alias absent (ref errored) — leave this ref unpopulated
+		if !ok || isNullRaw(raw) {
+			continue // alias 缺席或 null（ref 已从通道消失=stale GitHub 号 / 归档 / 删除）—留空不入 map（不会被误标 IsOpen=true 触发重排队）
 		}
 		var issue struct {
 			State      linearState `json:"state"`
