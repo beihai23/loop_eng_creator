@@ -39,11 +39,42 @@ type codexAgent struct {
 // "codex" when unset; Name is the -m model; Cmd is appended verbatim (native
 // passthrough for provider-specific flags).
 func newCodexAgent(ref config.ModelRef) *codexAgent {
+	args := ref.Cmd
+	if ref.ReadOnly {
+		args = codexReadOnlyArgs(args)
+	}
 	return &codexAgent{
 		binary: binaryOf(ref, "codex"),
 		model:  ref.Name,
-		args:   ref.Cmd,
+		args:   args,
 	}
+}
+
+// codexReadOnlyArgs forces codex into a read-only sandbox for a ReadOnly role
+// (triage/plan/verify), the codex equivalent of claude's plan mode: it strips
+// any prior --sandbox / --sandbox=<x> (a config could set workspace-write) and
+// appends --sandbox read-only, so the role physically cannot modify the repo
+// even via shell. codex exec defaults to read-only anyway, but this makes a
+// ReadOnly role airtight regardless of what cmd tried to widen the sandbox (#101:
+// before, only claude honored ReadOnly — non-claude plan/triage/verify silently
+// ran with write permission).
+func codexReadOnlyArgs(cmd []string) []string {
+	out := make([]string, 0, len(cmd)+2)
+	for i := 0; i < len(cmd); i++ {
+		switch a := cmd[i]; {
+		case a == "--sandbox": // strip --sandbox <val>
+			if i+1 < len(cmd) {
+				i++
+			}
+			continue
+		case strings.HasPrefix(a, "--sandbox="): // strip --sandbox=<val>
+			continue
+		default:
+			out = append(out, a)
+		}
+	}
+	out = append(out, "--sandbox", "read-only")
+	return out
 }
 
 func (a *codexAgent) Provider() string { return "codex" }
