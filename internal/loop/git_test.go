@@ -24,8 +24,29 @@ func TestWorktreeDiffIncludesUntracked(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "NEWFILE.md"), []byte("# new\nhello from loop-eng\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	diff := worktreeDiff(repo, wt)
+	diff, err := worktreeDiff(repo, wt)
+	if err != nil {
+		t.Fatalf("worktreeDiff on a valid worktree must not error: %v", err)
+	}
 	if !strings.Contains(diff, "NEWFILE.md") || !strings.Contains(diff, "hello from loop-eng") {
 		t.Fatalf("worktreeDiff must include the untracked new file; got:\n%s", diff)
+	}
+}
+
+// TestWorktreeDiffSurfacesGitError pins #99: when git can't stage/diff the
+// worktree (here: wt is not a git repo), worktreeDiff returns a wrapped error
+// naming the failing git step — NOT a silent empty string that would make verify
+// reject with a hidden, wrong "execute made no changes" cause.
+func TestWorktreeDiffSurfacesGitError(t *testing.T) {
+	notARepo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(notARepo, "f.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := worktreeDiff(notARepo, notARepo)
+	if err == nil {
+		t.Fatal("worktreeDiff on a non-git dir must return an error, not a silent empty diff")
+	}
+	if !strings.Contains(err.Error(), "git add") {
+		t.Fatalf("error must name the failing git step (git add); got: %v", err)
 	}
 }
