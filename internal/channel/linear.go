@@ -68,6 +68,11 @@ type Linear struct {
 	uuidCache  map[string]string // identifier → UUID（commentCreate 等用）
 	stateCache []linearState     // workflowStates 缓存（name/type → id 解析用）
 	stateReady bool
+
+	// repliesOff/statesOff rotate the per-tick ref cap (capRefs) across ticks so
+	// a stable overflow list is covered, not starved (same tail cut every tick,
+	// never polled). Mirrors GitHub.repliesOff/statesOff. Single-active engine.
+	repliesOff, statesOff int
 }
 
 // linearState 是 WorkflowState 的三元组（kanban 列：自定义列名 + 语义类别 +
@@ -80,11 +85,11 @@ type linearState struct {
 
 // NewLinear 构造 Linear 通道，参数按显式位置语义命名（不再按内容猜测）：
 //
-//	NewLinear(apiKey, endpoint, projectID, teamID, statusMap)
+//		NewLinear(apiKey, endpoint, projectID, teamID, statusMap)
 //
-//   - apiKey 为空时，每次请求回落读环境变量 LOOP_ENG_LINEAR_API_KEY。
-//   - endpoint 为空时，由 gqlEndpoint() 回落 DefaultLinearEndpoint。
-//   - statusMap 为 loop status → Linear WorkflowState name 的可配映射（可为 nil）。
+//	  - apiKey 为空时，每次请求回落读环境变量 LOOP_ENG_LINEAR_API_KEY。
+//	  - endpoint 为空时，由 gqlEndpoint() 回落 DefaultLinearEndpoint。
+//	  - statusMap 为 loop status → Linear WorkflowState name 的可配映射（可为 nil）。
 //
 // 导出与未导出字段同步写入：导出字段供包外（如 cli 层）读取配置，
 // 未导出字段供包内测试直接替换 endpoint/key 指向 mock server。
@@ -504,7 +509,7 @@ func (lc *Linear) ListNewTasks(ctx context.Context) ([]Task, error) {
 // doc §4.1, isomorphic with parseIssueCommentsJSON) so existing subloop callers
 // are unaffected. Each Reply carries CreatedAt so callers can re-filter.
 func (lc *Linear) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
-	refs = capRefs("linear.ListReplies", refs)
+	refs, lc.repliesOff = capRefs("linear.ListReplies", refs, lc.repliesOff)
 	var b strings.Builder
 	b.WriteString("query { ")
 	for i, ref := range refs {
@@ -607,7 +612,7 @@ func (lc *Linear) GetTaskStates(ctx context.Context, refs []string) (map[string]
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	refs = capRefs("linear.GetTaskStates", refs)
+	refs, lc.statesOff = capRefs("linear.GetTaskStates", refs, lc.statesOff)
 	var b strings.Builder
 	b.WriteString("query { ")
 	for i, ref := range refs {

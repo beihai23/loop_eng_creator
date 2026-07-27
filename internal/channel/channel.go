@@ -17,18 +17,28 @@ import (
 // budget predictable.
 const maxRefsPerTick = 50
 
-// capRefs bounds refs to maxRefsPerTick. When refs exceed the cap the first
-// maxRefsPerTick are kept and the overflow is logged (label names the caller
-// so the log line is attributable) — nothing is silently dropped, the tail
-// just waits for the next tick. Pure function: callers can use it without a
-// receiver (channel methods feed it their own label).
-func capRefs(label string, refs []string) []string {
+// capRefs bounds refs to maxRefsPerTick, ROTATING the window by `off` so a
+// stable list larger than the cap is covered across successive ticks instead of
+// always truncating the same tail. A fixed refs[:cap] truncation starves the
+// overflow — the refs come from an ordered query (TerminalTasks etc.), so the
+// same tail would be cut every tick and NEVER polled. Rotation advances the
+// window by cap each call (wrapping mod len), so over ceil(N/cap) ticks every
+// ref is polled. Returns the selected refs and the next offset to pass on the
+// following call (0 when no rotation was needed). Pure given (refs, off);
+// callers hold the offset across ticks.
+func capRefs(label string, refs []string, off int) ([]string, int) {
 	if len(refs) <= maxRefsPerTick {
-		return refs
+		return refs, 0
 	}
-	log.Printf("%s: %d refs > cap %d，本轮只拉前 %d，余下下 tick 再来（非静默丢弃）",
-		label, len(refs), maxRefsPerTick, maxRefsPerTick)
-	return refs[:maxRefsPerTick]
+	n := len(refs)
+	sel := make([]string, maxRefsPerTick)
+	for i := 0; i < maxRefsPerTick; i++ {
+		sel[i] = refs[(off+i)%n]
+	}
+	next := (off + maxRefsPerTick) % n
+	log.Printf("%s: %d refs > cap %d，从 offset %d 轮转拉 %d（next offset %d）——余下后续 tick 轮到，非静默丢弃",
+		label, n, maxRefsPerTick, off, maxRefsPerTick, next)
+	return sel, next
 }
 
 type Task struct {
