@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -99,5 +100,53 @@ func TestCodexAgentDeliversPromptViaStdin(t *testing.T) {
 	// wc -c of the piped prompt = len(prompt) bytes (the agent must not drop it).
 	if want, got := strconv.Itoa(len(prompt)), strings.TrimSpace(out); want != got {
 		t.Fatalf("codex agent must pipe the full prompt to stdin: want %s bytes, got %q", want, got)
+	}
+}
+
+// TestCodexAgentFatalTrustedDirAbortsImmediately pins the agent-smoke fix (task
+// #87): a codex "Not inside a trusted directory" refusal — the exact signal the
+// smoke hit because the harness ran Exec in a bare tempdir instead of a git
+// worktree — is FATAL. runWithRetry must return after exactly 1 attempt wrapped
+// in ErrClaudeFatal, not burn 30/60/120s of empty backoff retrying an error
+// retry cannot heal.
+func TestCodexAgentFatalTrustedDirAbortsImmediately(t *testing.T) {
+	withNoBackoff(t)
+	bin, countDir := writeFakeFatalBinary(t, "fake-codex-trusteddir",
+		"Not inside a trusted directory and --skip-git-repo-check was not specified")
+	a, err := NewAgent(config.ModelRef{Provider: "codex", Binary: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = AsExecuter(a).Exec(context.Background(), t.TempDir(), "do the task")
+	if !errors.Is(err, ErrClaudeFatal) {
+		t.Fatalf("codex trusted-dir error must be ErrClaudeFatal; got: %v", err)
+	}
+	countBytes, _ := os.ReadFile(filepath.Join(countDir, "count"))
+	attempts := len(strings.Split(strings.TrimSpace(string(countBytes)), "\n"))
+	if attempts != 1 {
+		t.Fatalf("codex trusted-dir error must abort after 1 attempt (no retry), got %d", attempts)
+	}
+}
+
+// TestCodexAgentFatalQuotaAbortsImmediately pins the codex quota class (task #87):
+// a "usage limit exceeded (429)" stderr — an account quota-exhausted — is FATAL.
+// 1 attempt, ErrClaudeFatal, no backoff. Otherwise every codex call while the
+// account is quota-exhausted burns 30/60/120s of empty retry before failing.
+func TestCodexAgentFatalQuotaAbortsImmediately(t *testing.T) {
+	withNoBackoff(t)
+	bin, countDir := writeFakeFatalBinary(t, "fake-codex-quota",
+		"usage limit exceeded (429)")
+	a, err := NewAgent(config.ModelRef{Provider: "codex", Binary: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = AsExecuter(a).Exec(context.Background(), t.TempDir(), "do the task")
+	if !errors.Is(err, ErrClaudeFatal) {
+		t.Fatalf("codex quota error must be ErrClaudeFatal; got: %v", err)
+	}
+	countBytes, _ := os.ReadFile(filepath.Join(countDir, "count"))
+	attempts := len(strings.Split(strings.TrimSpace(string(countBytes)), "\n"))
+	if attempts != 1 {
+		t.Fatalf("codex quota error must abort after 1 attempt (no retry), got %d", attempts)
 	}
 }

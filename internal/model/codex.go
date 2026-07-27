@@ -91,17 +91,31 @@ func (a *codexAgent) runOnce(ctx context.Context, dir, model, prompt string) (st
 }
 
 // fatalCodexSignals are lowercased substrings that mark a non-retryable codex
-// auth/credential failure. Mirrors fatalClaudeSignals's role for claude.
+// failure. Besides auth/credential (mirrors fatalClaudeSignals for claude), this
+// also covers the config/env-class failures retry cannot heal: the trusted-dir
+// refusal ("Not inside a trusted directory", which the smoke hit only because
+// the harness used a bare tempdir instead of a git worktree — real loop usage in
+// a worktree never trips it) and the account quota/rate-limit class (usage
+// limit / 429 / rate limit) that an exhausted codex account emits. Hitting any
+// → ErrClaudeFatal short-circuit, no 30/60/120s backoff burn.
 var fatalCodexSignals = []string{
 	"authentication", "unauthorized", "not authorized",
 	"401", "403",
 	"api key", "api_key", "apikey",
 	"credential", "not logged in", "login required", "please log in",
 	"invalid api key", "missing api key",
+	// config/env-class: trusted-dir refusal + account quota/rate-limit. These
+	// never self-heal on retry, so they are fatal alongside auth.
+	"not inside a trusted directory",
+	"usage limit", "usage_limit", "quota",
+	"rate limit", "rate_limit", "429",
+	"insufficient balance", "insufficient_balance",
 }
 
 // isFatalCodexError reports whether codex's combined output looks like a
-// non-retryable auth/credential failure (so ErrClaudeFatal short-circuits it).
+// non-retryable failure — auth/credential OR a config/env-class error retry
+// cannot heal (trusted-dir refusal, account quota/usage-limit/rate-limit/429,
+// insufficient balance). ErrClaudeFatal short-circuits it either way.
 func isFatalCodexError(stderr, stdout string) bool {
 	s := strings.ToLower(stderr + " " + stdout)
 	for _, sig := range fatalCodexSignals {

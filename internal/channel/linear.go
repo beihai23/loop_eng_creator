@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -493,36 +494,53 @@ func (lc *Linear) ListNewTasks(ctx context.Context) ([]Task, error) {
 	return tasks, nil
 }
 
-// ListReplies 逐 ref 拉评论（同 github 通道的 per-ref 循环），客户端按
-// createdAt > since 过滤（映射文档 §4.1：与 parseIssueCommentsJSON 同构）。
+// ListReplies fetches comments for ALL refs in a single GraphQL request using
+// aliased issue() fields (r0..rN-1) instead of one request per ref — N refs now
+// cost one round-trip (plus gql's existing retry/ctx passthrough covers the
+// whole batch), so a busy daemon tick no longer makes N serial calls that each
+// block dispatch. refs are capped to maxRefsPerTick first (overflow logged, not
+// silently dropped). The daemon calls this with since=zero and re-filters per
+// task; when since is non-zero this channel still filters client-side (mapping
+// doc §4.1, isomorphic with parseIssueCommentsJSON) so existing subloop callers
+// are unaffected. Each Reply carries CreatedAt so callers can re-filter.
 func (lc *Linear) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
-	const q = `query IssueComments($ref: String!) {
-  issue(id: $ref) { comments { nodes { body createdAt } } }
-}`
+	refs = capRefs("linear.ListReplies", refs)
+	var b strings.Builder
+	b.WriteString("query { ")
+	for i, ref := range refs {
+		fmt.Fprintf(&b, "r%d: issue(id: %q) { comments { nodes { body createdAt } } } ", i, ref)
+	}
+	b.WriteString("}")
+	var data map[string]json.RawMessage
+	if err := lc.gql(ctx, b.String(), &data); err != nil {
+		return nil, err
+	}
 	result := make(map[string][]Reply, len(refs))
-	for _, ref := range refs {
-		var out struct {
-			Issue struct {
-				Comments struct {
-					Nodes []struct {
-						Body      string `json:"body"`
-						CreatedAt string `json:"createdAt"`
-					} `json:"nodes"`
-				} `json:"comments"`
-			} `json:"issue"`
+	for i, ref := range refs {
+		raw, ok := data["r"+strconv.Itoa(i)]
+		if !ok {
+			continue // alias absent (ref errored) — leave this ref unpopulated
 		}
-		if err := lc.gql(ctx, q, map[string]any{"ref": ref}, &out); err != nil {
-			return nil, err
+		var issue struct {
+			Comments struct {
+				Nodes []struct {
+					Body      string `json:"body"`
+					CreatedAt string `json:"createdAt"`
+				} `json:"nodes"`
+			} `json:"comments"`
 		}
-		replies := make([]Reply, 0, len(out.Issue.Comments.Nodes))
-		for _, c := range out.Issue.Comments.Nodes {
+		if err := json.Unmarshal(raw, &issue); err != nil {
+			return nil, fmt.Errorf("linear: decode comments for %s: %w", ref, err)
+		}
+		replies := make([]Reply, 0, len(issue.Comments.Nodes))
+		for _, c := range issue.Comments.Nodes {
 			if !since.IsZero() {
 				t, err := time.Parse(time.RFC3339, c.CreatedAt)
 				if err != nil || !t.After(since) {
 					continue
 				}
 			}
-			replies = append(replies, Reply{Body: c.Body})
+			replies = append(replies, Reply{Body: c.Body, CreatedAt: c.CreatedAt})
 		}
 		result[ref] = replies
 	}
@@ -577,32 +595,46 @@ func (lc *Linear) CloseIssue(ctx context.Context, ref string) error {
 	return lc.issueUpdateState(ctx, ref, stateID)
 }
 
-// GetTaskStates 逐 ref 查 state + archivedAt：
-// IsOpen = archivedAt==nil && state.type ∉ {completed, canceled}；
-// Labels = [state.name]（Linear 的「状态标记」就是 kanban 列名，映射文档 §7）。
+// GetTaskStates fetches state + archivedAt for ALL refs in a single GraphQL
+// request using aliased issue() fields (r0..rN-1) instead of one request per
+// ref — N terminal refs (a reconcile batch) now cost one round-trip, so a
+// network blip no longer makes N serial calls that block dispatch. refs are
+// capped to maxRefsPerTick first (overflow logged, not silently dropped). The
+// alias key r{i} zips back to refs[i]; per-ref IsOpen/Labels follow the same
+// rules as before: IsOpen = archivedAt==nil && state.type ∉ {completed, canceled};
+// Labels = [state.name] (Linear's "status marker" is the kanban column, §7).
 func (lc *Linear) GetTaskStates(ctx context.Context, refs []string) (map[string]TaskState, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	const q = `query IssueState($ref: String!) {
-  issue(id: $ref) { state { id name type } archivedAt }
-}`
+	refs = capRefs("linear.GetTaskStates", refs)
+	var b strings.Builder
+	b.WriteString("query { ")
+	for i, ref := range refs {
+		fmt.Fprintf(&b, "r%d: issue(id: %q) { state { id name type } archivedAt } ", i, ref)
+	}
+	b.WriteString("}")
+	var data map[string]json.RawMessage
+	if err := lc.gql(ctx, b.String(), &data); err != nil {
+		return nil, err
+	}
 	out := make(map[string]TaskState, len(refs))
-	for _, ref := range refs {
-		var resp struct {
-			Issue struct {
-				State      linearState `json:"state"`
-				ArchivedAt *string     `json:"archivedAt"`
-			} `json:"issue"`
+	for i, ref := range refs {
+		raw, ok := data["r"+strconv.Itoa(i)]
+		if !ok {
+			continue // alias absent (ref errored) — leave this ref unpopulated
 		}
-		if err := lc.gql(ctx, q, map[string]any{"ref": ref}, &resp); err != nil {
-			return nil, err
+		var issue struct {
+			State      linearState `json:"state"`
+			ArchivedAt *string     `json:"archivedAt"`
 		}
-		st := resp.Issue.State
-		open := resp.Issue.ArchivedAt == nil && st.Type != "completed" && st.Type != "canceled"
+		if err := json.Unmarshal(raw, &issue); err != nil {
+			return nil, fmt.Errorf("linear: decode state for %s: %w", ref, err)
+		}
+		open := issue.ArchivedAt == nil && issue.State.Type != "completed" && issue.State.Type != "canceled"
 		var labels []string
-		if st.Name != "" {
-			labels = []string{st.Name}
+		if issue.State.Name != "" {
+			labels = []string{issue.State.Name}
 		}
 		out[ref] = TaskState{Ref: ref, IsOpen: open, Labels: labels}
 	}

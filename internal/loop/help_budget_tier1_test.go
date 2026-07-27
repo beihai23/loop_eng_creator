@@ -48,24 +48,20 @@ func TestTier1HelpBudget(t *testing.T) {
 		Repo: repo, Store: st, Budget: bz, Channel: channel.NewLocal(t.TempDir()),
 		Help: skill.Skill[skill.HelpInput, skill.HelpOutput]{
 			Name: "help", PromptTmpl: "HELP: {{.Task}}", ParseJSON: tier1ParseHelp,
-			Model: &budget.Client{Base: base, Enf: bz},
+			Model: &budget.Client{Base: base, Enf: bz, Role: "help"},
 		},
 	}
 	_ = sl.helpOutput(context.Background(), channel.Task{Ref: "H", Description: "h"}, 2, "卡住", runID)
 	if base.calls != 1 {
 		t.Fatalf("accounting: help base 应被调用 1 次, got %d", base.calls)
 	}
-	var helpIn int
-	for _, s := range mustReplay(t, st, runID) {
-		if s.Role == "help" {
-			helpIn = s.TokensIn
-		}
+	// main 的 help 预算：经 budget.Client{Role:"help"} 装饰，token 计入 Enforcer（spent）
+	// 且 ledger 落一行 kind="help"（不再写独立 help step、也不用旧的 kind="tokens"）。
+	if bz.Spent() == 0 {
+		t.Fatalf("accounting: help 调用的 token 应计入 Enforcer (spent>0), got 0")
 	}
-	if helpIn == 0 {
-		t.Fatalf("accounting: 想要 help step tokens_in>0, got 0")
-	}
-	if !ledgerHasTokens(t, st, runID) {
-		t.Fatalf("accounting: budget_ledger 缺 help 的 tokens 行")
+	if !ledgerHasHelp(t, st, runID) {
+		t.Fatalf("accounting: budget_ledger 缺 help 的预算行 (kind=help)")
 	}
 
 	// (2) 闸门——PerCall(100) 会把 spent 顶过 PerTask(50)：BeforeCall 拒付。
@@ -77,7 +73,7 @@ func TestTier1HelpBudget(t *testing.T) {
 		Repo: repo, Store: st, Budget: bzGate, Channel: channel.NewLocal(t.TempDir()),
 		Help: skill.Skill[skill.HelpInput, skill.HelpOutput]{
 			Name: "help", PromptTmpl: "HELP: {{.Task}}", ParseJSON: tier1ParseHelp,
-			Model: &budget.Client{Base: gated, Enf: bzGate},
+			Model: &budget.Client{Base: gated, Enf: bzGate, Role: "help"},
 		},
 	}
 	_ = sl2.helpOutput(context.Background(), channel.Task{Ref: "H2", Description: "h2"}, 2, "卡住", runID2)
@@ -95,14 +91,14 @@ func mustReplay(t *testing.T, st *state.Store, runID string) []state.StepRow {
 	return steps
 }
 
-func ledgerHasTokens(t *testing.T, st *state.Store, runID string) bool {
+func ledgerHasHelp(t *testing.T, st *state.Store, runID string) bool {
 	t.Helper()
 	rows, err := st.BudgetLedger(runID)
 	if err != nil {
 		t.Fatalf("budget ledger %s: %v", runID, err)
 	}
 	for _, r := range rows {
-		if r.Kind == "tokens" {
+		if r.Kind == "help" {
 			return true
 		}
 	}

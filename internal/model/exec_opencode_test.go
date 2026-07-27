@@ -2,6 +2,8 @@ package model
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -68,5 +70,29 @@ func TestOpencodeAgentDeliversPromptAsArgv(t *testing.T) {
 	}
 	if !strings.Contains(out, prompt) {
 		t.Fatalf("opencode agent must pass the full prompt as a positional argv element; got %q", out)
+	}
+}
+
+// TestOpencodeAgentFatalInsufficientBalanceAbortsImmediately pins the agent-smoke
+// fix (task #87): an opencode "Insufficient Balance" failure — an account with
+// no credit, an environment problem not a code bug — is FATAL. runWithRetry must
+// return after exactly 1 attempt wrapped in ErrClaudeFatal, not burn the ~97s of
+// empty backoff the smoke observed retrying a balance error retry cannot heal.
+func TestOpencodeAgentFatalInsufficientBalanceAbortsImmediately(t *testing.T) {
+	withNoBackoff(t)
+	bin, countDir := writeFakeFatalBinary(t, "fake-opencode-balance",
+		"Error: Insufficient Balance")
+	a, err := NewAgent(config.ModelRef{Provider: "opencode", Binary: bin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = AsExecuter(a).Exec(context.Background(), t.TempDir(), "do the task")
+	if !errors.Is(err, ErrClaudeFatal) {
+		t.Fatalf("opencode balance error must be ErrClaudeFatal; got: %v", err)
+	}
+	countBytes, _ := os.ReadFile(filepath.Join(countDir, "count"))
+	attempts := len(strings.Split(strings.TrimSpace(string(countBytes)), "\n"))
+	if attempts != 1 {
+		t.Fatalf("opencode balance error must abort after 1 attempt (no retry), got %d", attempts)
 	}
 }

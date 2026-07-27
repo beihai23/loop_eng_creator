@@ -1,6 +1,10 @@
 package channel
 
 import (
+	"context"
+	"errors"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -112,5 +116,99 @@ func TestParseIssueCommentsJSONEmpty(t *testing.T) {
 func TestParseIssueCommentsJSONBad(t *testing.T) {
 	if _, err := parseIssueCommentsJSON([]byte(`{not-json`), time.Time{}); err == nil {
 		t.Fatal("want error for malformed comments JSON, got nil")
+	}
+}
+
+// TestParseIssueCommentsJSONCarriesCreatedAt pins that every Reply now carries
+// the comment's RFC3339 createdAt — the field the daemon's batched
+// repliesSince re-filter relies on after a single ListReplies(since=zero) fetch.
+func TestParseIssueCommentsJSONCarriesCreatedAt(t *testing.T) {
+	raw := `{"comments":[{"body":"first","createdAt":"2026-07-01T00:00:00Z"},{"body":"second","createdAt":"2026-07-09T10:05:00Z"}]}`
+	replies, err := parseIssueCommentsJSON([]byte(raw), time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replies) != 2 {
+		t.Fatalf("want 2 replies, got %d", len(replies))
+	}
+	if replies[0].CreatedAt != "2026-07-01T00:00:00Z" || replies[1].CreatedAt != "2026-07-09T10:05:00Z" {
+		t.Fatalf("CreatedAt not carried: %+v", replies)
+	}
+}
+
+// TestGitHubListRepliesCapsRefs pins that ListReplies honors the per-tick ref
+// cap: over maxRefsPerTick, only the first maxRefsPerTick are fetched (the rest
+// deferred to the next tick) and gh is called exactly maxRefsPerTick times.
+func TestGitHubListRepliesCapsRefs(t *testing.T) {
+	var calls int32
+	g := &GitHub{Repo: "owner/repo", TaskLabel: "loop:task", ghFunc: func(ctx context.Context, args ...string) ([]byte, error) {
+		atomic.AddInt32(&calls, 1)
+		return []byte(`{"comments":[]}`), nil
+	}}
+	refs := make([]string, maxRefsPerTick+3)
+	for i := range refs {
+		refs[i] = strconv.Itoa(i + 1)
+	}
+	got, err := g.ListReplies(context.Background(), refs, time.Time{})
+	if err != nil {
+		t.Fatalf("ListReplies: %v", err)
+	}
+	if int(calls) != maxRefsPerTick {
+		t.Fatalf("gh 调用数 = %d, want 封顶到 maxRefsPerTick=%d", calls, maxRefsPerTick)
+	}
+	if len(got) != maxRefsPerTick {
+		t.Fatalf("回填 replies = %d, want 封顶到 maxRefsPerTick=%d", len(got), maxRefsPerTick)
+	}
+}
+
+// TestGitHubListRepliesPartialFailure pins the bounded pool's partial-failure
+// semantics: when one ref's gh call fails, the OTHER refs are still fetched and
+// back-filled, and the first error is returned (not nil). This is the key win
+// over the old serial loop — one flaky ref no longer aborts the whole tick.
+func TestGitHubListRepliesPartialFailure(t *testing.T) {
+	g := &GitHub{Repo: "owner/repo", TaskLabel: "loop:task", ghFunc: func(ctx context.Context, args ...string) ([]byte, error) {
+		// ref is args[2] (issue view <ref> ...); simulate ref "2" failing.
+		if len(args) > 2 && args[2] == "2" {
+			return nil, errors.New("gh: HTTP 502")
+		}
+		return []byte(`{"comments":[{"body":"ok","createdAt":"2026-07-01T00:00:00Z"}]}`), nil
+	}}
+	got, err := g.ListReplies(context.Background(), []string{"1", "2", "3"}, time.Time{})
+	if err == nil {
+		t.Fatal("应透出首个失败 ref 的 error, got nil")
+	}
+	if len(got["1"]) != 1 || got["1"][0].Body != "ok" {
+		t.Fatalf("ref 1 应在 ref 2 失败时仍回填, got[1]=%v", got["1"])
+	}
+	if len(got["3"]) != 1 || got["3"][0].Body != "ok" {
+		t.Fatalf("ref 3 应在 ref 2 失败时仍回填, got[3]=%v", got["3"])
+	}
+	if _, ok := got["2"]; ok {
+		t.Fatalf("失败的 ref 2 不应回填, got[2]=%v", got["2"])
+	}
+}
+
+// TestGitHubGetTaskStatesPartialFailure is the GetTaskStates analog of the
+// above: one failing ref returns firstErr but the rest are still populated, so
+// reconcile can act on whichever terminal refs it learned about.
+func TestGitHubGetTaskStatesPartialFailure(t *testing.T) {
+	g := &GitHub{Repo: "owner/repo", TaskLabel: "loop:task", ghFunc: func(ctx context.Context, args ...string) ([]byte, error) {
+		if len(args) > 2 && args[2] == "2" {
+			return nil, errors.New("gh: HTTP 502")
+		}
+		return []byte(`{"state":"OPEN","labels":[{"name":"loop:running"}]}`), nil
+	}}
+	got, err := g.GetTaskStates(context.Background(), []string{"1", "2", "3"})
+	if err == nil {
+		t.Fatal("应透出首个失败 ref 的 error, got nil")
+	}
+	if !got["1"].IsOpen || len(got["1"].Labels) != 1 {
+		t.Fatalf("ref 1 应回填 OPEN state, got[1]=%+v", got["1"])
+	}
+	if !got["3"].IsOpen {
+		t.Fatalf("ref 3 应在 ref 2 失败时仍回填, got[3]=%+v", got["3"])
+	}
+	if _, ok := got["2"]; ok {
+		t.Fatalf("失败的 ref 2 不应回填, got[2]=%+v", got["2"])
 	}
 }

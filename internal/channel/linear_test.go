@@ -144,8 +144,9 @@ func TestLinearListNewTasks(t *testing.T) {
 }
 
 func TestLinearListReplies(t *testing.T) {
-	lc, _ := newLinearStub(t, func(q linearStubReq) any {
-		return stubData(map[string]any{"issue": map[string]any{"comments": map[string]any{"nodes": []map[string]any{
+	lc, reqs := newLinearStub(t, func(q linearStubReq) any {
+		// 批量形态：单次 GraphQL 用别名 r0 拉回该 ref 的评论，不再逐 ref 单查。
+		return stubData(map[string]any{"r0": map[string]any{"comments": map[string]any{"nodes": []map[string]any{
 			{"body": "old", "createdAt": "2026-07-01T00:00:00Z"},
 			{"body": "new reply", "createdAt": "2026-07-17T12:00:00Z"},
 		}}}})
@@ -154,6 +155,9 @@ func TestLinearListReplies(t *testing.T) {
 	got, err := lc.ListReplies(context.Background(), []string{"ENG-1"}, since)
 	if err != nil {
 		t.Fatalf("ListReplies: %v", err)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("批量 ListReplies 对 1 ref 应只发 1 次请求, got %d", len(*reqs))
 	}
 	reps := got["ENG-1"]
 	if len(reps) != 1 || reps[0].Body != "new reply" {
@@ -254,21 +258,25 @@ func TestLinearCloseIssue(t *testing.T) {
 }
 
 func TestLinearGetTaskStates(t *testing.T) {
-	lc, _ := newLinearStub(t, func(q linearStubReq) any {
-		if q.Variables["ref"] == "ENG-1" {
-			return stubData(map[string]any{"issue": map[string]any{
+	lc, reqs := newLinearStub(t, func(q linearStubReq) any {
+		// 批量形态：单次 GraphQL 用别名 r0/r1 拉回两个 ref 的 state，不再逐 ref 单查。
+		return stubData(map[string]any{
+			"r0": map[string]any{
 				"state":      map[string]any{"id": "st-doing", "name": "In Progress", "type": "started"},
 				"archivedAt": nil,
-			}})
-		}
-		return stubData(map[string]any{"issue": map[string]any{
-			"state":      map[string]any{"id": "st-done", "name": "Done", "type": "completed"},
-			"archivedAt": nil,
-		}})
+			},
+			"r1": map[string]any{
+				"state":      map[string]any{"id": "st-done", "name": "Done", "type": "completed"},
+				"archivedAt": nil,
+			},
+		})
 	})
 	got, err := lc.GetTaskStates(context.Background(), []string{"ENG-1", "ENG-2"})
 	if err != nil {
 		t.Fatalf("GetTaskStates: %v", err)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("批量 GetTaskStates 对 2 refs 应只发 1 次请求, got %d", len(*reqs))
 	}
 	if !got["ENG-1"].IsOpen {
 		t.Fatal("started-type 应 IsOpen=true")

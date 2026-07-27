@@ -73,9 +73,11 @@ func TestTier1LinearChannel(t *testing.T) {
 				io.WriteString(w, `{"data":{"workflowStates":{"nodes":`+nodes+`}}}`)
 			}
 		case strings.Contains(q, "comments"):
-			io.WriteString(w, `{"data":{"issue":{"comments":{"nodes":[{"body":"old","createdAt":"2026-01-01T00:00:00Z"},{"body":"new","createdAt":"2026-07-10T00:00:00Z"}]}}}}`)
+			// 批量 ListReplies：别名 r0 顶层对象（不再单 issue 包裹）。
+			io.WriteString(w, `{"data":{"r0":{"comments":{"nodes":[{"body":"old","createdAt":"2026-01-01T00:00:00Z"},{"body":"new","createdAt":"2026-07-10T00:00:00Z"}]}}}}`)
 		case strings.Contains(q, "archivedAt"):
-			io.WriteString(w, `{"data":{"issue":{"identifier":"ENG-1","archivedAt":null,"state":{"id":"s-prog","name":"In Progress","type":"started"}}}}`)
+			// 批量 GetTaskStates：别名 r0 顶层对象（不再单 issue 包裹）。
+			io.WriteString(w, `{"data":{"r0":{"identifier":"ENG-1","archivedAt":null,"state":{"id":"s-prog","name":"In Progress","type":"started"}}}}`)
 		case strings.Contains(q, "issues"):
 			io.WriteString(w, `{"data":{"issues":{"nodes":[{"identifier":"ENG-1","title":"fallback title","description":"## 任务\ndo the thing\ntype: bug\n- [ ] ac1","createdAt":"2026-07-01T00:00:00Z","state":{"id":"s-todo","name":"Todo","type":"unstarted"}}]}}}`)
 		default: // identifier→UUID resolution: issue(id:$ref){ id }

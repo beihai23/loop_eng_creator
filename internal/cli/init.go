@@ -24,24 +24,35 @@ var skillFiles embed.FS
 // are produced per-task by the planner and run in the worktree. Per-role model
 // opt-in: set `name` in .loop/config.yaml if a role needs a different model.
 //
-// Read-only defense-in-depth (#84): triage/plan/verify append
-// `--disallowedTools Edit Write NotebookEdit` so the write tools are physically
-// removed from the agent's context — their "read-only" is enforced by the
-// permission layer, not just by prompt self-discipline. `--dangerously-skip-
-// permissions` is KEPT on all roles (headless read-only Bash — grep/go doc/git
-// ls-files — needs it to run); deny rules take precedence over bypassPermissions,
-// so the two coexist and deny wins. execute is unchanged: it needs to write.
-// Bash remains a potential write channel; worktree isolation (#68 P0) contains
-// in-repo writes, and out-of-repo Bash actions are accepted residual risk.
+// Airtight read-only roles (#84 → #airtight): triage/plan/verify carry
+// `readonly: true` plus `--disallowedTools Edit Write NotebookEdit`. The claude
+// provider factory turns `readonly: true` into its read-only profile
+// (model.claudeReadOnlyProfile): it strips any bypass and injects
+// `--permission-mode plan`. plan mode blocks EVERY write at the permission layer
+// — including Bash writes both inside (`echo > file`, `sed -i`) and OUTSIDE the
+// repo (an absolute-path `echo > /tmp/x` is rejected and the file is not created;
+// verified against real claude). Read-only Bash still runs normally (grep / go
+// doc / git ls-files), so exploration is unaffected.
+//
+// `--dangerously-skip-permissions` (bypassPermissions) is therefore REMOVED from
+// the read-only roles: it is mutually exclusive with plan mode, and only one can
+// win — read-only must win. execute KEEPS bypass and sets no `readonly` (it must
+// write), so execute is entirely unaffected by this change.
+//
+// Defense-in-depth, not replacement: the worktree (#68, option 2 — already in
+// place) remains plan/verify's exploration context and a second containment
+// layer — any write that somehow slipped plan mode would land on the disposable
+// tree, not the main repo. The two layers are independent: plan mode makes the
+// write impossible; the worktree makes its consequence disposable.
 var defaultConfig = `
 models:
-  triage:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
-  plan:    { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
+  triage:  { provider: claude, via: claude-p, binary: claude, cmd: ["--disallowedTools", "Edit", "Write", "NotebookEdit"], readonly: true }
+  plan:    { provider: claude, via: claude-p, binary: claude, cmd: ["--disallowedTools", "Edit", "Write", "NotebookEdit"], readonly: true }
   execute: { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions"] }
-  verify:  { provider: claude, via: claude-p, binary: claude, cmd: ["--dangerously-skip-permissions", "--disallowedTools", "Edit", "Write", "NotebookEdit"] }
+  verify:  { provider: claude, via: claude-p, binary: claude, cmd: ["--disallowedTools", "Edit", "Write", "NotebookEdit"], readonly: true }
 budget:
-  per_call_tokens: 20000
-  per_task_tokens: 200000
+  per_call_tokens: 200000
+  per_task_tokens: 1000000
   max_retries: 3
 verify:
   tier3_human: true

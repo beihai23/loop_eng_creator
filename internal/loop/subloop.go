@@ -185,7 +185,7 @@ func (sl *SubLoop) resolveAgentHints(sid string, hints *skill.AgentHints) (model
 			// budget.Client 是 verify token 计入预算的唯一通道）；无 Budget 时
 			// （纯测试装配）退化为裸 client。
 			if sl.Budget != nil {
-				ov.Skill.Model = &budget.Client{Base: model.AsClient(a), Enf: sl.Budget}
+				ov.Skill.Model = &budget.Client{Base: model.AsClient(a), Enf: sl.Budget, Role: "verify"}
 			} else {
 				ov.Skill.Model = model.AsClient(a)
 			}
@@ -198,15 +198,14 @@ func (sl *SubLoop) resolveAgentHints(sid string, hints *skill.AgentHints) (model
 	return exec, execRef, llm, verifyRef
 }
 
-// Before plan/execute calls SubLoop reserves a FULL PerCall of headroom under
-// the per-task cap — BeforeCall(sl.Budget.PerCall), not a tiny fixed estimate.
-// A call's real size is unknowable up front, so reserving PerCall guarantees the
-// next call cannot push cumulative spend past PerTask by more than the configured
-// per-call ceiling. The old fixed estimate (1000) was far smaller than a real
-// execute call (tens of thousands), so the per-task pre-check only tripped AFTER
-// an overshoot — proven by #86 (spent=266844, per_task=200000, estimate=1000).
-// AppendBudget logs the same PerCall value so the ledger records the estimate
-// the Enforcer checked (spec §8.8).
+// Before plan/execute calls SubLoop pre-checks the budget with a REAL per-role
+// estimate — BeforeCall(sl.Budget.Estimate(role)), not a constant. The estimate
+// is the role's last observed usage × estimateSafety (first call uses a per-role
+// floor from budget.roleFloor), so it tracks actual call size instead of the old
+// fixed 1000 / the "estimate == PerCall" tautology that could never trip. The
+// failure direction is "block" (spec §8.8): when in doubt, refuse, so a too-large
+// estimate errs on the side of rejecting. AppendBudget logs the same estimate so
+// the ledger records exactly what the Enforcer checked.
 
 // Run executes the plan→execute→verify→writeback loop for one task.
 //
@@ -309,13 +308,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- plan ----
 		sl.logf("[subloop] %s phase=plan start", sid)
 		_ = sl.Store.SetInFlight(taskID, "plan")
-		if err := sl.Budget.BeforeCall(sl.Budget.PerCall); err != nil {
+		planEst := sl.Budget.Estimate("plan")
+		if err := sl.Budget.BeforeCall(planEst); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
-		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
+		// 预算刹车·每调用 token：plan 模型调用前记一行（spec §8.8）。amount 现在是真实估算
+		// （上次 plan 真实用量×安全系数，首调用取角色 floor），不再是恒值——闸吃真实规模。
+		sl.Store.AppendBudget(runID, "call", "tokens", planEst, sl.Budget.PerCall)
 		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
 			BattleReport: joinNonEmpty(issueContext, priorFailure),
@@ -339,7 +340,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 文本一致；渲染失败（模板错）时 Plan.Run 同样会报 render 错，这里留空即可。
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.RunIn(ctx, planIn, wt)
-		sl.Budget.AfterCall(u)
+		sl.Budget.Record("plan", u)
 		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
 		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
 		// 可重试失败——不进 execute（否则 execute 只能靠战报上下文瞎续，浪费整轮
@@ -424,17 +425,24 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// execute/verify 本轮用哪个 agent 由 plan 的 hint（如有）决定，优先级
 		// step → task（已烘进 role agent）→ role → 默认。
 		exec, execModelRef, llm, verifyModelRef := sl.resolveAgentHints(sid, planOut.AgentHints)
+		// tier-2 token 旁路（修 verify step 行恒为 0）：在 resolve 之后给本轮 LLM 挂一个
+		// usage 指针——base 与 override 两条路径统一覆盖（override 在 resolveAgentHints 里
+		// 复制 sl.VerifyLLM 值时 Usage 还是 nil，这里补上；随后值拷贝进 Chain 的 tiers 共享
+		// 同一指针，Check 写回的 model.Usage 就能被下面的 verify AppendStep 读到落库）。
+		llm.Usage = &model.Usage{}
 
 		// ---- execute (in the attempt's worktree, created before plan) ----
 		sl.logf("[subloop] %s phase=execute start", sid)
 		_ = sl.Store.SetInFlight(taskID, "execute")
-		if err := sl.Budget.BeforeCall(sl.Budget.PerCall); err != nil {
+		execEst := sl.Budget.Estimate("execute")
+		if err := sl.Budget.BeforeCall(execEst); err != nil {
 			isolation.Discard(sl.Repo, wt)
 			_ = sl.Store.ClearInFlight()
 			return sl.report(ctx, taskID, task, "blocked", "budget: "+err.Error()), nil
 		}
-		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）
-		sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
+		// 预算刹车·每调用 token：execute 模型调用前记一行（spec §8.8）。amount=真实估算（execute
+		// 单次约 8 万 token，首调用 floor=80000，重试后吃上次真实用量×安全系数），闸才不致形同虚设。
+		sl.Store.AppendBudget(runID, "call", "tokens", execEst, sl.Budget.PerCall)
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(effTask.AcceptanceCriteria) + "\n"
@@ -475,7 +483,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := exec.Exec(ctx, wt, execPrompt)
-		sl.Budget.AfterCall(u2)
+		sl.Budget.Record("execute", u2)
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=execute fail: %v", sid, err)
@@ -514,6 +522,10 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// ---- verify (Chain of tiers; independent judgment) ----
 		sl.logf("[subloop] %s phase=verify start", sid)
 		_ = sl.Store.SetInFlight(taskID, "verify")
+		// 预算刹车·每调用 token：verify 的 ledger 行（闭合 state.go 注释里 deferred 的行）。
+		// verify 的实际 token 计入与 per-call/per-task 闸在 budget.Client 装饰器内生效（verify
+		// LLM 的 Model 被包成 &budget.Client{Role:"verify"}）；这里补一行可审计的估算记录。
+		_ = sl.Store.AppendBudget(runID, "call", "verify", sl.Budget.Estimate("verify"), sl.Budget.PerCall)
 		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut, llm), diff, effTask.AcceptanceCriteria, priorFailure)
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
@@ -529,6 +541,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			Status:     statusOf2(res.Passed),
 			ModelRef:   verifyModelRef,
 			OutputJSON: string(vt),
+			// tier-2 token 落库（修 verify step 行恒为 0）：llm.Usage 由 verify.LLM.Check
+			// 旁路写回（Skill.Run 的真实 model.Usage）。tier-1 短路或 Chain 出错时 tier-2
+			// 未跑 → 指针保持零值（正确：无 LLM 调用）。仅 role=verify 的 step 行补值，
+			// verifications 表与 tier-1(Deterministic) 不受影响。
+			TokensIn:  llm.Usage.TokensIn,
+			TokensOut: llm.Usage.TokensOut,
 		})
 		// 逐 tier 落盘 verifications（spec §4.6）：best-effort，trace 不 gate loop。
 		// runID 来自 Task 2 的 StartRun 透传；短路时只落实际跑过的 tier。
@@ -712,13 +730,9 @@ func (sl *SubLoop) recordRetryGate(runID string, attempt int, sig, prevSig strin
 
 // helpOutput 产出零增益升级战报的结构化求助。Help skill 已接线（Model!=nil）且 Run 成功 →
 // 用其 HelpOutput；否则退回 synthesizeHelp 兜底（测试不接线 Help 时走此路，Help 出错时也走
-// 此路——blocked 战报始终带 stuck_at/tried/need_from_human）。
-//
-// 记账（spec §8.8）：help 的 Model 经 buildModels 装饰成 *budget.Client，复用本 run 的
-// Enforcer（与 plan/execute/verify 同一个）——BeforeCall(PerCall) 在模型调用前强制、AfterCall
-// 把真实 token 计入 spent。这里只在调用前落一行预算估算（AppendBudget）+ 调用后落一行 help
-// step（role=help，tokens_in/out）；绝不再手动 AfterCall（装饰器已计，否则与 plan/execute 重复
-// 计）。runID 透传自 SubLoop.Run 的 StartRun。
+// 此路——blocked 战报始终带 stuck_at/tried/need_from_human）。runID 用于在真正调用 help 模型
+// 前补一行 budget_ledger（spec §8.8）：help 的 Model 经 buildModels 套 budget.Client{Role:"help"}，
+// 故 sl.Help.Run 会经装饰器 gate+记账到 sl.Budget，token 既进 ledger（help 行）又受 per-task 闸约束。
 func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt int, priorFailure, runID string) skill.HelpOutput {
 	if sl.Help.Model != nil {
 		in := skill.HelpInput{
@@ -727,15 +741,10 @@ func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt in
 			AttemptsSummary: fmt.Sprintf("已重试 %d 轮，连续失败签名相同（零增益）", attempt),
 			LastError:       truncateStr(priorFailure, 500),
 		}
-		// 调用前记一行预算估算（best-effort，trace 不 gate）。BeforeCall 由装饰器在 Call 内强制。
-		_ = sl.Store.AppendBudget(runID, "call", "tokens", sl.Budget.PerCall, sl.Budget.PerCall)
-		out, u, err := sl.Help.Run(ctx, in) // 装饰器自行 BeforeCall(PerCall)+AfterCall(u)
-		_ = sl.Store.AppendStep(state.StepRow{
-			RunID: runID, Seq: attempt*10 + 10, Role: "help",
-			Status: statusOf(err), Error: errStr(err),
-			TokensIn: u.TokensIn, TokensOut: u.TokensOut,
-		})
-		if err == nil {
+		// 预算刹车·每调用 token：help 模型调用前记一行（spec §8.8）。help 过去裸跑零记账，
+		// 现在经 budget.Client 装饰器受 per-call+per-task 闸约束并记账；这里补可审计的 ledger 行。
+		_ = sl.Store.AppendBudget(runID, "call", "help", sl.Budget.Estimate("help"), sl.Budget.PerCall)
+		if out, _, err := sl.Help.Run(ctx, in); err == nil {
 			return out
 		}
 	}
@@ -746,7 +755,7 @@ func (sl *SubLoop) helpOutput(ctx context.Context, task channel.Task, attempt in
 // （「重试零增益提前终止…」+ help 的 stuck_at/tried/need_from_human + sceneWT 非空时的
 // worktree 保留注记）、经 report 写回。sceneWT 非空时被驳回的 worktree 不丢弃（供人排查；
 // GC 按 TTL 回收）。
-func (sl *SubLoop) escalateZeroGain(ctx context.Context, taskID string, task channel.Task, runID string, attempt int, priorFailure, sig, sceneWT string) Outcome {
+func (sl *SubLoop) escalateZeroGain(ctx context.Context, taskID string, task channel.Task, attempt int, priorFailure, sig, sceneWT, runID string) Outcome {
 	_ = sl.Store.ClearInFlight()
 	help := sl.helpOutput(ctx, task, attempt, priorFailure, runID)
 	detail := "重试零增益提前终止（连续两轮失败签名相同，重试不会自愈）。签名: " + sig + "\n" + formatHelp(help)
@@ -769,7 +778,7 @@ func (sl *SubLoop) escalateIfZeroGain(ctx context.Context, taskID, ref string, t
 	escalate := zeroGain(*prevSig, sig)
 	sl.recordRetryGate(runID, attempt, sig, *prevSig, newReply, diffChanged, escalate)
 	if escalate {
-		return sl.escalateZeroGain(ctx, taskID, task, runID, attempt, priorFailure, sig, sceneWT), true
+		return sl.escalateZeroGain(ctx, taskID, task, attempt, priorFailure, sig, sceneWT, runID), true
 	}
 	*prevSig = sig
 	return Outcome{}, false
