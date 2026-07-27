@@ -229,7 +229,16 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			return Outcome{Status: "error"}, err
 		}
 	}
-	sl.Store.AppendTransition(taskID, "", "running", "dispatched")
+	// dispatch transition. daemon path: engine.go already wrote new→running
+	// ("dispatched") before runTask — skip the duplicate (and its meaningless
+	// from=""). run-once path: no engine, so SubLoop records it (from "new", the
+	// status InsertTask just set). Error logged, not swallowed, not fatal (audit
+	// row — the status flip is what the loop acts on).
+	if sl.PreinsertedTaskID == "" {
+		if err := sl.Store.AppendTransition(taskID, "new", "running", "dispatched"); err != nil {
+			fmt.Fprintf(os.Stderr, "dispatch AppendTransition failed: %v\n", err)
+		}
+	}
 
 	// →running 即在 channel 上标出「正在处理」（loop:running）。SubLoop.Run 是所有
 	// 执行路径（daemon 派发 + cli run-once）的漏斗，在这里打标覆盖 run-once——它
