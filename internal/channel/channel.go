@@ -2,7 +2,6 @@ package channel
 
 import (
 	"context"
-	"log"
 	"time"
 )
 
@@ -24,9 +23,11 @@ const maxRefsPerTick = 50
 // same tail would be cut every tick and NEVER polled. Rotation advances the
 // window by cap each call (wrapping mod len), so over ceil(N/cap) ticks every
 // ref is polled. Returns the selected refs and the next offset to pass on the
-// following call (0 when no rotation was needed). Pure given (refs, off);
-// callers hold the offset across ticks.
-func capRefs(label string, refs []string, off int) ([]string, int) {
+// following call (0 when no rotation was needed). Rotation is correct, covered
+// by TestRefCapRotatesNoStarvation, and routine (not an exception) — so it is
+// silent: no per-tick log, which would spam once a repo accumulates >cap polled
+// tasks (and the codebase logs exceptions, not routine operation).
+func capRefs(refs []string, off int) ([]string, int) {
 	if len(refs) <= maxRefsPerTick {
 		return refs, 0
 	}
@@ -35,10 +36,7 @@ func capRefs(label string, refs []string, off int) ([]string, int) {
 	for i := 0; i < maxRefsPerTick; i++ {
 		sel[i] = refs[(off+i)%n]
 	}
-	next := (off + maxRefsPerTick) % n
-	log.Printf("%s: %d refs > cap %d，从 offset %d 轮转拉 %d（next offset %d）——余下后续 tick 轮到，非静默丢弃",
-		label, n, maxRefsPerTick, off, maxRefsPerTick, next)
-	return sel, next
+	return sel, (off + maxRefsPerTick) % n
 }
 
 type Task struct {

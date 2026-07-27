@@ -304,7 +304,7 @@ func (g *GitHub) IsPRMerged(ctx context.Context, branch string) (bool, error) {
 // process whichever refs succeeded. ctx flows into every gh call, so a tick
 // cancel aborts every in-flight process.
 func (g *GitHub) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
-	refs, g.repliesOff = capRefs("github.ListReplies", refs, g.repliesOff)
+	refs, g.repliesOff = capRefs(refs, g.repliesOff)
 	out := make(map[string][]Reply, len(refs))
 	var (
 		mu       sync.Mutex
@@ -370,7 +370,7 @@ func (g *GitHub) GetTaskStates(ctx context.Context, refs []string) (map[string]T
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	refs, g.statesOff = capRefs("github.GetTaskStates", refs, g.statesOff)
+	refs, g.statesOff = capRefs(refs, g.statesOff)
 	out := make(map[string]TaskState, len(refs))
 	var (
 		mu       sync.Mutex
