@@ -133,6 +133,16 @@ func NewAgent(ref config.ModelRef) (Agent, error) {
 // a Config that fails other validation — e.g. a zero Budget — should still be
 // able to report a bad provider). Empty/claude and every registered provider
 // validate clean; anything else yields a role-named error carrying the valid set.
+// readOnlySupported lists providers whose adapters honor ReadOnly (an airtight
+// read-only profile in headless mode): claude (plan mode) and codex (read-only
+// sandbox). opencode/kimi/kilo have NO headless read-only mode — opencode's plan
+// mode is interactive-only, kimi -p is incompatible with --plan, kilo's
+// read-only is config-file-only — so a ReadOnly role on them cannot be made
+// airtight. ValidateProviders rejects that combo rather than silently letting the
+// role run with write permission (#101: ReadOnly used to be claude-only and was
+// quietly ignored on every other provider).
+var readOnlySupported = map[string]bool{"claude": true, "codex": true}
+
 func ValidateProviders(cfg *config.Config) error {
 	for _, r := range []struct {
 		role string
@@ -143,8 +153,14 @@ func ValidateProviders(cfg *config.Config) error {
 		{"execute", cfg.Models.Execute},
 		{"verify", cfg.Models.Verify},
 	} {
-		if _, ok := Providers[ResolveProvider(r.ref.Provider)]; !ok {
+		p := ResolveProvider(r.ref.Provider)
+		if _, ok := Providers[p]; !ok {
 			return fmt.Errorf("models.%s: unknown provider %q (want one of: %s)", r.role, r.ref.Provider, strings.Join(RegisteredProviders(), ", "))
+		}
+		// A ReadOnly role on a provider without headless read-only can't be made
+		// airtight — fail fast at config validation / doctor, not silently at runtime.
+		if r.ref.ReadOnly && !readOnlySupported[p] {
+			return fmt.Errorf("models.%s: provider %q does not support headless read-only (want claude or codex); a readonly role on it would silently run with write permission — use claude/codex for this role, or drop readonly", r.role, r.ref.Provider)
 		}
 	}
 	return nil
