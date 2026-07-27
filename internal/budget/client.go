@@ -42,8 +42,24 @@ func (c *Client) Call(ctx context.Context, prompt string) (string, model.Usage, 
 		return "", model.Usage{}, err
 	}
 	out, u, err := c.Base.Call(ctx, prompt)
-	c.Enf.Record(c.Role, u)
+	if berr := c.recordAndEnforce(u, err); berr != nil {
+		return out, u, berr
+	}
 	return out, u, err
+}
+
+// recordAndEnforce accrues the real usage (Record) and then enforces the
+// per-call ceiling on the ACTUAL usage (EnforcePerCall). The pre-call BeforeCall
+// uses a predictive Estimate and can miss a first overshoot; this post-call
+// check catches a single runaway call (real usage > PerCall). A Base error wins
+// (the call already failed — a budget violation is moot); enforcement only fires
+// when Base succeeded. Returns the enforcement error, if any.
+func (c *Client) recordAndEnforce(u model.Usage, baseErr error) error {
+	c.Enf.Record(c.Role, u)
+	if baseErr == nil {
+		return c.Enf.EnforcePerCall(u, c.Role)
+	}
+	return nil
 }
 
 // CallIn implements model.DirClient, making *budget.Client transparent to the
@@ -73,11 +89,15 @@ func (c *Client) CallIn(ctx context.Context, dir, prompt string) (string, model.
 	}
 	if dc, ok := c.Base.(model.DirClient); ok && dir != "" {
 		out, u, err := dc.CallIn(ctx, dir, prompt)
-		c.Enf.Record(c.Role, u)
+		if berr := c.recordAndEnforce(u, err); berr != nil {
+			return out, u, berr
+		}
 		return out, u, err
 	}
 	out, u, err := c.Base.Call(ctx, prompt)
-	c.Enf.Record(c.Role, u)
+	if berr := c.recordAndEnforce(u, err); berr != nil {
+		return out, u, berr
+	}
 	return out, u, err
 }
 

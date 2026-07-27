@@ -79,6 +79,23 @@ func (e *Enforcer) Record(role string, u model.Usage) {
 	}
 }
 
+// EnforcePerCall is the post-call per-call brake: after a Call's REAL usage is
+// known, reject if THIS single call exceeded PerCall. The pre-call BeforeCall
+// gates on a predictive Estimate (last usage × safety / floor), which can miss a
+// FIRST overshoot — a single pathological call far above the role's norm sails
+// through pre-call and only inflates the Estimate for the NEXT call. This closes
+// that gap: a single call whose real usage > PerCall is caught and the loop
+// aborts (blocked) instead of continuing to burn budget. nil when the call is
+// within the per-call ceiling (the common case). Call after Record so the usage
+// is accrued to the per-task tally regardless.
+func (e *Enforcer) EnforcePerCall(u model.Usage, role string) error {
+	used := u.TokensIn + u.TokensOut
+	if used > e.PerCall {
+		return fmt.Errorf("%w: single %s call used=%d per_call=%d", ErrPerCall, role, used, e.PerCall)
+	}
+	return nil
+}
+
 // BeforeCall: estimate 是单次调用的估算 token；超过 PerCall 即拒；累计+estimate 超 PerTask 也拒。
 func (e *Enforcer) BeforeCall(estimate int) error {
 	if estimate > e.PerCall {
