@@ -62,6 +62,13 @@ type GitHub struct {
 	// ensureOnce guards EnsureLabels so the (best-effort) label-create fan-out
 	// runs at most once per GitHub instance — lazily from the first UpdateStatus.
 	ensureOnce sync.Once
+
+	// repliesOff/statesOff rotate the per-tick ref cap (capRefs) across ticks.
+	// ListReplies and GetTaskStates get ordered ref lists (parked/terminal
+	// tasks), so a fixed refs[:cap] truncation would starve the overflow — the
+	// same tail cut every tick, never polled. Each call advances its window so
+	// every ref is covered over successive ticks. Single-active engine → no mutex.
+	repliesOff, statesOff int
 }
 
 // prefix returns the effective status-label prefix ("loop:" when unset).
@@ -297,7 +304,7 @@ func (g *GitHub) IsPRMerged(ctx context.Context, branch string) (bool, error) {
 // process whichever refs succeeded. ctx flows into every gh call, so a tick
 // cancel aborts every in-flight process.
 func (g *GitHub) ListReplies(ctx context.Context, refs []string, since time.Time) (map[string][]Reply, error) {
-	refs = capRefs("github.ListReplies", refs)
+	refs, g.repliesOff = capRefs("github.ListReplies", refs, g.repliesOff)
 	out := make(map[string][]Reply, len(refs))
 	var (
 		mu       sync.Mutex
@@ -363,7 +370,7 @@ func (g *GitHub) GetTaskStates(ctx context.Context, refs []string) (map[string]T
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	refs = capRefs("github.GetTaskStates", refs)
+	refs, g.statesOff = capRefs("github.GetTaskStates", refs, g.statesOff)
 	out := make(map[string]TaskState, len(refs))
 	var (
 		mu       sync.Mutex
