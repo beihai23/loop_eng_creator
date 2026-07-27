@@ -1032,6 +1032,39 @@ func (s *Store) MarkCommandApplied(cmdID string) error {
 	return err
 }
 
+// AppendTransitionMarked is AppendTransition PLUS marking the originating TUI
+// command applied, all in ONE transaction. Without this, drainCommands applied a
+// command's transition (AppendTransition, committed) and then marked it applied
+// (MarkCommandApplied) as two separate calls — a crash between them left the
+// command un-marked, so the next tick re-drained it and AppendTransition wrote a
+// DUPLICATE transition row (status table was fine — idempotent UPDATE — but the
+// audit trace gained a dup). Here the transition INSERT, the task_status UPDATE,
+// and the commands.applied_at flip land together or not at all, so a re-drain is
+// impossible once the transition is visible.
+func (s *Store) AppendTransitionMarked(taskID, from, to, reason, cmdID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO transitions(id, task_id, from_status, to_status, reason, at)
+		 VALUES(?,?,?,?,?,?)`,
+		newID("tr"), taskID, from, to, reason, nowISO()); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE task_status SET status=?, updated_at=? WHERE task_id=?`,
+		to, nowISO(), taskID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE commands SET applied_at=? WHERE id=?`, nowISO(), cmdID); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // CancelRequested reports whether a pending (unapplied) cancel command exists
 // for a task. SubLoop self-checks this at phase boundaries so a running task
 // stops cooperatively at the next phase (spec §4.5/§7).

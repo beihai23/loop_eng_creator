@@ -719,10 +719,12 @@ func (e *Engine) drainCommands(ctx context.Context) error {
 		return err
 	}
 	for _, c := range cmds {
+		// applyCommand marks the command applied itself — atomically with any
+		// transition (AppendTransitionMarked) on the resume/cancel path, or
+		// directly (MarkCommandApplied) on the no-op path — so a crash between
+		// applying and marking can't leave it un-marked and re-drained into a
+		// duplicate transition.
 		if err := e.applyCommand(ctx, c); err != nil {
-			return err
-		}
-		if err := e.Store.MarkCommandApplied(c.ID); err != nil {
 			return err
 		}
 	}
@@ -744,14 +746,17 @@ func (e *Engine) applyCommand(ctx context.Context, c state.CommandRow) error {
 			if err := e.Store.SetResumeFeedback(c.TaskID, c.Payload); err != nil {
 				return err
 			}
-			return e.Store.AppendTransition(c.TaskID, cur, "new", "tui resume: "+c.Payload)
+			// transition + mark applied atomically — see AppendTransitionMarked.
+			return e.Store.AppendTransitionMarked(c.TaskID, cur, "new", "tui resume: "+c.Payload, c.ID)
 		}
 	case "cancel":
 		switch cur {
 		case "new", "needs-info", "needs-human-decision", "needs-review", "blocked":
-			return e.Store.AppendTransition(c.TaskID, cur, "cancelled", "cancelled by TUI")
+			return e.Store.AppendTransitionMarked(c.TaskID, cur, "cancelled", "cancelled by TUI", c.ID)
 		}
 		// running → SubLoop 自查处理；done/cancelled → 已终态
 	}
-	return nil
+	// no-op for the current status (e.g. cancel on an already-terminal task):
+	// still mark applied so drainCommands doesn't re-drain this command forever.
+	return e.Store.MarkCommandApplied(c.ID)
 }
