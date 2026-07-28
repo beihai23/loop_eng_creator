@@ -225,6 +225,10 @@ func TestInitAliasDeprecationAndScaffold(t *testing.T) {
 }
 
 func TestBuildChannelLocalInboxAndLinearError(t *testing.T) {
+	// 隔离 ambient key：linear 子用例断言「无 key → 报 linear 错」，须保证不被
+	// 开发 shell 里残留的 LOOP_ENG_LINEAR_API_KEY 带偏（否则 buildChannel 越过
+	// key-empty 分支、解引用 nil 的 cfg.Channel.Linear 而 panic）。
+	t.Setenv(channel.LinearAPIKeyEnv, "")
 	cfg := &config.Config{Channel: config.Channel{Provider: "local", Inbox: "todo/"}}
 	ch, err := buildChannel(cfg, t.TempDir())
 	if err != nil {
