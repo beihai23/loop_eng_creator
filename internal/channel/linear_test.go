@@ -197,8 +197,8 @@ func TestLinearUpdateStatusByNameAndTypeFallback(t *testing.T) {
 		switch {
 		case strings.Contains(q.Query, "issueUpdate"):
 			return stubData(map[string]any{"issueUpdate": map[string]any{"success": true}})
-		case strings.Contains(q.Query, "workflowStates"):
-			return stubData(map[string]any{"team": map[string]any{"workflowStates": map[string]any{"nodes": []map[string]any{
+		case strings.Contains(q.Query, "states"):
+			return stubData(map[string]any{"team": map[string]any{"states": map[string]any{"nodes": []map[string]any{
 				{"id": "st-todo", "name": "Todo", "type": "unstarted"},
 				{"id": "st-doing", "name": "In Progress", "type": "started"},
 				{"id": "st-done", "name": "Done", "type": "completed"},
@@ -236,8 +236,8 @@ func TestLinearCloseIssue(t *testing.T) {
 		switch {
 		case strings.Contains(q.Query, "issueUpdate"):
 			return stubData(map[string]any{"issueUpdate": map[string]any{"success": true}})
-		case strings.Contains(q.Query, "workflowStates"):
-			return stubData(map[string]any{"team": map[string]any{"workflowStates": map[string]any{"nodes": []map[string]any{
+		case strings.Contains(q.Query, "states"):
+			return stubData(map[string]any{"team": map[string]any{"states": map[string]any{"nodes": []map[string]any{
 				{"id": "st-doing", "name": "In Progress", "type": "started"},
 				{"id": "st-done", "name": "Done", "type": "completed"},
 			}}}})

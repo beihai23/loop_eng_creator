@@ -384,7 +384,8 @@ func (lc *Linear) resolveIssueUUID(ctx context.Context, ref string) (string, err
 		}
 	}
 	lc.mu.Unlock()
-	const q = `query IssueID($ref: ID!) { issue(id: $ref) { id } }`
+	// issue(id:) is typed String in Linear's schema (NOT ID) — see introspection.
+	const q = `query IssueID($ref: String!) { issue(id: $ref) { id } }`
 	var out struct {
 		Issue struct {
 			ID string `json:"id"`
@@ -419,20 +420,23 @@ func (lc *Linear) workflowStates(ctx context.Context) ([]linearState, error) {
 	lc.mu.Unlock()
 	var states []linearState
 	if team := lc.team(); team != "" {
-		const q = `query TeamStates($team: ID!) {
-  team(id: $team) { workflowStates { nodes { id name type } } }
+		// team(id:) is String (NOT ID); Team has `states` (WorkflowStateConnection),
+		// NOT `workflowStates` (that field doesn't exist on Team — only the root
+		// Query.workflowStates does). Verified via schema introspection.
+		const q = `query TeamStates($team: String!) {
+  team(id: $team) { states { nodes { id name type } } }
 }`
 		var out struct {
 			Team struct {
-				WorkflowStates struct {
+				States struct {
 					Nodes []linearState `json:"nodes"`
-				} `json:"workflowStates"`
+				} `json:"states"`
 			} `json:"team"`
 		}
 		if err := lc.gql(ctx, q, map[string]any{"team": team}, &out); err != nil {
 			return nil, err
 		}
-		states = out.Team.WorkflowStates.Nodes
+		states = out.Team.States.Nodes
 	} else {
 		const q = `query WorkflowStates { workflowStates { nodes { id name type } } }`
 		var out struct {
@@ -503,7 +507,8 @@ func (lc *Linear) resolveStateID(ctx context.Context, status string) (string, er
 // 接受 identifier 简写，无需 UUID 解析。Linear 没有独立的 close mutation，
 // 关闭 = 推进到 completed-type state（completedAt 由服务端写）。
 func (lc *Linear) issueUpdateState(ctx context.Context, ref, stateID string) error {
-	const m = `mutation UpdateState($ref: ID!, $state: ID!) {
+	// issueUpdate(id:) and input.stateId are both String in Linear's schema (NOT ID).
+	const m = `mutation UpdateState($ref: String!, $state: String!) {
   issueUpdate(id: $ref, input: { stateId: $state }) { success }
 }`
 	var out struct {
@@ -627,7 +632,10 @@ func (lc *Linear) PostComment(ctx context.Context, ref, body string) error {
 	if err != nil {
 		return err
 	}
-	const m = `mutation Comment($issue: ID!, $body: String!) {
+	// NOTE: commentCreate.input.issueId is typed String in Linear's schema (NOT ID,
+	// unlike issue(id:)/issueUpdate(id:)) — so $issue stays String!. The other ID-
+	// holding vars ($project/$ref/$team/$state) are ID!; this one is the exception.
+	const m = `mutation Comment($issue: String!, $body: String!) {
   commentCreate(input: { issueId: $issue, body: $body }) {
     success
     comment { id url }

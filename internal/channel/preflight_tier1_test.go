@@ -81,8 +81,8 @@ func TestTier1PreflightLinearMissingProject(t *testing.T) {
 			return stubData(map[string]any{"viewer": map[string]any{"id": "u1", "name": "op"}})
 		case strings.Contains(q.Query, "project"):
 			return stubData(map[string]any{"project": nil}) // project 不存在
-		case strings.Contains(q.Query, "workflowStates"):
-			return stubData(map[string]any{"team": map[string]any{"workflowStates": map[string]any{"nodes": []any{}}}})
+		case strings.Contains(q.Query, "states"):
+			return stubData(map[string]any{"team": map[string]any{"states": map[string]any{"nodes": []any{}}}})
 		}
 		t.Errorf("unexpected query: %s", q.Query)
 		return stubData(map[string]any{})
@@ -104,8 +104,8 @@ func TestTier1PreflightLinearUnresolvableStatusMap(t *testing.T) {
 			return stubData(map[string]any{"viewer": map[string]any{"id": "u1", "name": "op"}})
 		case strings.Contains(q.Query, "project"):
 			return stubData(map[string]any{"project": map[string]any{"id": "proj-uuid-1", "name": "Eng"}})
-		case strings.Contains(q.Query, "workflowStates"):
-			return stubData(map[string]any{"team": map[string]any{"workflowStates": map[string]any{"nodes": []map[string]any{
+		case strings.Contains(q.Query, "states"):
+			return stubData(map[string]any{"team": map[string]any{"states": map[string]any{"nodes": []map[string]any{
 				{"id": "st-doing", "name": "In Progress", "type": "started"},
 			}}}})
 		}

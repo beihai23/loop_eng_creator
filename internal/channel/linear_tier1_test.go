@@ -65,13 +65,12 @@ func TestTier1LinearChannel(t *testing.T) {
 			rec.updates = append(rec.updates, req.Variables)
 			rec.mu.Unlock()
 			io.WriteString(w, `{"data":{"issueUpdate":{"success":true}}}`)
-		case strings.Contains(q, "workflowStates"):
+		case strings.Contains(q, "states"): // team-scoped: team(id:) { states { nodes } }
 			nodes := `[{"id":"s-todo","name":"Todo","type":"unstarted"},{"id":"s-done","name":"Done","type":"completed"}]`
-			if strings.Contains(q, "team") {
-				io.WriteString(w, `{"data":{"team":{"workflowStates":{"nodes":`+nodes+`}}}}`)
-			} else {
-				io.WriteString(w, `{"data":{"workflowStates":{"nodes":`+nodes+`}}}`)
-			}
+			io.WriteString(w, `{"data":{"team":{"states":{"nodes":`+nodes+`}}}}`)
+		case strings.Contains(q, "workflowStates"): // root: Query.workflowStates (no team)
+			nodes := `[{"id":"s-todo","name":"Todo","type":"unstarted"},{"id":"s-done","name":"Done","type":"completed"}]`
+			io.WriteString(w, `{"data":{"workflowStates":{"nodes":`+nodes+`}}}`)
 		case strings.Contains(q, "comments"):
 			// 批量 ListReplies：别名 r0 顶层对象（不再单 issue 包裹）。
 			io.WriteString(w, `{"data":{"r0":{"comments":{"nodes":[{"body":"old","createdAt":"2026-01-01T00:00:00Z"},{"body":"new","createdAt":"2026-07-10T00:00:00Z"}]}}}}`)
