@@ -519,9 +519,13 @@ func (lc *Linear) resolveStateID(ctx context.Context, status string) (string, er
 // continues; UpdateStatus for that status would then fail at runtime (logged).
 // No team → no-op (states are team-scoped).
 func (lc *Linear) ensureWorkflowStates(ctx context.Context) error {
-	team := lc.team()
-	if team == "" {
+	teamKey := lc.team()
+	if teamKey == "" {
 		return nil // states are team-scoped; nothing to ensure without a team
+	}
+	teamID, err := lc.teamUUID(ctx, teamKey)
+	if err != nil {
+		return fmt.Errorf("linear ensure workflow states: resolve team %q: %w", teamKey, err)
 	}
 	states, err := lc.workflowStates(ctx)
 	if err != nil {
@@ -552,7 +556,7 @@ func (lc *Linear) ensureWorkflowStates(ctx context.Context) error {
 		if typ == "" {
 			typ = "started"
 		}
-		if err := lc.createWorkflowState(ctx, team, name, typ); err != nil {
+		if err := lc.createWorkflowState(ctx, teamID, name, typ); err != nil {
 			log.Printf("channel/linear: ensure workflow state %q (%s) failed: %v (continuing; UpdateStatus for %s will fail at runtime)", name, typ, err, status)
 			continue
 		}
@@ -588,7 +592,26 @@ var defaultLinearStateNames = map[string]string{
 // createWorkflowState creates a team-scoped WorkflowState via workflowStateCreate.
 // Linear requires teamId/name/type/color (all String in the schema — verified by
 // introspection; NOT ID, unlike some other Linear id args).
-func (lc *Linear) createWorkflowState(ctx context.Context, team, name, typ string) error {
+// teamUUID resolves a team key/identifier (e.g. "TAS") to its UUID. team(id:)
+// accepts the identifier for queries, but workflowStateCreate.teamId REQUIRES a
+// UUID (isUuid constraint — "TAS" fails validation). Resolve before creating.
+func (lc *Linear) teamUUID(ctx context.Context, teamKey string) (string, error) {
+	const q = `query($team: String!) { team(id: $team) { id } }`
+	var out struct {
+		Team struct {
+			ID string `json:"id"`
+		} `json:"team"`
+	}
+	if err := lc.gql(ctx, q, map[string]any{"team": teamKey}, &out); err != nil {
+		return "", err
+	}
+	if out.Team.ID == "" {
+		return "", fmt.Errorf("linear: team %q not found", teamKey)
+	}
+	return out.Team.ID, nil
+}
+
+func (lc *Linear) createWorkflowState(ctx context.Context, teamID, name, typ string) error {
 	const m = `mutation($team: String!, $name: String!, $type: String!, $color: String!) {
   workflowStateCreate(input: { teamId: $team, name: $name, type: $type, color: $color }) { success }
 }`
@@ -596,7 +619,7 @@ func (lc *Linear) createWorkflowState(ctx context.Context, team, name, typ strin
 		Success bool `json:"success"`
 	}
 	return lc.gql(ctx, m, map[string]any{
-		"team":  team,
+		"team":  teamID,
 		"name":  name,
 		"type":  typ,
 		"color": workflowStateColor(typ),
