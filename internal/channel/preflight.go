@@ -60,6 +60,26 @@ var (
 	_ Preflighter = (*Linear)(nil)
 )
 
+// StatusEnsurer is a channel that auto-provisions its status markers at startup
+// so every loop status has a target to move to — the unified, config-driven
+// provisioning behavior across channels (the parallel of GitHub's EnsureLabels,
+// lifted into a capability). GitHub creates <label_prefix><status> labels;
+// Linear creates WorkflowStates named per channel.linear.status_map (or a
+// default display name) + the statusTypeFallback type. Channels without status
+// markers (Local) don't implement it. Idempotent (skips existing). Best-effort
+// (a create failure — e.g. missing write scope — is logged, not fatal; Preflight
+// is the hard gate). Called once at daemon startup after preflight; the lazy
+// EnsureLabels in GitHub.UpdateStatus stays as a run-once/no-preflight fallback.
+type StatusEnsurer interface {
+	EnsureStatusMarkers(ctx context.Context) error
+}
+
+// Compile-time guarantees that GitHub and Linear satisfy StatusEnsurer.
+var (
+	_ StatusEnsurer = (*GitHub)(nil)
+	_ StatusEnsurer = (*Linear)(nil)
+)
+
 // --- GitHub ----------------------------------------------------------------
 
 // Preflight checks the repo carries the full loop label set the engine moves

@@ -63,6 +63,20 @@ func NewDaemonCmd() *cobra.Command {
 				return err
 			}
 
+			// Ensure the channel's status markers exist (GitHub labels / Linear
+			// workflow states), creating any missing — the unified startup
+			// provisioning (StatusEnsurer), the channel-agnostic parallel of
+			// GitHub's EnsureLabels. Runs after preflight (the check) so
+			// UpdateStatus never 404s on a missing label/state. Best-effort: a
+			// failure (e.g. transient API error, no write scope) is logged, not
+			// fatal — the daemon starts; per-status UpdateStatus failures surface
+			// at runtime. Idempotent + config-driven (label_prefix / status_map).
+			if se, ok := ch.(channel.StatusEnsurer); ok {
+				if err := se.EnsureStatusMarkers(context.Background()); err != nil {
+					fmt.Fprintf(os.Stderr, "[daemon] ensure status markers: %v (continuing)\n", err)
+				}
+			}
+
 			// RunTask: construct a fresh SubLoop per dispatched task + run it.
 			// SubLoop does the full plan→execute→verify→writeback (incl. channel
 			// comment + status mark via report()). PreinsertedTaskID = the daemon's
