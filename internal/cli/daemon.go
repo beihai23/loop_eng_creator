@@ -174,11 +174,17 @@ func NewDaemonCmd() *cobra.Command {
 				// 装饰器内生效（triageSkill.Model = &budget.Client{Role:"triage"}）。
 				est := triageBz.Estimate("triage")
 				_ = st.AppendBudget(task.ID, "call", "triage", est, cfg.Budget.PerCallTokens)
+				// Read (don't pop) the user's prior reply so triage can see what was
+				// already answered — without it, triage only sees the original (vague)
+				// issue body and re-asks the same questions every round (#needs-info loop).
+				// SubLoop's PopResumeFeedback still clears it when the task runs.
+				fb, _ := st.GetResumeFeedback(task.ID)
 				out, _, err := triageSkill.Run(ctx, skill.TriageInput{
 					TaskDescription:    task.Description,
 					AcceptanceCriteria: task.Criteria,
 					TaskType:           task.TaskType,
-					Body:               task.Body, // 全文：判断「缺不缺信息」以全文为准
+					Body:               task.Body,           // 全文：判断「缺不缺信息」以全文为准
+					PriorFeedback:      fb,                  // 上轮人回复：用户已补充的信息
 				})
 				return out, err
 			}

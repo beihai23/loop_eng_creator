@@ -632,6 +632,21 @@ func (s *Store) SetResumeFeedback(taskID, feedback string) error {
 	return err
 }
 
+// GetResumeFeedback reads (without clearing) the resume feedback for a task — used
+// by triage to see the user's prior reply without consuming it. SubLoop's
+// PopResumeFeedback still clears it later when the task actually runs.
+func (s *Store) GetResumeFeedback(taskID string) (string, error) {
+	var fb sql.NullString
+	err := s.db.QueryRow(`SELECT parked_detail FROM task_status WHERE task_id=?`, taskID).Scan(&fb)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return fb.String, nil
+}
+
 // PopResumeFeedback reads and clears the resume feedback for a task. Returns ""
 // if no feedback was set. Called by SubLoop at the start of each Run so the
 // human's reply from the previous parked round feeds into the Plan skill.
