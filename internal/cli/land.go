@@ -306,7 +306,57 @@ func verifyPRHead(wantTip string, fetch func() (string, error), sleep func(time.
 	return fmt.Errorf("PR head %q != branch tip %q after %d polls — GitHub head-sync stalled; merge may miss commits (verify head==tip before merging)", last, wantTip, attempts)
 }
 
+// errNoGitHubRemote signals the code repo has no GitHub remote — no PR path.
+// landFallback treats it (like any non-push PR failure) as "FF-merge directly".
+var errNoGitHubRemote = errors.New("no GitHub remote on code repo: no PR path (FF-merge instead)")
+
+// parseGitHubOwnerName extracts "owner/name" from a GitHub remote URL (SSH or
+// HTTPS, with/without .git, with an embedded token), or "" if it isn't GitHub.
+// Pure so the URL-shape test can pin it without shelling out.
+func parseGitHubOwnerName(remoteURL string) string {
+	u := strings.TrimSpace(remoteURL)
+	i := strings.Index(u, "github.com")
+	if i < 0 {
+		return ""
+	}
+	rest := u[i+len("github.com"):]
+	rest = strings.TrimLeft(rest, ":/") // SSH ':' (git@github.com:owner/name) or HTTPS '/'
+	rest = strings.TrimSuffix(rest, ".git")
+	rest = strings.TrimRight(rest, "/")
+	// exactly owner/name — one '/', no spaces/colons/@ (scheme/token leftovers).
+	if rest == "" || strings.Count(rest, "/") != 1 || strings.ContainsAny(rest, " :@") {
+		return ""
+	}
+	return rest
+}
+
+// codeGitHubRepo derives the GitHub owner/name of the repo's `origin` remote —
+// the CODE repo, where done work lands via PR, independent of the task channel
+// (GitHub issues vs Linear vs ...). The task channel tracks task STATUS; the
+// code repo is where the work merges. For a GitHub task channel these are the
+// same repo; for Linear they differ — landing must target the code repo, not the
+// (empty) channel repo. "" if origin isn't GitHub.
+func codeGitHubRepo(repo string) string {
+	out, err := exec.Command("git", "-C", repo, "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	return parseGitHubOwnerName(string(out))}
+
 func createPR(repo, ghRepo, branch, wt, title, body string) (string, error) {
+	// ghRepo is the task channel's repo (GitHub channel). For a non-GitHub task
+	// channel (Linear) it's empty — but the CODE still lands in this repo's GitHub
+	// remote (origin), independent of where tasks come from. Derive it so landing
+	// is channel-agnostic: GitHub and Linear tasks both PR into the code repo.
+	if ghRepo == "" {
+		ghRepo = codeGitHubRepo(repo)
+	}
+	if ghRepo == "" {
+		// No GitHub remote → no PR path. Return without pushing so landFallback
+		// FF-merges the branch directly (non-GitHub code repos; a direct-push
+		// strategy is a future refinement).
+		return "", errNoGitHubRemote
+	}
 	if err := pushWithRetry(func() error {
 		return runGit(repo, "push", "-u", "origin", branch)
 	}, time.Sleep); err != nil {

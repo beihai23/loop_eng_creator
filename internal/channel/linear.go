@@ -384,7 +384,7 @@ func (lc *Linear) resolveIssueUUID(ctx context.Context, ref string) (string, err
 		}
 	}
 	lc.mu.Unlock()
-	const q = `query IssueID($ref: String!) { issue(id: $ref) { id } }`
+	const q = `query IssueID($ref: ID!) { issue(id: $ref) { id } }`
 	var out struct {
 		Issue struct {
 			ID string `json:"id"`
@@ -419,7 +419,7 @@ func (lc *Linear) workflowStates(ctx context.Context) ([]linearState, error) {
 	lc.mu.Unlock()
 	var states []linearState
 	if team := lc.team(); team != "" {
-		const q = `query TeamStates($team: String!) {
+		const q = `query TeamStates($team: ID!) {
   team(id: $team) { workflowStates { nodes { id name type } } }
 }`
 		var out struct {
@@ -503,7 +503,7 @@ func (lc *Linear) resolveStateID(ctx context.Context, status string) (string, er
 // 接受 identifier 简写，无需 UUID 解析。Linear 没有独立的 close mutation，
 // 关闭 = 推进到 completed-type state（completedAt 由服务端写）。
 func (lc *Linear) issueUpdateState(ctx context.Context, ref, stateID string) error {
-	const m = `mutation UpdateState($ref: String!, $state: String!) {
+	const m = `mutation UpdateState($ref: ID!, $state: ID!) {
   issueUpdate(id: $ref, input: { stateId: $state }) { success }
 }`
 	var out struct {
@@ -532,7 +532,7 @@ func (lc *Linear) issueUpdateState(ctx context.Context, ref, stateID string) err
 // TODO: introspection 核实 project filter 是否也接受 name（映射文档 §3 提到
 // project:{ name:{ eq } } 更稳但非官方明示形态）；当前按 id 过滤。
 func (lc *Linear) ListNewTasks(ctx context.Context) ([]Task, error) {
-	const q = `query ListNewTasks($project: String!) {
+	const q = `query ListNewTasks($project: ID!) {
   issues(filter: {
     project: { id: { eq: $project } }
     state: { type: { nin: ["completed", "canceled"] } }
@@ -627,7 +627,7 @@ func (lc *Linear) PostComment(ctx context.Context, ref, body string) error {
 	if err != nil {
 		return err
 	}
-	const m = `mutation Comment($issue: String!, $body: String!) {
+	const m = `mutation Comment($issue: ID!, $body: String!) {
   commentCreate(input: { issueId: $issue, body: $body }) {
     success
     comment { id url }
