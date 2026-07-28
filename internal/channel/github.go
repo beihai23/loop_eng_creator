@@ -215,6 +215,15 @@ func (g *GitHub) EnsureLabels(ctx context.Context) {
 	})
 }
 
+// EnsureStatusMarkers provisions the loop:<status> label set — the StatusEnsurer
+// capability. Delegates to EnsureLabels (prefix-driven, idempotent via
+// ensureOnce). Best-effort (label-create failures logged, not fatal — operator
+// may lack labels:write); Preflight is the hard gate that reports missing labels.
+func (g *GitHub) EnsureStatusMarkers(ctx context.Context) error {
+	g.EnsureLabels(ctx)
+	return nil
+}
+
 // UpdateStatus 把 issue 的状态标签换成 loop:<status>。两条独立的 gh issue edit，
 // 顺序执行：先 remove 旧状态标签，再 add 新标签——add 失败不回滚 remove，至少
 // 旧状态标签能清掉（修 #54：旧版 add+remove 原子 edit，add 因标签缺失 404 时连带

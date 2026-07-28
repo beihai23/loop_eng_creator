@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -464,9 +465,15 @@ var statusTypeFallback = map[string]string{
 	"canceled":     "canceled",
 	"running":      "started",
 	"needs-review": "started",
-	"blocked":      "unstarted",
-	"backlog":      "backlog",
-	"todo":         "unstarted",
+	// parked-waiting-on-human statuses: Linear has no "needs info"/"waiting"
+	// type by default, so map them to `started` (In Progress) — same as
+	// needs-review — so the issue stays visible on the board as active/awaiting
+	// (the posted comment carries the detail). Override via channel.linear.status_map.
+	"needs-info":           "started",
+	"needs-human-decision": "started",
+	"blocked":              "unstarted",
+	"backlog":              "backlog",
+	"todo":                 "unstarted",
 }
 
 // resolveStateID 把 loop status 解析成 Linear stateId：先按 statusMap 给的
@@ -500,6 +507,119 @@ func (lc *Linear) resolveStateID(ctx context.Context, status string) (string, er
 		return "", fmt.Errorf("linear: 找不到 status %q（映射 name %q / type %q）对应的 WorkflowState", status, target, typ)
 	}
 	return "", fmt.Errorf("linear: 找不到 status %q（name/type %q）对应的 WorkflowState", status, typ)
+}
+
+// ensureWorkflowStates provisions a Linear WorkflowState for every loop status —
+// the Linear parallel of GitHub.EnsureLabels. For each loop status: resolve the
+// target state name (status_map if configured, else a default display name) +
+// type (statusTypeFallback); if no same-named state exists in the team, create
+// it (workflowStateCreate) and back-fill status_map so resolveStateID resolves
+// the created state by name. Idempotent (skips existing). Best-effort: a create
+// failure (e.g. no workflow:write scope) is logged, not fatal — the daemon
+// continues; UpdateStatus for that status would then fail at runtime (logged).
+// No team → no-op (states are team-scoped).
+func (lc *Linear) ensureWorkflowStates(ctx context.Context) error {
+	team := lc.team()
+	if team == "" {
+		return nil // states are team-scoped; nothing to ensure without a team
+	}
+	states, err := lc.workflowStates(ctx)
+	if err != nil {
+		return fmt.Errorf("linear ensure workflow states: %w", err)
+	}
+	existing := make(map[string]bool, len(states))
+	for _, s := range states {
+		existing[strings.ToLower(s.Name)] = true
+	}
+	for _, status := range loopStatusNames {
+		name := lc.statusName(status)
+		if name == "" {
+			name = defaultLinearStateNames[status]
+			if name == "" {
+				continue // no built-in default for this status; rely on resolveStateID's type fallback
+			}
+			lc.mu.Lock()
+			if lc.statusMap == nil {
+				lc.statusMap = map[string]string{}
+			}
+			lc.statusMap[status] = name
+			lc.mu.Unlock()
+		}
+		if existing[strings.ToLower(name)] {
+			continue
+		}
+		typ := statusTypeFallback[status]
+		if typ == "" {
+			typ = "started"
+		}
+		if err := lc.createWorkflowState(ctx, team, name, typ); err != nil {
+			log.Printf("channel/linear: ensure workflow state %q (%s) failed: %v (continuing; UpdateStatus for %s will fail at runtime)", name, typ, err, status)
+			continue
+		}
+		existing[strings.ToLower(name)] = true
+	}
+	return nil
+}
+
+// EnsureStatusMarkers provisions Linear WorkflowStates — the StatusEnsurer
+// capability. Delegates to ensureWorkflowStates (team-scoped, status_map-aware,
+// idempotent, best-effort).
+func (lc *Linear) EnsureStatusMarkers(ctx context.Context) error {
+	return lc.ensureWorkflowStates(ctx)
+}
+
+// defaultLinearStateNames is the built-in loop status → Linear WorkflowState name
+// mapping ensureWorkflowStates uses when channel.linear.status_map doesn't
+// override. Common statuses map to Linear's DEFAULT columns (no duplicate
+// "Running" next to "In Progress", no "Cancelled" next to Linear's "Canceled");
+// the parked-waiting-on-human statuses map to dedicated names that
+// ensureWorkflowStates CREATES if missing. Override any per-status via
+// channel.linear.status_map.
+var defaultLinearStateNames = map[string]string{
+	"running":              "In Progress",
+	"needs-review":         "Needs Review",
+	"needs-info":           "Needs Info",
+	"needs-human-decision": "Needs Human Decision",
+	"blocked":              "Blocked",
+	"done":                 "Done",
+	"cancelled":            "Canceled", // Linear's default (American) spelling
+}
+
+// createWorkflowState creates a team-scoped WorkflowState via workflowStateCreate.
+// Linear requires teamId/name/type/color (all String in the schema — verified by
+// introspection; NOT ID, unlike some other Linear id args).
+func (lc *Linear) createWorkflowState(ctx context.Context, team, name, typ string) error {
+	const m = `mutation($team: String!, $name: String!, $type: String!, $color: String!) {
+  workflowStateCreate(input: { teamId: $team, name: $name, type: $type, color: $color }) { success }
+}`
+	var out struct {
+		Success bool `json:"success"`
+	}
+	return lc.gql(ctx, m, map[string]any{
+		"team":  team,
+		"name":  name,
+		"type":  typ,
+		"color": workflowStateColor(typ),
+	}, &out)
+}
+
+// workflowStateColor picks a board-readable hex color per WorkflowState type
+// (Linear requires a color on create). Approximates Linear's own palette.
+func workflowStateColor(typ string) string {
+	switch typ {
+	case "completed":
+		return "#4bce84"
+	case "canceled":
+		return "#bec1c5"
+	case "started":
+		return "#f2c94c"
+	case "unstarted":
+		return "#c1c7d0"
+	case "backlog":
+		return "#c7edc3"
+	default:
+		return "#9575cd"
+	}
 }
 
 // issueUpdateState 是 UpdateStatus/CloseIssue 的共用骨架：
