@@ -350,15 +350,6 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.RunIn(ctx, planIn, wt)
 		sl.Budget.Record("plan", u)
-		// post-call per-call brake (#103): plan 成功但单次真实用量 > PerCall（病理性
-		// 大调用，Estimate 没预测到）→ blocked，不进 execute/verify 继续烧。
-		if err == nil {
-			if berr := sl.Budget.EnforcePerCall(u, "plan"); berr != nil {
-				isolation.Discard(sl.Repo, wt)
-				_ = sl.Store.ClearInFlight()
-				return sl.report(ctx, taskID, task, "blocked", "budget: "+berr.Error()), nil
-			}
-		}
 		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
 		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
 		// 可重试失败——不进 execute（否则 execute 只能靠战报上下文瞎续，浪费整轮
@@ -502,15 +493,6 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := exec.Exec(ctx, wt, execPrompt)
 		sl.Budget.Record("execute", u2)
-		// post-call per-call brake (#103): execute 成功但单次真实用量 > PerCall
-		// （runaway，比如 agent 循环读爆）→ blocked，不进 verify/下一轮继续烧。
-		if err == nil {
-			if berr := sl.Budget.EnforcePerCall(u2, "execute"); berr != nil {
-				isolation.Discard(sl.Repo, wt)
-				_ = sl.Store.ClearInFlight()
-				return sl.report(ctx, taskID, task, "blocked", "budget: "+berr.Error()), nil
-			}
-		}
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=execute fail: %v", sid, err)
