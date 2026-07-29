@@ -22,6 +22,7 @@ func NewRootCmd() *cobra.Command {
 	cmd.AddCommand(NewDaemonCmd())
 	cmd.AddCommand(NewDoctorCmd())
 	cmd.AddCommand(NewDashboardCmd())
+	cmd.AddCommand(NewWebCmd())
 	cmd.AddCommand(NewCleanCmd())
 	return cmd
 }
