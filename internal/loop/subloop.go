@@ -266,9 +266,15 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	_ = sl.Store.SetInFlight(taskID, "starting")
 	sid := shortID(taskID)
 
-	// 每次运行（不论触发原因：首次 / reopen / resume / 重排队）都收集 issue 的全部
-	// 评论作为「战报」上下文喂给 plan —— 修「reopen 写的反馈 plan 看不到」的 bug。
+	// 每次运行（不论触发原因：首次 / reopen / resume / 重排队）都收集 issue 上
+	// 「人写的」评论喂给 plan/execute —— 修「reopen 写的反馈 plan 看不到」的 bug。
+	// daemon 自发的战报/驳回/分诊评论由 channel.IsBotComment 滤除（只写不读，
+	// 自回声是 prompt 重复膨胀的病根）；机器可推导的历轮历史走下面的 runHistory。
 	issueContext := sl.collectIssueComments(ctx, task.Ref)
+	// run history 回灌（跨 run 记忆，DB 构建）：该 issue 历轮已终结 run 的结局 +
+	// 最近驳回理由，有界（≤maxRunHistoryRuns 行）。替代战报评论过去扮演的
+	// 「跨 run 记忆」角色——结构化、无自回声。plan/execute 都用它。
+	runHistory := BuildRunHistory(sl.Store, task.Ref)
 	priorFailure := ""
 	if fb, err := sl.Store.PopResumeFeedback(taskID); err == nil && fb != "" {
 		priorFailure = fb
@@ -328,8 +334,13 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		sl.Store.AppendBudget(runID, "call", "tokens", planEst, sl.Budget.PerCall)
 		planIn := skill.PlanInput{
 			Task: task.Description, AcceptanceCriteria: task.AcceptanceCriteria,
-			BattleReport: joinNonEmpty(issueContext, priorFailure),
-			Body:         task.Body, // 全文保留：issue 原文（背景/约束）也喂给 plan
+			// 人反馈：过滤后的 issue 人评论。priorFailure 不再拼进来——attempt≥2
+			// 时它由 RetryDiagnosis 逐字引用（同条件注入），resume 反馈本身是人
+			// 评论、已在 issueContext 里，拼进来只会同文两份。
+			HumanFeedback: issueContext,
+			Body:          task.Body, // 全文保留：issue 原文（背景/约束）也喂给 plan
+			// 历轮 run 摘要（DB 构建）：跨 run 记忆的结构化来源。
+			RunHistory: runHistory,
 			// 重试诊断（attempt≥2 + 当轮 priorFailure 非空时注入）：引用当轮驳回原文，
 			// 要求 plan 诊断 loop 数据流的结构性不可满足、行使 revised_criteria 把证据要求
 			// 翻译成 tier-1 可机械判定的退出码/编译期判据。attempt=1 或无 priorFailure 时为空串，
@@ -476,10 +487,18 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		if task.Body != "" {
 			execPrompt += "Issue 全文（背景/约束，实现时以全文为准）:\n" + task.Body + "\n"
 		}
-		// 战报/反馈也喂给 execute（不只是 plan）：否则 execute 只对照验收标准、看不见
-		// issue 里的反馈，对「已实现但需按反馈精修」的任务会反复产出空 diff（#20 即此）。
+		// 历轮 run 摘要也喂给 execute：跨 run 重跑时 execute 看不到上一轮驳回理由
+		// （战报评论已滤除、只写不读），驳回轨迹改由这份 DB 构建的摘要承载——
+		// 有界（≤maxRunHistoryRuns 行），不随轮次膨胀。
+		if runHistory != "" {
+			execPrompt += "本任务历轮 run 摘要（结构化记录，了解既往失败轨迹；最近一次驳回详见下文「被驳回的现场」）:\n" +
+				runHistory + "\n"
+		}
+		// 人反馈也喂给 execute（不只是 plan）：否则 execute 只对照验收标准、看不见
+		// issue 里人写的反馈，对「已实现但需按反馈精修」的任务会反复产出空 diff（#20 即此）。
+		// daemon 自发的战报/驳回评论已被滤除（机器可推导的历史见上面的 run 摘要段）。
 		if issueContext != "" {
-			execPrompt += "战报/反馈（issue 评论，含历轮驳回与人审意见）——务必据此修正代码，" +
+			execPrompt += "人反馈（issue 上人的评论）——务必据此修正代码，" +
 				"不要只对照验收标准就说「已完成」:\n" + issueContext + "\n"
 		}
 		// 失败现场回灌（execute 侧）：上一轮被驳回实现的 diff + 驳回理由直达 execute。
@@ -631,10 +650,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		// 不过 → 反馈，下一轮重试
 		sl.logf("[subloop] %s phase=verify done rejected: %s", sid, res.Detail)
-		// verify 不过必给「失败理由 + 改进建议」，落进 issue 评论：给人看（驳回不再黑箱）
-		// + 作下一轮持久反馈（collectIssueComments 下一轮读回喂 plan/execute）。best-effort——
-		// 发评论失败只记日志、不 gate loop（与 report 的 PostComment 容错一致）。
-		if cErr := sl.Channel.PostComment(ctx, task.Ref, verifyFailComment(effTask, attempt, res)); cErr != nil {
+		// verify 不过必给「失败理由 + 改进建议」，落进 issue 评论：纯人可读写回
+		// （驳回不再黑箱）。带 bot 标记——collectIssueComments 会滤除它（只写不读）；
+		// 下一轮/跨 run 的驳回理由改由 DB 的 verify step + BuildRunHistory 传递。
+		// best-effort——发评论失败只记日志、不 gate loop（与 report 的 PostComment 容错一致）。
+		if cErr := sl.Channel.PostComment(ctx, task.Ref, channel.MarkBotComment(verifyFailComment(effTask, attempt, res))); cErr != nil {
 			sl.logf("[subloop] %s verify-fail comment post failed: %v", sid, cErr)
 		}
 		// 编译错误信号更新（#46）：本轮驳回是编译/构建类 → 把原始 detail 存为下一轮 execute
@@ -836,10 +856,15 @@ type verifyTrace struct {
 	FailingCriteria []string `json:"failing_criteria,omitempty"`
 }
 
-// collectIssueComments 拉取 issue/ticket 的全部评论（人审反馈 + 历轮战报）作为 plan
-// 的上下文。每次 Run 都调——不论触发原因（修「reopen 写的反馈 plan 看不到」）：
+// collectIssueComments 拉取 issue/ticket 上「人写的」评论作为 plan/execute 的
+// 人反馈上下文。每次 Run 都调——不论触发原因（修「reopen 写的反馈 plan 看不到」）：
 // reopen 走 reconcile 只翻状态、不读评论，导致 plan 拿不到人在 issue 里写的反馈。
 // since 为零值表示「全部评论」。读失败非致命（plan 只是少了上下文，不致崩）。
+//
+// daemon 自发评论（战报/驳回/分诊/人审请求/land 注记）由 channel.IsBotComment
+// 滤除——它们是人可读写回（只写不读），读回来就是 daemon 听自己的回声：同一条
+// 驳回理由以散文形式第二次进 prompt，且随轮次无界膨胀。机器可推导的历轮历史
+// （结局+驳回理由）由 BuildRunHistory 从 DB 构建，不走本通道。
 func (sl *SubLoop) collectIssueComments(ctx context.Context, ref string) string {
 	if sl.Channel == nil {
 		return ""
@@ -851,23 +876,13 @@ func (sl *SubLoop) collectIssueComments(ctx context.Context, ref string) string 
 	}
 	parts := make([]string, 0, len(replies[ref]))
 	for _, r := range replies[ref] {
-		if s := strings.TrimSpace(r.Body); s != "" {
-			parts = append(parts, s)
+		s := strings.TrimSpace(r.Body)
+		if s == "" || channel.IsBotComment(s) {
+			continue
 		}
+		parts = append(parts, s)
 	}
 	return strings.Join(parts, "\n---\n")
-}
-
-// joinNonEmpty 用双换行拼接非空片段（issue 战报 + 当轮失败/反馈），喂给 plan 的
-// BattleReport。空片段跳过，避免前导空行。
-func joinNonEmpty(parts ...string) string {
-	var out []string
-	for _, p := range parts {
-		if strings.TrimSpace(p) != "" {
-			out = append(out, p)
-		}
-	}
-	return strings.Join(out, "\n\n")
 }
 
 // retryDiagnosisFor builds the retry-diagnosis meta-instruction SubLoop injects
@@ -933,11 +948,10 @@ func landCommitMessage(task channel.Task, taskID string) string {
 
 // verifyFailComment 构造「verify 驳回」的 issue 评论正文：失败理由 + 改进建议。
 //
-// verify 不过（且非 needs-human）时落进 issue 评论——双重作用：
-//   - 给人看：驳回不再是黑箱，每轮失败原因 + 该怎么改都可见（issue 侧的可观测性）。
-//   - 作下一轮的持久反馈：collectIssueComments 下一轮（及 reopen/resume 后）读回，
-//     喂给 plan/execute。in-memory 的 priorFailure 只活在一次 Run 内；落成评论后，
-//     即便跨进程重启、跨 reopen，反馈也不丢。
+// verify 不过（且非 needs-human）时落进 issue 评论——纯人可读写回：驳回不再是黑箱，
+// 每轮失败原因 + 该怎么改对操作员可见（issue 侧的可观测性）。评论带 bot 标记发出，
+// collectIssueComments 会滤除它（战报只写不读）；跨轮/跨进程的驳回理由持久传递改由
+// DB 承载（verify step 的 output_json + BuildRunHistory），不依赖评论读回。
 //
 // 纯函数（不碰 channel），便于直接单测正文；调用方负责 PostComment + best-effort 容错。
 // 签名固定为 (channel.Task, int, verify.VerifyResult)：task 给验收标准（推导建议），
@@ -1007,7 +1021,7 @@ func (sl *SubLoop) report(ctx context.Context, taskID string, task channel.Task,
 		fmt.Fprintf(os.Stderr, "writeback error: AppendTransition failed: %v\n", err)
 		detail += " [writeback partial: transition: " + err.Error() + "]"
 	}
-	if err := sl.Channel.PostComment(ctx, task.Ref, strings.ToUpper(status)+": "+detail); err != nil {
+	if err := sl.Channel.PostComment(ctx, task.Ref, channel.MarkBotComment(strings.ToUpper(status)+": "+detail)); err != nil {
 		fmt.Fprintf(os.Stderr, "writeback error: PostComment failed: %v\n", err)
 		detail += " [writeback partial: comment: " + err.Error() + "]"
 	} else if err := sl.Store.SetLastCommentAt(taskID, time.Now()); err != nil {

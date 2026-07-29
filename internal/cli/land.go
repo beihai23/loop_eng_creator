@@ -140,7 +140,7 @@ func landFallback(repo, wt, branch string, prErr error, logf func(format string,
 func handlePRFailure(ctx context.Context, ch channel.Channel, issueRef, repo, wt, branch string, prErr error, logf func(format string, args ...any)) string {
 	extra := landFallback(repo, wt, branch, prErr, logf)
 	if errors.Is(prErr, ErrPushFailed) && ch != nil {
-		if err := ch.PostComment(ctx, issueRef, extra); err != nil {
+		if err := ch.PostComment(ctx, issueRef, channel.MarkBotComment(extra)); err != nil {
 			logf("LAND PARTIAL comment failed (marker still in done detail): %v", err)
 		}
 	}
@@ -212,7 +212,7 @@ func finalizeLand(ctx context.Context, ch channel.Channel, issueRef, repo, workt
 	if prErr == nil {
 		note := "PR 待合并：" + prURL + "，合并后自动关闭"
 		if ch != nil {
-			if err := ch.PostComment(ctx, issueRef, note); err != nil {
+			if err := ch.PostComment(ctx, issueRef, channel.MarkBotComment(note)); err != nil {
 				logf("PR 待合并 comment failed for %s: %v", issueRef, err)
 			}
 		}

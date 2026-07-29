@@ -183,8 +183,11 @@ func NewDaemonCmd() *cobra.Command {
 					TaskDescription:    task.Description,
 					AcceptanceCriteria: task.Criteria,
 					TaskType:           task.TaskType,
-					Body:               task.Body,           // 全文：判断「缺不缺信息」以全文为准
-					PriorFeedback:      fb,                  // 上轮人回复：用户已补充的信息
+					Body:               task.Body, // 全文：判断「缺不缺信息」以全文为准
+					PriorFeedback:      fb,       // 上轮人回复：用户已补充的信息
+					// 历轮 run 摘要（DB 构建）：已反复 blocked 的任务让 triage 直接判
+					// needs_human_decision，而非再放行进 loop 空烧。
+					RunHistory: loop.BuildRunHistory(st, task.IssueRef),
 				})
 				return out, err
 			}

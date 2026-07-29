@@ -21,7 +21,7 @@ type Human struct {
 }
 
 func (h Human) Check(ctx context.Context, diff string, criteria []string, priorFailure string) (VerifyResult, error) {
-	body := reviewRequest(diff, criteria, priorFailure)
+	body := channel.MarkBotComment(reviewRequest(diff, criteria, priorFailure))
 	if err := h.Ch.PostComment(ctx, h.Ref, body); err != nil {
 		return VerifyResult{}, err
 	}

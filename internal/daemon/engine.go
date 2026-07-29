@@ -551,7 +551,7 @@ func (e *Engine) parkByTriage(ctx context.Context, task state.TaskRow, status, r
 	}
 	e.logf("[daemon] triage park: task %s (%s) → %s (%s)",
 		shortTaskID(task.ID), task.IssueRef, status, truncRunes(reason, 80))
-	if err := e.Channel.PostComment(ctx, task.IssueRef, comment); err != nil {
+	if err := e.Channel.PostComment(ctx, task.IssueRef, channel.MarkBotComment(comment)); err != nil {
 		e.logf("[daemon] triage park comment failed for %s: %v", task.IssueRef, err)
 	} else {
 		_ = e.Store.SetLastCommentAt(task.ID, time.Now())

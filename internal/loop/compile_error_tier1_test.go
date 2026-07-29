@@ -97,8 +97,8 @@ func TestTier1CompileErrorSectionInjectedAboveBattleReport(t *testing.T) {
 	if !strings.Contains(p2, "Foo") {
 		t.Fatal("attempt 2 execute prompt missing undefined symbol Foo in section")
 	}
-	if iSec, iBR := strings.Index(p2, "上一轮编译错误"), strings.Index(p2, "战报/反馈"); iBR >= 0 && iSec >= iBR {
-		t.Fatal("compile-error section must precede 战报/反馈 (not buried in battle report)")
+	if iSec, iBR := strings.Index(p2, "上一轮编译错误"), strings.Index(p2, "人反馈"); iBR >= 0 && iSec >= iBR {
+		t.Fatal("compile-error section must precede 人反馈 (not buried in feedback prose)")
 	}
 }
 

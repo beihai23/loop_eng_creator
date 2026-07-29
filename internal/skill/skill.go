@@ -64,6 +64,12 @@ type TriageInput struct {
 	// feedback). Triage must consider it — if the user already answered the
 	// missing-info questions, don't re-ask (startable=true). Empty on first triage.
 	PriorFeedback string
+	// RunHistory is the bounded, DB-built summary of this issue's prior finished
+	// runs (one line per run: outcome + last rejection). Triage uses it to spot a
+	// task that has already burned multiple blocked runs — a candidate for
+	// needs_human_decision instead of re-dispatching into the same wall. Empty on
+	// the task's first dispatch.
+	RunHistory string
 }
 type TriageOutput struct {
 	Startable          bool     `json:"startable"`
@@ -78,11 +84,23 @@ type TriageOutput struct {
 type PlanInput struct {
 	Task               string
 	AcceptanceCriteria []string
-	BattleReport       string
-	RepoStateSummary   string
+	// HumanFeedback is the issue's human-written comments (bot/battle-report
+	// comments filtered out by channel.IsBotComment) — the ONLY thing the issue
+	// thread still contributes to prompts. Machine-derivable history (past
+	// rejections, run outcomes) comes from the DB via RunHistory instead; the
+	// battle report is human-facing writeback, never read back. Empty when the
+	// thread has no human comments.
+	HumanFeedback    string
+	RepoStateSummary string
 	// Body is the full raw issue text (背景/约束/上下文)。Description 只是正文
 	// 首行的蒸馏；plan 评审验收标准、规划实现时应能看到全文。
 	Body string
+	// RunHistory is the bounded, DB-built summary of this issue's prior finished
+	// runs (one line per run: outcome + last verify rejection). It replaces the
+	// role battle-report comments used to (badly) play as cross-run memory:
+	// structured, bounded by run count, and free of the daemon's own echo.
+	// Empty on the first run.
+	RunHistory string
 	// RetryDiagnosis is a "how to plan" meta-instruction SubLoop injects on retries
 	// (attempt ≥ 2 with a non-empty priorFailure): it quotes this round's
 	// priorFailure and asks plan to diagnose whether the verify rejection is a
@@ -92,13 +110,13 @@ type PlanInput struct {
 	// requirement into a tier-1 mechanically-checkable exit-code/compile-time
 	// predicate. Empty on attempt=1 / no prior failure — first-time planning is
 	// left undisturbed. This is meta (how to plan), deliberately kept OUT of
-	// BattleReport (which is "what happened" history/context); rendering it through
+	// HumanFeedback (which is "what people said" context); rendering it through
 	// its own {{.RetryDiagnosis}} block keeps the two separable for plan.
 	RetryDiagnosis string
 	// RejectedDiff is the previous attempt's rejected implementation (unified
 	// diff), when one exists: within a run it is the last verify-rejected
 	// attempt's diff; across runs it is the prior run's execute diff recovered
-	// from the state store by issue_ref. BattleReport/RetryDiagnosis carry the
+	// from the state store by issue_ref. RunHistory/RetryDiagnosis carry the
 	// *verdict* (why it was rejected); this carries the *scene* (what was
 	// actually written), so plan can choose to amend it or start over with full
 	// information instead of re-rolling from scratch. Empty = no prior scene.

@@ -920,6 +920,49 @@ func (s *Store) LatestPlanOutputByRef(ref string) (string, error) {
 	return out, err
 }
 
+// RunSummary 是 run history 的一行：一个已终结 run 的结局 + 该 run 最后一次
+// verify step 的原始 output_json。VerifyOutput 保持原始 JSON（state 不解析
+// loop 的 verifyTrace 形状——与 LatestExecuteOutputByRef 返回原始 output_json
+// 同款分工：store 取数，调用方（loop）解析格式化）。
+type RunSummary struct {
+	RunID        string
+	Outcome      string // done|blocked|needs-review|cancelled|error
+	VerifyOutput string // 该 run 最后一次 verify step 的 output_json；无 verify step 时为空
+}
+
+// RunHistoryByRef 按 issue_ref 找回该任务全部已终结 run 的摘要，时间升序、最多
+// limit 条最近的。供「run history 回灌」：plan/triage/execute 的跨 run 记忆改从
+// DB 构建（结构化、有界），不再靠读回 issue 里的战报评论（人可读写回，只写不读）。
+//
+// 排除：outcome='' 的未终结 run（当前正在跑的 run 自然被排除——EndRun 是 defer
+// 收尾的）与 outcome='triage' 的分诊 run（分诊记账用的附属 run，非任务执行史）。
+// 每个 run 带其最后一次 verify step 的 output_json（驳回理由的结构化来源）。
+func (s *Store) RunHistoryByRef(ref string, limit int) ([]RunSummary, error) {
+	rows, err := s.db.Query(
+		`SELECT id, outcome, vout FROM (
+		   SELECT r.id, r.outcome, r.started_at,
+		          COALESCE((SELECT s.output_json FROM steps s
+		                    WHERE s.run_id = r.id AND s.role = 'verify'
+		                    ORDER BY s.at DESC LIMIT 1), '') AS vout
+		   FROM runs r JOIN tasks t ON t.id = r.task_id
+		   WHERE t.issue_ref = ? AND r.outcome != '' AND r.outcome != 'triage'
+		   ORDER BY r.started_at DESC LIMIT ?
+		 ) ORDER BY started_at ASC`, ref, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RunSummary
+	for rows.Next() {
+		var rs RunSummary
+		if err := rows.Scan(&rs.RunID, &rs.Outcome, &rs.VerifyOutput); err != nil {
+			return nil, err
+		}
+		out = append(out, rs)
+	}
+	return out, rows.Err()
+}
+
 // VerificationRow 是 verifications 表的一行，供 TUI 详情面板的逐 tier 状态展示（spec §4.6）。
 type VerificationRow struct {
 	Tier   int

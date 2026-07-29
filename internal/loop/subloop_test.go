@@ -976,7 +976,7 @@ func TestReplayNoInterleaveAfterResume(t *testing.T) {
 // ---- reopen/反馈：每次运行都把 issue 评论喂给 plan（修 reopen 反馈丢失 bug）----
 
 // fakeCommentChan：channel.Channel 桩，ListReplies 返回预设评论。local 通道不返回
-// 评论，故用它证明 SubLoop 把评论收集进 plan 的 BattleReport。
+// 评论，故用它证明 SubLoop 把人写的评论收集进 plan 的 HumanFeedback。
 type fakeCommentChan struct{ replies map[string][]channel.Reply }
 
 func (f *fakeCommentChan) ListNewTasks(context.Context) ([]channel.Task, error) { return nil, nil }
@@ -1040,7 +1040,7 @@ func TestSubLoopFeedsIssueCommentsToPlan(t *testing.T) {
 		Execute: fake,
 		Plan: skill.Skill[skill.PlanInput, skill.PlanOutput]{
 			Name:       "plan",
-			PromptTmpl: "PLAN:\n战报: {{.BattleReport}}\n任务: {{.Task}}",
+			PromptTmpl: "PLAN:\n人反馈: {{.HumanFeedback}}\n任务: {{.Task}}",
 			ParseJSON: func(b []byte) (skill.PlanOutput, error) {
 				var o skill.PlanOutput
 				return o, json.Unmarshal(b, &o)
