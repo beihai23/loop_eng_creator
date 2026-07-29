@@ -12,6 +12,35 @@
 
 ---
 
+## 界面速览
+
+**Dashboard(TUI)** —— `loop-eng dashboard`:总览 / 详情 / 轨迹三个视角,每个任务跑到哪一步、卡在哪、烧了多少 token,一屏看清。
+
+| 总览:状态计数 + 任务列表 | 详情:初始提示词、三层验收、预算 | 轨迹:逐轮回放与阻塞原因 |
+|---|---|---|
+| ![TUI 总览](docs/images/tui-overview.png) | ![TUI 详情](docs/images/tui-detail.png) | ![TUI 轨迹](docs/images/tui-trace.png) |
+
+**工单侧的闭环** —— 战报、标签流转、人审回复都写回工单系统(下图为 Linear 与 GitHub 两个通道的真实界面,非 loop-eng 自带 UI):
+
+| Linear 看板:派发中的任务 | GitHub Issues:loop 完成的工单 | Issue 详情:驳回→战报→PR→人反馈 |
+|---|---|---|
+| ![Linear 看板](docs/images/channel-linear-board.png) | ![GitHub Issues 列表](docs/images/channel-github-issues.png) | ![GitHub issue 详情](docs/images/channel-github-issue-detail.png) |
+
+<details>
+<summary><b>配置向导</b>(<code>loop-eng config</code>,交互式配好 channel + 各角色引擎,共 6 张)</summary>
+
+| 欢迎页 | 第 1 步:任务来源(channel) | GitHub 仓库(带校验) |
+|---|---|---|
+| ![配置向导欢迎页](docs/images/wizard-intro.png) | ![向导:任务来源](docs/images/wizard-channel.png) | ![向导:GitHub 仓库](docs/images/wizard-github-repo.png) |
+
+| 第 2 步:干活引擎 | 逐角色选引擎(1/4) | 确认配置并写入 `.loop/config.yaml` |
+|---|---|---|
+| ![向导:干活引擎](docs/images/wizard-agents.png) | ![向导:逐角色选引擎](docs/images/wizard-per-role.png) | ![向导:确认配置](docs/images/wizard-confirm.png) |
+
+</details>
+
+---
+
 ## 为什么能信任它
 
 让 LLM 自己跑闭环，最容易翻车的三件事：**它会自我安慰说「做完了」**、**它的记忆不可靠**、**没有预算会一直烧**。loop-eng 用三条硬规则对症：

@@ -2,7 +2,7 @@
 arc: battle-report-readback
 started: 3c17330c6d8653cce7f825a00d2f78ce878e3dc1
 status: resolved
-commits: []
+commits: [133217c]
 ---
 
 # 战报只写不读：机器记忆与人可读写回分通道
