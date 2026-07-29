@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>loop-eng dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1><span class="brand">loop-eng</span> dashboard</h1>
+    <div id="counts" class="counts"></div>
+    <div id="running-banner" class="running-banner" hidden></div>
+  </header>
+
+  <main>
+    <!-- 总览容器：id 含 'overview'（验收锚点）。每 ~3s 自动刷新。 -->
+    <section id="overview" class="overview">
+      <h2>任务总览</h2>
+      <ul id="task-list" class="task-list"></ul>
+      <p id="empty-hint" class="hint" hidden>暂无任务。</p>
+    </section>
+
+    <!-- 详情视图：点击任务进入，拉 detail + trace。 -->
+    <section id="detail" class="detail" hidden>
+      <button id="back-btn" class="link-btn">← 返回总览</button>
+      <div id="detail-body"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>loop-eng web · 只读 + resume/cancel 控制通道</span>
+    <span id="last-updated"></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
