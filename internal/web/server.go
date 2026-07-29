@@ -11,6 +11,7 @@ package web
 import (
 	"embed"
 	"io/fs"
+	"net"
 	"net/http"
 
 	"loop-eng/internal/config"
@@ -77,6 +78,16 @@ func (s *Server) Handler() http.Handler { return s.mux }
 // returns. Used by the `loop-eng web` command.
 func (s *Server) ListenAndServe(addr string) error {
 	return http.ListenAndServe(addr, s.mux)
+}
+
+// Serve serves the dashboard on an already-bound listener, blocking until ln
+// returns. Splitting bind (caller's net.Listen) from serve lets the `web`
+// command guarantee the address is actually listening before it advertises the
+// URL — eliminating the「打印了不可达链接」bug where ListenAndServe would print
+// the access line first and then fail to bind. http.Serve closes ln when it
+// returns, so the caller does not need to.
+func (s *Server) Serve(ln net.Listener) error {
+	return http.Serve(ln, s.mux)
 }
 
 // handleIndex serves the embedded SPA shell. ServeMux "GET /" is the catch-all
