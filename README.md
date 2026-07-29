@@ -212,3 +212,7 @@ make fmt vet
 
 - [核心设计规格](docs/superpowers/specs/2026-07-02-loop-eng-core-design.md)——背景、原则、架构、数据流、术语对照。
 - `docs/superpowers/plans/` 下有各阶段的实现计划。
+
+## 许可证
+
+[MIT](LICENSE)
