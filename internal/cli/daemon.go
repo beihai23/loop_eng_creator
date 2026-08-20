@@ -28,6 +28,7 @@ import (
 func NewDaemonCmd() *cobra.Command {
 	var repo, channelFlag, models string
 	var pollInterval, cooldown time.Duration
+	var fixPreflight bool
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "常驻 loop 引擎（轮询工单 + 单活跃子 loop + park/resume）",
@@ -53,6 +54,18 @@ func NewDaemonCmd() *cobra.Command {
 			ch, err := buildChannel(cfg, repo)
 			if err != nil {
 				return err
+			}
+
+			// --fix-preflight：opt-in 自愈。先跑 StatusEnsurer 补齐可自动创建的前置
+			// 依赖（GitHub loop:* 标签 / Linear WorkflowState），再走下面的 preflight
+			// 硬门——残余缺口（auth、missing-project、无写权限建不出的标签）仍拒启并
+			// 给清单。默认关：preflight 保持 #65 的只读硬门语义。ensure 幂等，与门后
+			// 的常规 provisioning 块重复调用无害（GitHub sync.Once / Linear skip-existing）。
+			if fixPreflight {
+				fmt.Fprintf(os.Stderr, "[daemon] fix-preflight: 补齐可自动创建的前置依赖（标签/状态列）...\n")
+				if err := autoFixPreflight(context.Background(), ch); err != nil {
+					fmt.Fprintf(os.Stderr, "[daemon] fix-preflight: %v（继续 preflight，残余缺口照常报告）\n", err)
+				}
 			}
 
 			// Preflight gate (#65): refuse to start when the channel's
@@ -238,6 +251,7 @@ func NewDaemonCmd() *cobra.Command {
 	cmd.Flags().StringVar(&repo, "repo", ".", "仓库路径")
 	cmd.Flags().StringVar(&channelFlag, "channel", "", "local | github（空=用 cfg.Channel.Provider）")
 	cmd.Flags().StringVar(&models, "models", "real", "real | fake")
+	cmd.Flags().BoolVar(&fixPreflight, "fix-preflight", false, "启动前自动补齐可修复的 channel 前置依赖（缺失 loop:* 标签 / Linear 状态列），再走 preflight 硬校验")
 	cmd.Flags().DurationVar(&pollInterval, "poll-interval", 60*time.Second, "轮询间隔")
 	cmd.Flags().DurationVar(&cooldown, "cooldown", 5*time.Minute, "瞬时基础设施阻塞（如上游 529 限流）后的派发冷却时长")
 	return cmd

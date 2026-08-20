@@ -152,7 +152,7 @@ type: feature
 | `loop-eng init [--repo <path>]` | （deprecated alias，内部调 `config`）在仓库生成 `.loop/`，并把 `.loop/` 加进 `.gitignore`。非交互 stdin（EOF）下只脚手架、保持默认配置。 |
 | `loop-eng task new <desc> [--repo <path>] [--type feature\|bugfix\|docs\|refactor]` | 生成 `inbox/<n>.md`，自动检测项目语言（go/node/rust/python/java）并建议验收标准。 |
 | `loop-eng run-once [--repo <path>] [--models real\|fake] [--channel local\|github]` | **同步**：捞 inbox 第一个任务，跑完整 plan→execute→verify→writeback；`done` 自动 land。 |
-| `loop-eng daemon [--repo <path>] [--channel local\|github] [--models real\|fake] [--poll-interval <dur>] [--cooldown <dur>]` | **常驻**：轮询工单、逐个跑、park/resume、崩溃可恢复。`--cooldown` 是上游瞬时阻塞（如限流）后的派发冷却。 |
+| `loop-eng daemon [--repo <path>] [--channel local\|github] [--models real\|fake] [--poll-interval <dur>] [--cooldown <dur>] [--fix-preflight]` | **常驻**：轮询工单、逐个跑、park/resume、崩溃可恢复。`--cooldown` 是上游瞬时阻塞（如限流）后的派发冷却。`--fix-preflight` 在 preflight 硬校验前自动补齐可修复的 channel 前置依赖（缺失 `loop:*` 标签 / Linear 状态列）；修不了的（auth、missing-project）仍拒启并给清单。 |
 | `loop-eng status [--repo <path>] [--task <id>] [--watch]` | 打印任务态；`--watch` 实时刷新（Ctrl-C 退出）。 |
 | `loop-eng replay --run <id> [--repo <path>]` | 按 seq 回放某次 run 的 steps。 |
 | `loop-eng dashboard [--repo <path>]` | 交互式 TUI 看板：总览 / 详情 / 轨迹三 Tab，`j/k` 选择、`enter` 进详情、`t` 看轨迹、`r` 恢复、`x` 取消、`q` 退出。 |

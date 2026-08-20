@@ -36,6 +36,15 @@ type PreflightIssue struct {
 	Message string
 }
 
+// AutoFixable reports whether `daemon --fix-preflight` can provision this
+// issue's missing prerequisite itself: missing-label (GitHub) and
+// unresolvable-status (Linear) name exactly the markers EnsureStatusMarkers
+// creates (loop:<status> labels / WorkflowStates). auth and missing-project
+// need operator action — the flag can't help them, so gate hints on this.
+func (i PreflightIssue) AutoFixable() bool {
+	return i.Code == "missing-label" || i.Code == "unresolvable-status"
+}
+
 // Preflighter is an optional capability a Channel may implement: a startup
 // readiness check that lists missing prerequisites so the daemon can fail fast
 // with a checklist instead of crashing mid-run.

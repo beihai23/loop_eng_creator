@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -90,6 +91,93 @@ func TestFormatPreflightIssuesRendersChecklist(t *testing.T) {
 	}
 	if strings.Count(out, "\n") != 2 {
 		t.Fatalf("want one bullet per issue (2 lines), got:\n%s", out)
+	}
+}
+
+// TestRunPreflightHintSuggestsFixFlag: when any issue is auto-fixable
+// (missing-label), the refusal error must carry the `--fix-preflight` hint —
+// the operator's one-flag path instead of hand-running the gh label commands.
+func TestRunPreflightHintSuggestsFixFlag(t *testing.T) {
+	ch := &fakePreflightChannel{
+		Local: channel.NewLocal(t.TempDir()),
+		issues: []channel.PreflightIssue{
+			{Code: "missing-label", Target: "loop:running", Message: "缺 loop:running"},
+			{Code: "missing-project", Target: "ghost", Message: "project 不存在"},
+		},
+	}
+	err := runPreflight(context.Background(), ch)
+	if err == nil {
+		t.Fatal("missing prerequisites must refuse startup, got nil")
+	}
+	if !strings.Contains(err.Error(), "--fix-preflight") {
+		t.Fatalf("auto-fixable issues must hint `daemon --fix-preflight`, got:\n%s", err)
+	}
+}
+
+// TestRunPreflightNoHintWhenNotFixable: when no issue is auto-fixable (auth,
+// missing-project) the hint must NOT appear — the flag can't heal those and
+// suggesting it would waste an operator round.
+func TestRunPreflightNoHintWhenNotFixable(t *testing.T) {
+	ch := &fakePreflightChannel{
+		Local: channel.NewLocal(t.TempDir()),
+		issues: []channel.PreflightIssue{
+			{Code: "auth", Target: "LINEAR_API_KEY", Message: "key bad"},
+			{Code: "missing-project", Target: "ghost", Message: "project 不存在"},
+		},
+	}
+	err := runPreflight(context.Background(), ch)
+	if err == nil {
+		t.Fatal("missing prerequisites must refuse startup, got nil")
+	}
+	if strings.Contains(err.Error(), "--fix-preflight") {
+		t.Fatalf("unfixable issues must not suggest --fix-preflight, got:\n%s", err)
+	}
+}
+
+// fakeEnsurerChannel adds a StatusEnsurer method so autoFixPreflight can be
+// exercised without a live GitHub/Linear backend. ensured counts calls.
+type fakeEnsurerChannel struct {
+	*channel.Local
+	ensured int
+	err     error
+}
+
+func (f *fakeEnsurerChannel) EnsureStatusMarkers(context.Context) error {
+	f.ensured++
+	return f.err
+}
+
+// TestAutoFixPreflight: --fix-preflight's provisioning pass calls
+// EnsureStatusMarkers exactly once on a StatusEnsurer channel (propagating its
+// error so the daemon can log it) and is a no-op nil on a channel without
+// status markers (Local).
+func TestAutoFixPreflight(t *testing.T) {
+	ens := &fakeEnsurerChannel{Local: channel.NewLocal(t.TempDir())}
+	if err := autoFixPreflight(context.Background(), ens); err != nil {
+		t.Fatalf("ensurer error must propagate, got %v", err)
+	}
+	if ens.ensured != 1 {
+		t.Fatalf("EnsureStatusMarkers must run exactly once, got %d", ens.ensured)
+	}
+
+	sentinel := errors.New("no labels:write scope")
+	failing := &fakeEnsurerChannel{Local: channel.NewLocal(t.TempDir()), err: sentinel}
+	if err := autoFixPreflight(context.Background(), failing); !errors.Is(err, sentinel) {
+		t.Fatalf("ensurer failure must surface (caller logs, preflight still gates), got %v", err)
+	}
+
+	if err := autoFixPreflight(context.Background(), channel.NewLocal(t.TempDir())); err != nil {
+		t.Fatalf("non-ensurer channel must be a no-op nil, got %v", err)
+	}
+}
+
+// TestDaemonCmdHasFixPreflightFlag pins the flag name operators are told to run
+// (the refusal hint says `daemon --fix-preflight`) — a rename here would make
+// the printed hint a lie.
+func TestDaemonCmdHasFixPreflightFlag(t *testing.T) {
+	f := NewDaemonCmd().Flags().Lookup("fix-preflight")
+	if f == nil {
+		t.Fatal("daemon must register --fix-preflight (the preflight refusal hint names it)")
 	}
 }
 

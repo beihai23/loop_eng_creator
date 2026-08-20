@@ -72,6 +72,9 @@ func NewDoctorCmd() *cobra.Command {
 			fmt.Printf("channel=%s：❌ 未就绪，缺 %d 项前置依赖（channel %d + provider %d）\n",
 				prov, total, len(chanIssues), len(provIssues))
 			fmt.Print(formatPreflightIssues(chanIssues))
+			if hint := fixPreflightHint(chanIssues); hint != "" {
+				fmt.Printf("提示：%s\n", hint)
+			}
 			for _, msg := range provIssues {
 				fmt.Printf("  - %s\n", msg)
 			}
@@ -116,7 +119,8 @@ func providerPreflight(cfg *config.Config) []string {
 // prerequisites are missing, so the daemon refuses to start — fail fast at boot
 // instead of crashing mid-run (e.g. a missing loop:running label only surfacing
 // when UpdateStatus hits it, #54/#65). Channels without prerequisites (Local)
-// are always ready.
+// are always ready. When any missing item is auto-fixable, the error appends
+// the `daemon --fix-preflight` hint so the operator learns the one-flag path.
 func runPreflight(ctx context.Context, ch channel.Channel) error {
 	pf, ok := ch.(channel.Preflighter)
 	if !ok {
@@ -132,7 +136,37 @@ func runPreflight(ctx context.Context, ch channel.Channel) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "channel 未就绪：缺 %d 项前置依赖（`loop-eng doctor` 查看详情）：\n", len(issues))
 	b.WriteString(formatPreflightIssues(issues))
+	if hint := fixPreflightHint(issues); hint != "" {
+		fmt.Fprintf(&b, "提示：%s\n", hint)
+	}
 	return errors.New(b.String())
+}
+
+// autoFixPreflight is `daemon --fix-preflight`'s provisioning pass: run the
+// channel's StatusEnsurer (GitHub loop:<status> labels / Linear WorkflowStates)
+// BEFORE the preflight gate, so auto-provisionable prerequisites exist by the
+// time Preflight lists the residual. Best-effort by contract (GitHub logs
+// create failures and returns nil; Linear returns an error its caller logs) —
+// preflight stays the hard gate either way. Channels without status markers
+// (Local) are a no-op nil.
+func autoFixPreflight(ctx context.Context, ch channel.Channel) error {
+	se, ok := ch.(channel.StatusEnsurer)
+	if !ok {
+		return nil
+	}
+	return se.EnsureStatusMarkers(ctx)
+}
+
+// fixPreflightHint returns the `daemon --fix-preflight` suggestion for the
+// issue list, or "" when no issue is auto-fixable — suggesting the flag for an
+// auth/missing-project gap it can't heal would just waste an operator round.
+func fixPreflightHint(issues []channel.PreflightIssue) string {
+	for _, is := range issues {
+		if is.AutoFixable() {
+			return "可自动补齐的项（缺失标签/状态列）——执行 `loop-eng daemon --fix-preflight` 自动修复后重启"
+		}
+	}
+	return ""
 }
 
 // formatPreflightIssues renders the issue list as a indented checklist
