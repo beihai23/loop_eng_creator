@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"loop-eng/internal/channel"
+	"loop-eng/internal/config"
 	"loop-eng/internal/isolation"
+	"loop-eng/internal/state"
 )
 
 // ErrPushFailed marks a createPR failure whose root cause is `git push origin`
@@ -175,6 +178,78 @@ func prBodyFor(title, ref string) string {
 		return base
 	}
 	return title + "\n\n" + base
+}
+
+// acceptToken 是 tier-3 人审的「接受」令牌：review-request 评论教学人回复它。
+// 与 loop:task / loop:running / loop:blocked 令牌族一致——语言中立、可 grep。
+// 大小写不敏感的子串匹配（loop:accepted 之类自然语言变体也命中，方向安全：
+// 多接受一次的代价是一次本可重跑的落地，反向误判不存在）。
+const acceptToken = "loop:accept"
+
+// acceptParkedReview handles the tier-3 accept reply: a needs-review task
+// re-queued carrying a human reply containing loop:accept, with its park-time
+// branch on record (land_branch, set when SubLoop committed before parking).
+// It lands THAT branch without re-running the loop — a re-run rebuilds the
+// implementation from a fresh HEAD worktree and could produce code the human
+// never reviewed; accept must land exactly what was reviewed (spec §8.6
+// 「人 accept → 写回 → done」的落地侧).
+//
+// Returns ok=true when the accept was handled (caller reports done + detail).
+// ok=false (无反馈 / 无令牌 / 无分支记录 / 读任务失败) leaves the normal
+// SubLoop.Run path untouched; a matched-but-broken accept degrades to the
+// re-run path with a log line — never parks forever on a failed accept.
+func acceptParkedReview(ctx context.Context, st *state.Store, ch channel.Channel,
+	repo string, cfg *config.Config, task state.TaskRow) (string, bool) {
+	fb, err := st.GetResumeFeedback(task.ID)
+	if err != nil || !strings.Contains(strings.ToLower(fb), acceptToken) {
+		return "", false
+	}
+	row, err := st.GetTask(task.ID)
+	if err != nil {
+		log.Printf("[daemon] task %s accept: GetTask failed (%v) — degrade to re-run", task.ID, err)
+		return "", false
+	}
+	branch := row.LandBranch
+	if branch == "" || branch == "(unlanded)" {
+		log.Printf("[daemon] task %s accept: no parked branch on record (park commit failed or pre-park-commit park) — degrade to re-run", task.ID)
+		return "", false
+	}
+	// 消费反馈：避免后续任何重跑路径再次弹出同一条 accept 反馈。
+	_, _ = st.PopResumeFeedback(task.ID)
+	// worktree 路径由分支名重建（park 树通常仍在——needs-review 活树 GC 永不清；
+	// 已被清理时 Discard 的失败只是化妆性残留，merge/push 用的分支在主仓库对象库）。
+	wt := isolation.WorktreePath(repo, strings.TrimPrefix(branch, "loop/"))
+	prTitle := prTitleFor(task.Title, task.Description, task.IssueRef)
+	prBody := prBodyFor(task.Title, task.IssueRef)
+	prURL, prErr := createPR(repo, cfg.Channel.Repo, branch, wt, prTitle, prBody)
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "[daemon] task "+task.ID+" accept "+format+"\n", args...)
+	}
+	if prErr == nil {
+		fmt.Printf("[daemon] task %s accept: PR created: %s\n", task.ID, prURL)
+	}
+	res := finalizeLand(ctx, ch, task.IssueRef, repo, wt, branch, prURL, prErr, logf)
+	detail := "tier-3 人审接受（loop:accept）：落地分支 " + branch
+	if res.Note != "" {
+		detail += "\n" + res.Note
+	}
+	// 未集成且仍有待合并分支 → 记 land_branch，reconcile 据此轮询 PR 合并后关单
+	//（与 done 路径同款）。
+	if !res.Integrated && res.Branch != "" {
+		if err := st.SetLandBranch(task.ID, res.Branch); err != nil {
+			fmt.Fprintf(os.Stderr, "[daemon] task %s SetLandBranch failed: %v\n", task.ID, err)
+		}
+	}
+	// 写回（SubLoop.report 同款容错：失败折叠进 detail，绝不翻转结果）。
+	if err := ch.PostComment(ctx, task.IssueRef, channel.MarkBotComment("DONE: "+detail)); err != nil {
+		detail += " [writeback partial: comment: " + err.Error() + "]"
+	} else if err := st.SetLastCommentAt(task.ID, time.Now()); err != nil {
+		detail += " [writeback partial: last_comment_at: " + err.Error() + "]"
+	}
+	if err := ch.UpdateStatus(ctx, task.IssueRef, "done"); err != nil {
+		detail += " [writeback partial: status: " + err.Error() + "]"
+	}
+	return detail, true
 }
 
 // LandResult is finalizeLand's decision: whether the done work is fully
@@ -341,7 +416,8 @@ func codeGitHubRepo(repo string) string {
 	if err != nil {
 		return ""
 	}
-	return parseGitHubOwnerName(string(out))}
+	return parseGitHubOwnerName(string(out))
+}
 
 func createPR(repo, ghRepo, branch, wt, title, body string) (string, error) {
 	// ghRepo is the task channel's repo (GitHub channel). For a non-GitHub task

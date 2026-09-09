@@ -36,7 +36,7 @@ func TestChainShortCircuitsOnTier1Fail(t *testing.T) {
 	fail := Deterministic{Label: "tests", Cmd: []string{"false"}}
 	called := false
 	t2 := tierSpy{called: &called}
-	res, _ := Chain(context.Background(), []Tier{fail, t2}, "", nil, "")
+	res, _ := Chain(context.Background(), []Tier{fail, t2}, "", nil, "", Handoff{})
 	if res.Passed {
 		t.Fatal("should fail")
 	}
@@ -48,7 +48,7 @@ func TestChainShortCircuitsOnTier1Fail(t *testing.T) {
 func TestChainPassesWhenAllPass(t *testing.T) {
 	ok := Deterministic{Label: "tests", Cmd: []string{"true"}}
 	human := HumanStub{}
-	res, _ := Chain(context.Background(), []Tier{ok, human}, "", nil, "")
+	res, _ := Chain(context.Background(), []Tier{ok, human}, "", nil, "", Handoff{})
 	if !res.Passed {
 		t.Fatal("ok+tier3-stub should pass (stub doesn't block in M1 chain)")
 	}
@@ -184,7 +184,7 @@ func TestChainFillsTiersAndShortCircuits(t *testing.T) {
 		stubTier{pass: false, detail: "t2 nope"},
 		stubTier{pass: true, detail: "t3"},
 	}
-	res, err := Chain(context.Background(), tiers, "diff", nil, "")
+	res, err := Chain(context.Background(), tiers, "diff", nil, "", Handoff{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestChainFillsTiersAndShortCircuits(t *testing.T) {
 
 func TestChainFillsTiersAllPass(t *testing.T) {
 	tiers := []Tier{stubTier{pass: true, detail: "t1"}, stubTier{pass: true, detail: "t2"}}
-	res, _ := Chain(context.Background(), tiers, "diff", nil, "")
+	res, _ := Chain(context.Background(), tiers, "diff", nil, "", Handoff{})
 	if !res.Passed || len(res.Tiers) != 2 {
 		t.Fatalf("want passed + 2 tiers, got %+v", res)
 	}

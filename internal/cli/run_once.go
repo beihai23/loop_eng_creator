@@ -70,6 +70,7 @@ func NewRunOnceCmd() *cobra.Command {
 				Help:            help,
 				VerifyLLM:       verify.LLM{Skill: verifySkill},
 				Tier3Human:      cfg.Verify.Tier3Human,
+				HumanTier:       humanTierFor(cfg, ch, tasks[0].Ref),
 				Channel:         ch,
 				PlanModelRef:    providerLabel(cfg.Models.Plan),
 				ExecuteModelRef: providerLabel(cfg.Models.Execute),
@@ -108,6 +109,30 @@ func NewRunOnceCmd() *cobra.Command {
 	cmd.Flags().StringVar(&models, "models", "real", "real | fake（测试用）")
 	cmd.Flags().StringVar(&channelFlag, "channel", "", "local | github（空=用 cfg.Channel.Provider）")
 	return cmd
+}
+
+// humanTierFor returns the real tier-3 human-review tier when cfg enables it
+// AND the channel can carry the review loop. The loop needs a reply path: park
+// is only useful if the human's accept/reject reply can flow back
+// (Channel.ListReplies). local's ListReplies is a no-op (channel/local.go) —
+// parking there would strand the task with no reply channel (TUI 'r' resume
+// exists but is an implicit dependency), so local keeps the auto-pass stub.
+// github/linear get the real tier: review-request comment → needs-review park
+// → daemon polls replies → loop:accept lands / feedback re-runs (spec §8.6/§10
+// — before this wiring the flag silently attached HumanStub and every
+// production task auto-passed tier-3).
+func humanTierFor(cfg *config.Config, ch channel.Channel, ref string) verify.Tier {
+	if !cfg.Verify.Tier3Human {
+		return nil
+	}
+	switch cfg.Channel.Provider {
+	case "github", "linear":
+		// 指针：HandoffAware（SetHandoff 指针接收者）要进接口的方法集，verify.Chain
+		// 的注入才命中（见 P1 移交包）。
+		return &verify.Human{Ch: ch, Ref: ref}
+	default:
+		return nil
+	}
 }
 
 // buildChannel picks the channel.Channel by cfg.Channel.Provider: "" or

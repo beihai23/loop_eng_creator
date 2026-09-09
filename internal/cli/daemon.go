@@ -95,6 +95,14 @@ func NewDaemonCmd() *cobra.Command {
 			// comment + status mark via report()). PreinsertedTaskID = the daemon's
 			// already-ingested task ID (avoids duplicate InsertTask).
 			runTask := func(ctx context.Context, task state.TaskRow) (string, string, error) {
+				// loop:accept 拦截（tier-3 人审接受→落地，不重跑 loop）。放在 runTask 而
+				// 非 engine：落地助手（createPR/finalizeLand）都在 cli 层，且「重跑会从
+				// HEAD 新建 worktree 重做实现、产出的可能是人没审过的新代码」这条正确性
+				// 判断只在派发点成立。拦截失败（无分支/读任务出错）→ 记日志、照常重跑
+				//（reject 语义兜底，人反馈里的其余内容仍会进 loop）。
+				if detail, ok := acceptParkedReview(ctx, st, ch, repo, cfg, task); ok {
+					return "done", detail, nil
+				}
 				bz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
 				// 任务级 agent override：daemon 从 issue 摄取的 task.Agent 覆盖各角色 provider
 				// （agent: codex → 该任务全程用 codex）。未知 provider 静默回落 config 默认。
@@ -112,6 +120,7 @@ func NewDaemonCmd() *cobra.Command {
 					Help:              help,
 					VerifyLLM:         verify.LLM{Skill: verifySkill},
 					Tier3Human:        taskCfg.Verify.Tier3Human,
+					HumanTier:         humanTierFor(taskCfg, ch, task.IssueRef),
 					Channel:           ch,
 					PreinsertedTaskID: task.ID,
 					PlanModelRef:      providerLabel(taskCfg.Models.Plan),
@@ -197,7 +206,7 @@ func NewDaemonCmd() *cobra.Command {
 					AcceptanceCriteria: task.Criteria,
 					TaskType:           task.TaskType,
 					Body:               task.Body, // 全文：判断「缺不缺信息」以全文为准
-					PriorFeedback:      fb,       // 上轮人回复：用户已补充的信息
+					PriorFeedback:      fb,        // 上轮人回复：用户已补充的信息
 					// 历轮 run 摘要（DB 构建）：已反复 blocked 的任务让 triage 直接判
 					// needs_human_decision，而非再放行进 loop 空烧。
 					RunHistory: loop.BuildRunHistory(st, task.IssueRef),

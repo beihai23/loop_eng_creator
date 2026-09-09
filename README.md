@@ -132,7 +132,7 @@ type: feature
 | 想干什么 | 改哪里 | 说明 |
 |---|---|---|
 | tier-1 验收脚本 | —（不在 config 里） | 由 **plan 按每个任务产出**（`PlanOutput.verify_script`），按项目技术栈写成脚本，在 worktree 里跑，看退出码。不可脚本化的任务 plan 不产出，直接落 tier-2。 |
-| 关掉人工复核（纯自动跑） | `verify.tier3_human` | `false` 则跳过人工复核这一关 |
+| 人工复核（tier-3） | `verify.tier3_human` | 默认 `true`：tier-1/2 全过后发**结构化移交包**评论（现场/机器已验过什么/风险/历轮/token）并挂起等人审。仅 github / linear 通道生效——local 无回复通道，自动通过。人回复含 `loop:accept` → 直接落地人审过的分支（不重跑）；回复其他内容 → 带反馈重跑。`false` 则整层跳过 |
 | 调预算（三道刹车） | `budget.per_call_tokens` / `per_task_tokens` / `max_retries` | 单次调用 / 单任务 / 最大重试。**三项必填且必须 > 0**，否则拒绝启动 |
 | 给某角色换模型 | `models.<role>.name` | 可选；默认用 claude 的默认模型。`<role>` ∈ triage / plan / execute / verify |
 | 换工单通道 | `channel.provider` | `local`（读 `<repo>/inbox/*.md`）或 `github`（经已认证的 `gh`，按标签过滤 issue） |
@@ -174,12 +174,13 @@ type: feature
 验证   三层链，按序短路：
          第一层  确定性脚本（plan 按任务产出，按技术栈，在 worktree 里跑）   ─不过→ 反馈
          第二层  claude 新会话：只给 diff + 验收标准            ─不过→ 反馈
-         第三层  异步人审：发 review 评论 → 挂起 → 等回复
+         第三层  异步人审：发移交包评论（现场/证据/风险/历轮）→ 挂起 → 等回复
        第一层 + 第二层全过 → 写回 → done → 自动 land 到主分支
 写回   落盘 trace（SQLite）+ 战报（issue 评论 / outbox）+ 摄取回主循环
 ```
 
 - 第一层 / 第二层不过：失败成为下一轮 **计划** 的输入，预算内重试。
+- tier-3 挂起前先把人审的工作 commit 到 `loop/<task>-r<N>` 分支并记 `land_branch`：人回复含 `loop:accept` → 直接落地**人审过的那份提交**（不重跑——重跑会从 HEAD 重做实现）；回复其他内容 → 带反馈重跑。
 - 连续失败或预算耗尽：→ `blocked` → 发求助评论。
 - 执行端**不得自改验收标准**；发现标准本身有错 → 走人。
 

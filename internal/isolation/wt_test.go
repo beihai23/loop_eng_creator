@@ -123,3 +123,51 @@ func TestCreateToleratesLeftoverBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestCreateReuseSafeWithParkedWorktree: tier-3 park 保留 worktree（needs-review
+// 活树 GC 永不清），人回复后 resume 重派同一 runID——Create 对已注册的同名路径
+// 必须先清场再建，而非 "already exists" 崩掉（park→resume 重派的真实路径）。
+func TestCreateReuseSafeWithParkedWorktree(t *testing.T) {
+	repo := initRepo(t)
+	wt, err := Create(repo, "run-parked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(wt, "parked.txt"), "parked scene")
+	// 不 Discard——模拟 park 保留的活树，直接同 runID 再 Create（resume 重派）。
+	wt2, err := Create(repo, "run-parked")
+	if err != nil {
+		t.Fatalf("Create must tolerate parked (registered) worktree at same path: %v", err)
+	}
+	// 新树从 HEAD 重建：parked.txt 属于被取代的旧现场，不应带进新树。
+	if _, err := os.Stat(filepath.Join(wt2, "parked.txt")); !os.IsNotExist(err) {
+		t.Fatalf("re-created worktree should start fresh from HEAD, found parked.txt (err=%v)", err)
+	}
+	if err := Discard(repo, wt2); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCreateReuseSafeWithOrphanDir: 未注册的同名孤儿目录（登记损坏 / 手工删过
+// .git 文件）同样不得崩——rm -rf + prune 后原路重建。
+func TestCreateReuseSafeWithOrphanDir(t *testing.T) {
+	repo := initRepo(t)
+	wt, err := Create(repo, "run-orphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟登记损坏：直接 rm -rf worktree 目录（不走 worktree remove），git 侧登记残留。
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".loop", "worktrees", "run-orphan"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	wt2, err := Create(repo, "run-orphan")
+	if err != nil {
+		t.Fatalf("Create must tolerate unregistered orphan dir at same path: %v", err)
+	}
+	if err := Discard(repo, wt2); err != nil {
+		t.Fatal(err)
+	}
+}

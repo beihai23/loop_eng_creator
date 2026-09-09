@@ -12,14 +12,38 @@ func writeFile(path, body string) error {
 	return os.WriteFile(path, []byte(body), 0644)
 }
 
+// WorktreePath 返回 runID 对应的 worktree 路径（Create 的路径公式，Abs 解析
+// 一致）。供落地路径从分支名重建 worktree 位置——tier-3 park 后树通常仍在
+// （needs-review 活树 GC 永不清）；已被清理时调用方的 best-effort 容错兜底。
+func WorktreePath(baseRepo, runID string) string {
+	wt, _ := filepath.Abs(filepath.Join(baseRepo, ".loop", "worktrees", runID))
+	return wt
+}
+
 // Create 在 baseRepo 旁的 .loop/worktrees/<runID> 建 worktree，返回其绝对路径。
 func Create(baseRepo, runID string) (string, error) {
 	wtRoot := filepath.Join(baseRepo, ".loop", "worktrees")
 	if err := os.MkdirAll(wtRoot, 0755); err != nil {
 		return "", err
 	}
-	wtPath := filepath.Join(wtRoot, runID)
+	wtPath := WorktreePath(baseRepo, runID)
 	branch := "loop/" + runID
+	// 同名路径先清场（reuse-safe）：tier-3 park 保留 worktree（needs-review 的活树
+	// GC 永不清），人回复后 resume 重派同一 runID——worktree add 对已注册路径会直接
+	// 报 "already exists" 崩掉。重派语义上旧树必然已被取代（若曾 commit，提交在主仓库
+	// 对象库里；diff/现场已落 steps.output_json），原地重建不丢信息。两种残留都处理：
+	// 已注册的走 worktree remove --force；未注册的孤儿目录走 rm -rf + prune。
+	if _, err := os.Stat(wtPath); err == nil {
+		if out, err := exec.Command("git", "-C", baseRepo,
+			"worktree", "remove", "--force", wtPath).CombinedOutput(); err != nil {
+			// 未注册（登记损坏/手工删过 .git 文件）：清目录 + prune 掉 git 侧残登记。
+			if err := os.RemoveAll(wtPath); err != nil {
+				return "", fmt.Errorf("clear stale worktree path: %w", err)
+			}
+			_ = exec.Command("git", "-C", baseRepo, "worktree", "prune").Run()
+			_ = out
+		}
+	}
 	// -B（不是 -b）：分支已存在时强制重置到 HEAD，而非报 "already exists" 崩掉。
 	// 同一 <taskID>-r<attempt> 分支可能因上次 run 在 Discard 前崩溃、land 失败、
 	// 或手工操作而残留——-b 会让下一次 Create 直接 error（#20 就栽在这）。
@@ -28,10 +52,9 @@ func Create(baseRepo, runID string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("git worktree add: %s", out)
 	}
-	// filepath.Join stays relative when baseRepo == "."; resolve to absolute so
-	// the doc comment ("返回其绝对路径") is truthful and downstream git -C calls
-	// work regardless of the caller's cwd.
-	return filepath.Abs(wtPath)
+	// wtPath 已由 WorktreePath 解析为绝对路径（baseRepo == "." 时 Join 仍相对，
+	// Abs 保证返回值与下游 git -C 调用不受调用方 cwd 影响）。
+	return wtPath, nil
 }
 
 // Discard 删 worktree 及其分支。

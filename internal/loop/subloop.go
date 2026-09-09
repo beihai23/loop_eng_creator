@@ -300,6 +300,9 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	// prevFailureSig 跨 attempt 记录上一轮失败签名——重试增益门槛（零增益）的判定基准：
 	// 本轮签名与上一轮相同（且非空）→ 零新增信息 → 不再机械重试、升级求助（见 gain.go）。
 	prevFailureSig := ""
+	// runTokensIn/Out 累计本 run 各角色真实用量（plan/execute/tier-2；help 旁路不计），
+	// 供 tier-3 移交包的透明度字段——审的人知道这份 review 烧了多少。
+	runTokensIn, runTokensOut := 0, 0
 	for attempt := 1; sl.Budget.ShouldRetry(attempt); attempt++ {
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
 		if ok, _ := sl.Store.CancelRequested(taskID); ok {
@@ -361,6 +364,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		planPrompt, _ := skill.RenderPrompt(sl.Plan.PromptTmpl, planIn)
 		planOut, u, err := sl.Plan.RunIn(ctx, planIn, wt)
 		sl.Budget.Record("plan", u)
+		runTokensIn, runTokensOut = runTokensIn+u.TokensIn, runTokensOut+u.TokensOut
 		// 空 plan 防护（plan-execute-contract-drift）：plan 调用成功但产出空计划
 		// （Plan nil 或 len 0，即 `{"plan":null}` / `{"plan":[]}`）= 模型摆烂，视为
 		// 可重试失败——不进 execute（否则 execute 只能靠战报上下文瞎续，浪费整轮
@@ -509,9 +513,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		execPrompt += "上下文：若任务/issue 引用了设计文档或 spec，开工前先读相关章节；也可浏览仓库的 README/docs 了解项目约定与冻结接口，再动手。\n" +
 			"在当前目录实现任务，确保满足全部验收标准（若项目有测试，确保测试通过）。\n" +
+			"自报末尾固定附一段标题为「### 环境与复现」的说明：本轮安装的依赖、如何运行/验证你的改动（具体命令）、注意事项；没有特殊环境要求就写「无特殊环境要求」——该段会转给人审（tier-3）作现场说明。\n" +
 			"注意：不要执行 git add / git commit —— 只修改或创建文件；loop-eng 会自动捕获你的改动生成 diff。"
 		execOut, u2, err := exec.Exec(ctx, wt, execPrompt)
 		sl.Budget.Record("execute", u2)
+		runTokensIn, runTokensOut = runTokensIn+u2.TokensIn, runTokensOut+u2.TokensOut
 		if err != nil {
 			isolation.Discard(sl.Repo, wt)
 			sl.logf("[subloop] %s phase=execute fail: %v", sid, err)
@@ -562,7 +568,14 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// verify 的实际 token 计入与 per-call/per-task 闸在 budget.Client 装饰器内生效（verify
 		// LLM 的 Model 被包成 &budget.Client{Role:"verify"}）；这里补一行可审计的估算记录。
 		_ = sl.Store.AppendBudget(runID, "call", "verify", sl.Budget.Estimate("verify"), sl.Budget.PerCall)
-		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut, llm), diff, effTask.AcceptanceCriteria, priorFailure)
+		// 移交包（agent→人）：tier-3 到达时 Human tier 经 Chain 拿到完整现场
+		// （轮次/token/分支/机器已验过/环境/风险/历轮）——见 loop/handoff.go。
+		// verify 驳回短路时包无人消费，纯字符串无副作用。
+		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut, llm), diff, effTask.AcceptanceCriteria, priorFailure,
+			sl.buildHandoff(attempt, wt, branchName(taskID, attempt), planOut, criteriaRevised, execOut, runHistory, runTokensIn, runTokensOut))
+		// tier-2 真实用量（llm.Usage 由 verify.LLM.Check 旁路写回）计入 run 累计；
+		// 放 Chain 后：tier-1 短路时为零值，天然不虚增。
+		runTokensIn, runTokensOut = runTokensIn+llm.Usage.TokensIn, runTokensOut+llm.Usage.TokensOut
 		// NeedsHuman（tier-3 人审信号）记录进 verify trace；下面在 Passed 之前优先裁决。
 		// verifyTrace 写成结构化 JSON：驳回时 Detail 由 verify.detailFor 兜底永不空，
 		// 且 failing_criteria 随行落库——修 #10 黑箱（旧 trace 只剩空的 detail=）。
@@ -616,8 +629,30 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 在 Passed 之前裁决——NeedsHuman 优先于 done/反馈。注意：worktree 不丢弃（park 保留）。
 		if res.NeedsHuman {
 			sl.logf("[subloop] %s phase=verify done needs-human", sid)
+			// park 前先 commit（与 done 路径同款）：人审的工作进主仓库对象库后，人
+			// 回复 loop:accept 的落地（FF-merge / PR）不再依赖 worktree 存活——树被
+			// GC/清理也不丢已人审的提交。commit 失败降级为无 branch 的 park（现状）：
+			// 人审请求照发，accept 届时自然回落「带反馈重跑」路径，绝不因 commit 失败
+			// 丢 park。Outcome.Branch/Worktree 仅在 commit 成功时携带（daemon 据此记
+			// land_branch，accept 落地用它）。
+			parkBranch := branchName(taskID, attempt)
+			if cerr := commitWorktree(wt, parkBranch, landCommitMessage(task, taskID)); cerr != nil {
+				sl.logf("[subloop] %s park commit failed (park without branch): %v", sid, cerr)
+				parkBranch = ""
+			}
 			_ = sl.Store.ClearInFlight()
-			return sl.report(ctx, taskID, task, "needs-review", res.Detail), nil
+			out := sl.report(ctx, taskID, task, "needs-review", res.Detail)
+			if parkBranch != "" {
+				out.Branch = parkBranch
+				out.Worktree = wt
+				// park 分支落 land_branch（reconcile 只对 done 行消费该列，needs-review
+				// 行不受影响）：重派路径的 loop:accept 拦截据此找到待落地分支，无需
+				// 从评论/trace 反解。best-effort——失败只记日志（accept 届时回落重跑）。
+				if err := sl.Store.SetLandBranch(taskID, parkBranch); err != nil {
+					sl.logf("[subloop] %s park SetLandBranch failed: %v", sid, err)
+				}
+			}
+			return out, nil
 		}
 		if res.Passed {
 			sl.logf("[subloop] %s phase=verify done passed", sid)

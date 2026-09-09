@@ -32,14 +32,18 @@ type TaskRow struct {
 	// configured default. The daemon reads it back at dispatch to opt this task
 	// into a different provider stack (applyTaskAgent).
 	Agent string
-	// LandBranch records the branch a done task's work lives on when its issue is
+	// LandBranch records the branch a task's work lives on while its issue is
 	// deliberately left OPEN pending integration (PR created / LAND PARTIAL / land
-	// or commit failure sentinel). Non-empty ⟺ reconcile must NOT re-queue this
-	// done+open task (it is awaiting a PR merge, not a human reopen), and instead
-	// polls the branch for a merged PR to auto-close the issue. Empty ⟺ the old
-	// reopen semantics (locally landed + closed, later reopened by a human →
-	// re-queue). The "(unlanded)" sentinel marks a done task whose commitWorktree
-	// failed (no branch to merge) so reconcile still skips it.
+	// or commit failure sentinel), OR the branch a needs-review (tier-3 parked)
+	// task committed its human-reviewable work on — the resume path's loop:accept
+	// interception lands exactly that branch without re-running the loop. For done
+	// tasks: non-empty ⟺ reconcile must NOT re-queue this done+open task (it is
+	// awaiting a PR merge, not a human reopen), and instead polls the branch for a
+	// merged PR to auto-close the issue. Empty ⟺ the old reopen semantics (locally
+	// landed + closed, later reopened by a human → re-queue). The "(unlanded)"
+	// sentinel marks a done task whose commitWorktree failed (no branch to merge)
+	// so reconcile still skips it. needs-review rows carrying LandBranch are
+	// invisible to reconcile (it switches on done/blocked only).
 	LandBranch string
 }
 
@@ -934,7 +938,7 @@ type RunSummary struct {
 // limit 条最近的。供「run history 回灌」：plan/triage/execute 的跨 run 记忆改从
 // DB 构建（结构化、有界），不再靠读回 issue 里的战报评论（人可读写回，只写不读）。
 //
-// 排除：outcome='' 的未终结 run（当前正在跑的 run 自然被排除——EndRun 是 defer
+// 排除：outcome=” 的未终结 run（当前正在跑的 run 自然被排除——EndRun 是 defer
 // 收尾的）与 outcome='triage' 的分诊 run（分诊记账用的附属 run，非任务执行史）。
 // 每个 run 带其最后一次 verify step 的 output_json（驳回理由的结构化来源）。
 func (s *Store) RunHistoryByRef(ref string, limit int) ([]RunSummary, error) {
