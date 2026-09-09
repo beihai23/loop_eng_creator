@@ -32,6 +32,9 @@ func NewDaemonCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "daemon",
 		Short: "常驻 loop 引擎（轮询工单 + 单活跃子 loop + park/resume）",
+		// SilenceUsage：运行期错误（lock 冲突、preflight 缺依赖等）只报一行原因，
+		// 不 dump 完整 usage——usage 只在参数解析错误时才有意义（与 web 命令同款）。
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := mustLoad(repo)
 			// 单实例保护：在 <repo>/.loop/daemon.lock 上取独占 flock。两个 daemon 指向同一
@@ -247,14 +250,34 @@ func NewDaemonCmd() *cobra.Command {
 			defer cancel()
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			// shutdown 关闭 ⟺ 停机由信号触发。它区分「信号停机」与「真错误」：
+			// 信号触发的 context.Canceled 是正常退出路径，绝不能作为 RunE 错误
+			// 返回——否则 cobra 打印 "Error: context canceled" + 完整 usage，
+			// 把一次干净的 Ctrl+C 弄成命令失败。
+			shutdown := make(chan struct{})
 			go func() {
 				<-sigCh
-				fmt.Fprintln(os.Stderr, "[daemon] shutting down...")
+				// 恢复默认信号处理：优雅停机若被卡住（如收尾写回 hang 住），
+				// 第二次 Ctrl-C 直接终止进程——永远留一条强退通道。
+				signal.Stop(sigCh)
+				fmt.Fprintln(os.Stderr, "[daemon] shutting down…（再按一次 Ctrl-C 强制退出）")
 				cancel()
+				close(shutdown)
 			}()
 
-			fmt.Printf("[daemon] starting (poll=%s, channel=%s)\n", pollInterval, cfg.Channel.Provider)
-			return eng.Run(ctx)
+			fmt.Fprint(os.Stderr, banner())
+			// 横幅与运行日志之间留一个空行：身份块和日志是两种视觉层级。
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintf(os.Stderr, "[daemon] starting (poll=%s, channel=%s)\n", pollInterval, cfg.Channel.Provider)
+			runErr := eng.Run(ctx)
+			select {
+			case <-shutdown:
+				// 信号停机 = 正常退出（退出码 0，无 Error/usage）。
+				fmt.Fprintln(os.Stderr, "[daemon] shutdown complete")
+				return nil
+			default:
+				return runErr
+			}
 		},
 	}
 	cmd.Flags().StringVar(&repo, "repo", ".", "仓库路径")

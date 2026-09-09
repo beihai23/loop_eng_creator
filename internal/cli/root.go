@@ -11,6 +11,9 @@ func NewRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "loop-eng",
 		Short: "loop engineering 工具",
+		// Version 让 cobra 自动挂 --version：打印 "loop-eng version <v>"。
+		// 版本解析见 version.go（ldflags 注入 → git 短 hash 回退）。
+		Version: buildVersion(),
 	}
 	cmd.AddCommand(NewInitCmd())
 	cmd.AddCommand(NewConfigCmd())
