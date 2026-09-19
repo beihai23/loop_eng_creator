@@ -1,8 +1,8 @@
 ---
 arc: test-prep-exam-authority
 started: ef8f477
-status: open
-commits: [] # M1 落地待提交
+status: open # 代码已落地（M1+M2），观察清单等试点数据；数据到后追记再收弧
+commits: [3ceb19a, fb02a14] # M1 出题权分离 / M2 争议路由
 ---
 
 # 出题权分离：test-prep 角色（M1）
