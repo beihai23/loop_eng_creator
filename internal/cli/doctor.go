@@ -111,6 +111,15 @@ func providerPreflight(cfg *config.Config) []string {
 			issues = append(issues, fmt.Sprintf("[provider] models.%s (%s): %v", r.role, a.Provider(), err))
 		}
 	}
+	// test-prep 是可选角色：配置了才体检（零值走 legacy，不存在 CLI 可查）。
+	if tp := cfg.Models.TestPrep; !tp.IsZero() {
+		a, err := model.NewAgent(tp)
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("[provider] models.test_prep: %v", err))
+		} else if err := a.Check(context.Background()); err != nil {
+			issues = append(issues, fmt.Sprintf("[provider] models.test_prep (%s): %v", a.Provider(), err))
+		}
+	}
 	return issues
 }
 

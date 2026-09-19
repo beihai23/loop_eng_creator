@@ -44,7 +44,10 @@ var roleFloor = map[string]int{
 	"execute": 80000,
 	"verify":  20000,
 	"triage":  15000,
-	"help":    15000,
+	// test-prep（M1 出题权分离）：与 plan 同级——两者都是「只读探索 + 结构化
+	// 产出」的中等调用；首调用 floor 取保守下界，重试后吃上次真实用量。
+	"test-prep": 20000,
+	"help":      15000,
 }
 
 const defaultFloor = 20000

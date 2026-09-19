@@ -20,7 +20,7 @@ func TestTriageAccountsTokens(t *testing.T) {
 		Budget: config.Budget{PerCallTokens: 100000, PerTaskTokens: 1000000, MaxRetries: 3},
 	}
 	// buildModels(fake) 返回裸 triage skill（Model 未装饰），正是 runTriage 的输入契约。
-	_, _, _, triageSkill, _ := buildModels(cfg, "fake", budget.New(100000, 1000000, 3))
+	_, _, _, triageSkill, _, _ := buildModels(cfg, "fake", budget.New(100000, 1000000, 3))
 
 	tid, err := st.InsertTask(state.TaskRow{IssueRef: "T", Description: "triage 任务"})
 	if err != nil {
@@ -87,7 +87,7 @@ func TestTriageBudgetGateBlocksCall(t *testing.T) {
 	cfg := &config.Config{
 		Budget: config.Budget{PerCallTokens: 1000, PerTaskTokens: 50, MaxRetries: 3},
 	}
-	_, _, _, triageSkill, _ := buildModels(cfg, "fake", budget.New(1000, 50, 3))
+	_, _, _, triageSkill, _, _ := buildModels(cfg, "fake", budget.New(1000, 50, 3))
 
 	tid, err := st.InsertTask(state.TaskRow{IssueRef: "G", Description: "紧预算 triage"})
 	if err != nil {

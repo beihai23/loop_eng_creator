@@ -256,7 +256,7 @@ func TestTiersForPlanDriven(t *testing.T) {
 
 	// plan 产出合法脚本（纯命令）→ Deterministic 在链首。
 	with := skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "go-test", Run: []string{"go", "test", "./..."}}}
-	tiers := sl.tiersFor("/wt", with, sl.VerifyLLM)
+	tiers := sl.tiersFor("/wt", with.VerifyScript, sl.VerifyLLM)
 	if len(tiers) != 3 {
 		t.Fatalf("valid script: want 3 tiers (det+llm+human), got %d", len(tiers))
 	}
@@ -270,15 +270,14 @@ func TestTiersForPlanDriven(t *testing.T) {
 
 	// plan 产出带 body 的脚本 → body/file 透传到 Deterministic。
 	withBody := skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{File: "v.sh", Body: "echo ok", Run: []string{"sh", "v.sh"}}}
-	tiers2 := sl.tiersFor("/wt", withBody, sl.VerifyLLM)
+	tiers2 := sl.tiersFor("/wt", withBody.VerifyScript, sl.VerifyLLM)
 	d2, _ := tiers2[0].(verify.Deterministic)
 	if d2.ScriptFile != "v.sh" || d2.ScriptBody != "echo ok" {
 		t.Fatalf("script body/file not passed through: %+v", d2)
 	}
 
 	// plan 未产出 → 无 Deterministic，LLM 是链首。
-	none := skill.PlanOutput{}
-	tiers3 := sl.tiersFor("/wt", none, sl.VerifyLLM)
+	tiers3 := sl.tiersFor("/wt", nil, sl.VerifyLLM)
 	if _, ok := tiers3[0].(verify.Deterministic); ok {
 		t.Fatal("no script: tier[0] must NOT be Deterministic (tier-1 absent)")
 	}
@@ -288,7 +287,7 @@ func TestTiersForPlanDriven(t *testing.T) {
 
 	// plan 产出非法（缺 Run）→ 同样无 Deterministic。
 	invalid := skill.PlanOutput{VerifyScript: &skill.PlanVerifyScript{Label: "bad"}}
-	tiers4 := sl.tiersFor("/wt", invalid, sl.VerifyLLM)
+	tiers4 := sl.tiersFor("/wt", invalid.VerifyScript, sl.VerifyLLM)
 	if _, ok := tiers4[0].(verify.Deterministic); ok {
 		t.Fatal("invalid script: tier[0] must NOT be Deterministic (dropped to tier-2)")
 	}
@@ -1604,7 +1603,7 @@ func TestSubLoopEmptyPlanBlocks(t *testing.T) {
 		name     string
 		planJSON string
 	}{
-		{"nil Plan 字段 (JSON null)", mustJSON(skill.PlanOutput{})},                // Plan nil → {"plan":null}
+		{"nil Plan 字段 (JSON null)", mustJSON(skill.PlanOutput{})},                        // Plan nil → {"plan":null}
 		{"空 plan slice (JSON [])", mustJSON(skill.PlanOutput{Plan: []skill.PlanStep{}})}, // len 0 → {"plan":[]}
 	} {
 		t.Run(tc.name, func(t *testing.T) {

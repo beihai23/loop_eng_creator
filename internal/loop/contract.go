@@ -29,8 +29,8 @@ const maxContractRunes = 20000
 // planContract 是 PlanOutput 的合同投影——回灌/注入只带约束实现的两块：
 // 冻结的步骤（含签名）与 tier-1 验收脚本。risks/revised_criteria 走原有通道。
 type planContract struct {
-	Plan         []skill.PlanStep         `json:"plan"`
-	VerifyScript *skill.PlanVerifyScript  `json:"verify_script,omitempty"`
+	Plan         []skill.PlanStep        `json:"plan"`
+	VerifyScript *skill.PlanVerifyScript `json:"verify_script,omitempty"`
 }
 
 // contractOf 从一次 plan 产出提取合同投影（JSON）。空 plan / 序列化失败返回空串
@@ -70,7 +70,9 @@ func (sl *SubLoop) loadPriorPlanContract(ref string) string {
 // executeContractSection 构造 execute prompt 的「本轮实现合同」段：plan 冻结的
 // 步骤（含签名）+ tier-1 验收脚本全文。execute 过去从来看不到这两样——它要猜
 // tier-1 按什么判，#71 三轮振荡的直接根源。空合同（plan 未产出步骤）返回空串。
-func executeContractSection(planOut skill.PlanOutput) string {
+// script 是本轮生效的 tier-1 脚本（legacy = planOut.VerifyScript；M1 出题权分离 =
+// test-prep 考卷里的脚本——判 execute 的是这份，与参数解耦以免食源切换时展示错卷）。
+func executeContractSection(planOut skill.PlanOutput, script *skill.PlanVerifyScript) string {
 	if len(planOut.Plan) == 0 {
 		return ""
 	}
@@ -87,7 +89,7 @@ func executeContractSection(planOut skill.PlanOutput) string {
 		}
 		b.WriteString("\n")
 	}
-	if vs := planOut.VerifyScript; vs != nil && vs.Valid() {
+	if vs := script; vs != nil && vs.Valid() {
 		b.WriteString("\ntier-1 验收脚本")
 		if vs.File != "" {
 			b.WriteString("（将写入 " + vs.File)

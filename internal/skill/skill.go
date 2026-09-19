@@ -130,6 +130,11 @@ type PlanInput struct {
 	// instructs default-stability (keep the contract unless the rejection proves
 	// the contract itself wrong). Empty = no prior contract.
 	PriorPlanContract string
+	// ExamSeparate 标记「出题权已移交 test-prep」（M1，models.test_prep 已配置）：
+	// plan.md 据此隐藏验收标准评审与 verify_script 职责段，产出瘦身为
+	// plan+risks+agent_hints。false = legacy（plan 兼出题，模板渲染与旧版一致）。
+	// 仅作 prompt 模板开关，不进任何 JSON 合同。
+	ExamSeparate bool
 }
 type PlanStep struct {
 	Step     string   `json:"step"`
@@ -160,6 +165,48 @@ type PlanOutput struct {
 	// nil = no hint (role config governs). See AgentHints for the selection
 	// priority and validation semantics.
 	AgentHints *AgentHints `json:"agent_hints,omitempty"`
+}
+
+// TestPrepInput 是 test-prep（M1 出题权分离）的输入——按白名单制构造：调用方
+// 只允许喂 {需求全文, 标准原件, 上一轮考卷}，实现侧产物（plan 输出、被拒 diff、
+// verify 判决）一律不进。依据：被考的是实施侧联合产物，考卷必须从「被要求的」
+// 导出、不从「被打算的」导出——plan 输出若进考卷，考卷对「plan 误读需求」这类
+// 最上游错误结构性失明（自我评分的温柔版）。串行时序下 diff 尚不存在，对实现
+// 的盲是天然的；plan 输出是唯一在时序上先于出题存在的实施侧产物，故白名单
+// 只需显式禁它。
+type TestPrepInput struct {
+	Task string
+	// AcceptanceCriteria 是 issue 标准原件（ground truth 合同的原始形态）——
+	// test-prep 的出题对象，不是它的产出上限（可评审修订，防放水铁律见模板）。
+	AcceptanceCriteria []string
+	// Body is the full raw issue text（背景/约束/上下文）。Task 只是首行蒸馏，
+	// 出题以全文为准。
+	Body string
+	// PriorExam 是上一轮 attempt/run 的考卷（TestPrepOutput JSON 原文）——
+	// 出题铁律「默认沿用上轮考卷，仅证据证明考卷本身错误才修订」的载体。
+	// 空 = 首次出题（无既往考卷）。
+	PriorExam string
+}
+
+// TestPrepOutput 是 test-prep 的产出：有效验收合同（考卷正文）+ tier-1 脚本 +
+// 审计轨迹。Criteria 是全量合同（非 diff）：非空时下游（execute prompt /
+// verify.Chain / 驳回评论）一律按它走；空 = 出题失败/摆烂，调用方回落 issue
+// 原版标准（可用性优先，见 subloop 的回落路径）。
+type TestPrepOutput struct {
+	// Criteria 是 test-prep 承诺的最终验收合同（完整列表，不是 diff）。出题人
+	// 评审 issue 原件后澄清/改写/删除的版本——execute 按它实现、verify 按它判。
+	// 空列表按「出题失败」处理，调用方回落 issue 原版（可用性优先）。
+	Criteria []string `json:"criteria"`
+	// CriteriaNotes 是出题说明（为什么每条被澄清/改写/删除）——审计轨迹，
+	// 落 steps.output_json 并进 done/blocked 战报，tier-3 人审的阅读对象。
+	CriteriaNotes string `json:"criteria_notes,omitempty"`
+	// VerifyScript 是 tier-1 验收脚本，复用 PlanVerifyScript 类型（改名会破坏
+	// preflight 冻结签名，见方案文档「设计决定 7」）。nil/invalid ⇒ tier-1 缺席
+	// ⇒ 落 tier-2，与 plan 产出脚本的既有语义完全一致。
+	VerifyScript *PlanVerifyScript `json:"verify_script,omitempty"`
+	// Risks 是出题人拿不准的点（如「原标准 X 疑似与任务描述矛盾，已保守保留」）
+	// ——进移交包（tier-3 人审）与战报，提请人注意。
+	Risks []string `json:"risks,omitempty"`
 }
 
 // PlanVerifyScript is the plan-produced tier-1 acceptance script: a runnable

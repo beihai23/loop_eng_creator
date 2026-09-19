@@ -924,6 +924,25 @@ func (s *Store) LatestPlanOutputByRef(ref string) (string, error) {
 	return out, err
 }
 
+// LatestTestPrepOutputByRef 返回该 issue_ref 最近一次成功 test-prep step 的
+// output_json（TestPrepOutput：criteria/verify_script），供「上轮考卷回灌」：
+// test-prep 每轮是全新会话，跨 run 看不到前任的考卷就会盲重出——判分基准漂移、
+// M1 出题权分离的修订轨迹跨 run 断裂。与 LatestPlanOutputByRef 同款机制。
+// 查不到返回空串 + nil error（按「无既往考卷」处理，首次出题）。
+func (s *Store) LatestTestPrepOutputByRef(ref string) (string, error) {
+	var out string
+	err := s.db.QueryRow(
+		`SELECT s.output_json FROM steps s
+		 JOIN runs r ON r.id = s.run_id
+		 JOIN tasks t ON t.id = r.task_id
+		 WHERE t.issue_ref = ? AND s.role = 'test-prep' AND s.status = 'ok'
+		 ORDER BY s.at DESC LIMIT 1`, ref).Scan(&out)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return out, err
+}
+
 // RunSummary 是 run history 的一行：一个已终结 run 的结局 + 该 run 最后一次
 // verify step 的原始 output_json。VerifyOutput 保持原始 JSON（state 不解析
 // loop 的 verifyTrace 形状——与 LatestExecuteOutputByRef 返回原始 output_json

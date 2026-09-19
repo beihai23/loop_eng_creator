@@ -110,10 +110,11 @@ func NewDaemonCmd() *cobra.Command {
 				// 任务级 agent override：daemon 从 issue 摄取的 task.Agent 覆盖各角色 provider
 				// （agent: codex → 该任务全程用 codex）。未知 provider 静默回落 config 默认。
 				taskCfg := applyTaskAgent(cfg, task.Agent)
-				exec, plan, verifySkill, _, help := buildModels(taskCfg, models, bz)
+				exec, plan, verifySkill, _, help, tp := buildModels(taskCfg, models, bz)
 
-				// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
-				// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
+				// tier-1 不再从 config 接入——legacy 由 plan 每轮按任务产出验收脚本；
+				// M1 启用 test-prep 后由考卷产出。SubLoop.tiersFor 据此挂 tier-1（在当前
+				// worktree 里跑）。无静态/兜底列表。
 				sl := &loop.SubLoop{
 					Repo:              repo,
 					Store:             st,
@@ -121,6 +122,7 @@ func NewDaemonCmd() *cobra.Command {
 					Execute:           exec,
 					Plan:              plan,
 					Help:              help,
+					TestPrep:          tp,
 					VerifyLLM:         verify.LLM{Skill: verifySkill},
 					Tier3Human:        taskCfg.Verify.Tier3Human,
 					HumanTier:         humanTierFor(taskCfg, ch, task.IssueRef),
@@ -130,6 +132,9 @@ func NewDaemonCmd() *cobra.Command {
 					ExecuteModelRef:   providerLabel(taskCfg.Models.Execute),
 					VerifyModelRef:    providerLabel(taskCfg.Models.Verify),
 					AgentForRole:      agentForRole(taskCfg),
+				}
+				if tp != nil {
+					sl.TestPrepModelRef = providerLabel(taskCfg.Models.TestPrep)
 				}
 
 				ct := channel.Task{
@@ -192,7 +197,7 @@ func NewDaemonCmd() *cobra.Command {
 			// triageFn 再用 task.ID 作 scope key 落一行 ledger（triage 无 runID——append-only
 			// trace，不影响 run 级 Replay）。满足 issue 实质诉求：triage token 不丢弃、记账、受闸、可审计。
 			triageBz := budget.New(cfg.Budget.PerCallTokens, cfg.Budget.PerTaskTokens, cfg.Budget.MaxRetries)
-			_, _, _, triageSkill, _ := buildModels(cfg, models, triageBz)
+			_, _, _, triageSkill, _, _ := buildModels(cfg, models, triageBz)
 			triageFn := func(ctx context.Context, task state.TaskRow) (skill.TriageOutput, error) {
 				// 预算刹车·每调用 token（triage）：记录被检查的估算 vs PerCall（与 plan/execute/
 				// verify 同款）。triage 的实际 token 计入与 per-call/per-task 闸在 budget.Client

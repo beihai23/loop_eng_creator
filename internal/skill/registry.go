@@ -15,4 +15,6 @@ var Defaults = []Entry{
 	{Name: "plan", Version: "1", DefaultEmbedPath: "internal/cli/embed/skills/plan.md"},
 	{Name: "verify", Version: "1", DefaultEmbedPath: "internal/cli/embed/skills/verify.md"},
 	{Name: "help", Version: "1", DefaultEmbedPath: "internal/cli/embed/skills/help.md"},
+	// M1 出题权分离：验收合同 + tier-1 脚本的独立出题人（models.test_prep 启用）。
+	{Name: "test-prep", Version: "1", DefaultEmbedPath: "internal/cli/embed/skills/test-prep.md"},
 }

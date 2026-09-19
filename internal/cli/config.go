@@ -316,6 +316,8 @@ func roleMeaning(role string) string {
 		return "执行：在隔离 worktree 里动手改代码"
 	case "verify":
 		return "验证：独立复核改动是否满足验收标准"
+	case "test-prep":
+		return "出题（可选）：独立出验收考卷与 tier-1 脚本（出题权分离，不启用则 plan 兼出题）"
 	}
 	return ""
 }

@@ -55,7 +55,14 @@ type SubLoop struct {
 	// report into the blocked battle report. Zero value (Model == nil) → SubLoop
 	// falls back to the deterministic synthesizeHelp, so tests that do not wire
 	// Help are unaffected and a blocked report always carries the three fields.
-	Help              skill.Skill[skill.HelpInput, skill.HelpOutput]
+	Help skill.Skill[skill.HelpInput, skill.HelpOutput]
+	// TestPrep 非空（models.test_prep 已配置）时启用 M1 出题权分离：plan 之后插入
+	// test-prep step，验收合同 + tier-1 脚本由 test-prep 盲出（输入白名单：需求全文/
+	// 标准原件/repo/上轮考卷，永不见 plan 输出——被考侧产物是泄题材料）。nil = legacy
+	// （plan 兼出题，RevisedCriteria/VerifyScript 语义与旧版完全一致）。回滚开关。
+	TestPrep *skill.Skill[skill.TestPrepInput, skill.TestPrepOutput]
+	// TestPrepModelRef 进 steps.model_ref（"who ran this step"），同 PlanModelRef 惯例。
+	TestPrepModelRef  string
 	VerifyLLM         verify.LLM  // tier2
 	Tier3Human        bool        // tier3 开关：true 时挂 tier-3（HumanTier，否则回落 HumanStub）
 	HumanTier         verify.Tier // M3 真 tier-3 人审 tier；nil 时回落 HumanStub（自动通过占位）
@@ -111,17 +118,19 @@ func shortID(id string) string {
 	return id
 }
 
-// tiersFor 在每轮按 worktree + plan 产出重建 tier 链：tier1（plan 产出的验收脚本，
-// 在 wt 里跑）→ tier2 → tier3。llm 是本轮生效的 tier-2（可能被 plan 的 agent_hints
-// 步骤级 override 替换，见 #71-B）。
+// tiersFor 在每轮按 worktree + 考卷产出重建 tier 链：tier1（验收脚本，在 wt 里跑）
+// → tier2 → tier3。llm 是本轮生效的 tier-2（可能被 plan 的 agent_hints 步骤级
+// override 替换，见 #71-B）。script 是本轮生效的 tier-1 脚本——legacy 时来自
+// plan（planOut.VerifyScript），M1 出题权分离时来自 test-prep 的考卷（调用方
+// 解析好传入，本函数不关心食源）。
 //
-// tier-1 完全来自 plan（planOut.VerifyScript），无任何静态/兜底列表：
-//   - plan 产出且 Valid（非空、有运行命令）→ 挂 tier-1（Dir=wt，脚本 body 先落盘）。
-//   - plan 未产出（VerifyScript=nil）→ tier-1 缺席，链直接落 tier-2。
-//   - plan 产出了但非法（缺运行命令等）→ Run 已记一行，这里同样跳过，落 tier-2。
-func (sl *SubLoop) tiersFor(wt string, planOut skill.PlanOutput, llm verify.LLM) []verify.Tier {
+// tier-1 无任何静态/兜底列表：
+//   - 脚本产出且 Valid（非空、有运行命令）→ 挂 tier-1（Dir=wt，脚本 body 先落盘）。
+//   - 未产出（nil）→ tier-1 缺席，链直接落 tier-2。
+//   - 产出了但非法（缺运行命令等）→ Run 已记一行，这里同样跳过，落 tier-2。
+func (sl *SubLoop) tiersFor(wt string, script *skill.PlanVerifyScript, llm verify.LLM) []verify.Tier {
 	var tiers []verify.Tier
-	if s := planOut.VerifyScript; s.Valid() {
+	if s := script; s.Valid() {
 		tiers = append(tiers, verify.Deterministic{
 			Label:      labelOf(s),
 			Cmd:        s.Run,
@@ -288,6 +297,14 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	// plan 每轮是全新会话，看不到前任冻结的签名就会盲重设计（#71 三轮 4→3→2
 	// 振荡的病根）。run 内每轮 plan 成功后就地更新它。
 	lastPlanContract := sl.loadPriorPlanContract(task.Ref)
+	// 上轮考卷回灌（跨 run，M1 出题权分离）：test-prep 启用时按 issue_ref 读回
+	// 上一轮考卷——出题人每轮是全新会话，看不到前任考卷就会盲重出、判分基准漂移，
+	// 修订轨迹跨 run 断裂。run 内每轮 test-prep 成功后就地更新（对下一 attempt
+	// 总是喂最新的）。legacy 不读（无 test-prep step 可写）。
+	priorExam := ""
+	if sl.TestPrep != nil {
+		priorExam = sl.loadPriorExam(task.Ref)
+	}
 	// sceneKept：重试耗尽的末轮被驳回时保留的 worktree（供人排查/复用；GC 按 TTL
 	// 清理）。非末轮的 attempt 树仍即建即弃——diff 已进 lastRejectedDiff 与
 	// steps.output_json，弃树不丢信息。
@@ -350,13 +367,17 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			// 不干扰首次规划。承载在独立字段（不进 BattleReport）：这是「如何规划」的元指令，
 			// 与「发生了什么」的战报分离——经 plan embed 的 {{.RetryDiagnosis}} 条件块渲染进
 			// planPrompt，落进 plan step 的 input_json（attempt≥2 的 seq≥20 行）可审计。
-			RetryDiagnosis: retryDiagnosisFor(attempt, priorFailure),
+			// M1 出题权分离时抑制（plan 无 revised_criteria 可行使，见 testprep.go）。
+			RetryDiagnosis: retryDiagnosisForAttempt(sl.TestPrep != nil, attempt, priorFailure),
 			// 失败现场（plan 侧）：上一轮被驳回实现的 diff（截断后）。与 RetryDiagnosis
 			// 分工：诊断是「为什么被驳回」的元指令，这是「实际写了什么」的现场。
 			RejectedDiff: truncateSceneDiff(lastRejectedDiff),
 			// 合同回灌（plan 侧）：上一轮冻结的实现合同——默认保持稳定，防每轮
 			// 盲重设计签名（#71 振荡）。
 			PriorPlanContract: lastPlanContract,
+			// M1 出题权分离：启用时 plan.md 隐藏验收标准评审与 verify_script 职责段
+			// （出题权归 test-prep，plan 只规划实施）。
+			ExamSeparate: sl.TestPrep != nil,
 		}
 		// 把喂给 plan 的原始提示词落进 step trace（input_json）——dashboard 详情页
 		// 的「初始提示词」读它。RenderPrompt 与 Plan.Run 内部渲染同一模板+输入，
@@ -420,21 +441,56 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 合同回灌（run 内）：本轮 plan 冻结的合同成为下一轮 plan 的 PriorPlanContract
 		// （attempt N+1 的 plan 不再盲重设计）。
 		lastPlanContract = contractOf(planOut)
-		// plan 产出验收脚本但非法（缺运行命令等）→ tier-1 缺席，落 tier-2。记一行可观测。
-		// plan 未产出是正常分支（判定不可脚本化 → tier-2），不算异常，不打 warning。
-		if vs := planOut.VerifyScript; vs != nil && !vs.Valid() {
-			sl.logf("[subloop] %s plan verify_script invalid (run command missing?) — skip tier-1, fall to tier-2", sid)
-		}
 
-		// 有效验收标准：plan 行使评审权（RevisedCriteria 非 nil）时以 plan 承诺的
-		// 版本为准——execute 按它实现、verify 按它判；未修订（nil）沿用 issue 原版。
-		// effTask 仅替换标准（verifyFailComment 的签名被测试钉死，从调用点喂修订版）。
+		// ---- 有效验收标准 + tier-1 脚本的食源（M1 出题权分离的分叉点）----
+		//   - legacy（TestPrep==nil）：plan 兼出题——plan 行使评审权（RevisedCriteria
+		//     非 nil）时以 plan 承诺的版本为准；tier-1 用 planOut.VerifyScript。
+		//     旧版行为逐字节一致（含 seq 布局 +1/+2/+3）。
+		//   - 启用（TestPrep!=nil）：plan 后插 test-prep step（seq+2），验收合同 +
+		//     tier-1 脚本由 test-prep 盲出；基础设施错误/空考卷回落 issue 原版标准、
+		//     tier-1 缺席（可用性优先，triage-gate arc 同款：出题器挂了不阻塞 loop）。
+		//     seq 顺延：execute=+3、verify=+4。
+		// effTask 仅替换标准（verifyFailComment 的签名被测试钉死，从调用点喂考卷版）。
 		effTask := task
-		criteriaRevised := planOut.RevisedCriteria != nil
-		if criteriaRevised {
-			effTask.AcceptanceCriteria = *planOut.RevisedCriteria
-			sl.logf("[subloop] %s plan revised acceptance criteria: %d → %d 条 (%s)",
-				sid, len(task.AcceptanceCriteria), len(*planOut.RevisedCriteria), truncateStr(planOut.CriteriaNotes, 80))
+		var exam *skill.TestPrepOutput
+		var effScript *skill.PlanVerifyScript
+		examNotes := ""
+		criteriaRevised := false
+		if sl.TestPrep == nil {
+			effScript = planOut.VerifyScript
+			// plan 产出验收脚本但非法（缺运行命令等）→ tier-1 缺席，落 tier-2。记一行可观测。
+			// plan 未产出是正常分支（判定不可脚本化 → tier-2），不算异常，不打 warning。
+			if vs := planOut.VerifyScript; vs != nil && !vs.Valid() {
+				sl.logf("[subloop] %s plan verify_script invalid (run command missing?) — skip tier-1, fall to tier-2", sid)
+			}
+			criteriaRevised = planOut.RevisedCriteria != nil
+			if criteriaRevised {
+				effTask.AcceptanceCriteria = *planOut.RevisedCriteria
+				sl.logf("[subloop] %s plan revised acceptance criteria: %d → %d 条 (%s)",
+					sid, len(task.AcceptanceCriteria), len(*planOut.RevisedCriteria), truncateStr(planOut.CriteriaNotes, 80))
+			}
+		} else {
+			var tpUsage model.Usage
+			exam, tpUsage = sl.runTestPrep(ctx, taskID, runID, attempt, task, priorExam, wt)
+			runTokensIn, runTokensOut = runTokensIn+tpUsage.TokensIn, runTokensOut+tpUsage.TokensOut
+			if exam != nil {
+				priorExam = examJSONOf(exam) // 考卷回灌（run 内）：下一 attempt 默认沿用
+				effScript = exam.VerifyScript
+				if vs := exam.VerifyScript; vs != nil && !vs.Valid() {
+					sl.logf("[subloop] %s test-prep verify_script invalid (run command missing?) — skip tier-1, fall to tier-2", sid)
+				}
+				if len(exam.Criteria) > 0 {
+					effTask.AcceptanceCriteria = exam.Criteria
+					examNotes = exam.CriteriaNotes
+					sl.logf("[subloop] %s test-prep authored exam: %d 条 criteria (%s)",
+						sid, len(exam.Criteria), truncateStr(exam.CriteriaNotes, 80))
+				} else {
+					// 空考卷 = 出题摆烂：回落 issue 原版标准（ground truth），交 tier-2 判。
+					sl.logf("[subloop] %s test-prep returned empty criteria — fall back to issue criteria", sid)
+				}
+			} else {
+				sl.logf("[subloop] %s test-prep unavailable — fall back to issue criteria, no tier-1", sid)
+			}
 		}
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
@@ -456,6 +512,12 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		llm.Usage = &model.Usage{}
 
 		// ---- execute (in the attempt's worktree, created before plan) ----
+		// seq 布局：legacy = plan(+1)/execute(+2)/verify(+3)；启用 test-prep =
+		// plan(+1)/test-prep(+2)/execute(+3)/verify(+4)（retry-gate 恒 +9）。
+		seqExec, seqVerify := 2, 3
+		if sl.TestPrep != nil {
+			seqExec, seqVerify = 3, 4
+		}
 		sl.logf("[subloop] %s phase=execute start", sid)
 		_ = sl.Store.SetInFlight(taskID, "execute")
 		execEst := sl.Budget.Estimate("execute")
@@ -470,15 +532,19 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		execPrompt := "EXECUTE: 你在一个 git worktree 里（当前工作目录即工作区）。\n" +
 			"任务: " + task.Description + "\n" +
 			"验收标准:\n" + criteriaBlock(effTask.AcceptanceCriteria) + "\n"
-		// plan 修订过标准时把修订理由也告诉 execute——它实现的是 plan 承诺的合同，
-		// 知道「为什么改」才能不在被删除/改写的条款上浪费力气或自作主张补回。
-		if criteriaRevised && planOut.CriteriaNotes != "" {
+		// 标准不是 issue 原文直通时把理由也告诉 execute——它实现的是被承诺的合同，
+		// 知道「为什么是这份考卷」才能不在被删除/改写的条款上浪费力气或自作主张补回。
+		switch {
+		case sl.TestPrep != nil && examNotes != "":
+			execPrompt += "（以上验收标准由 test-prep 独立出题：" + examNotes + "——你按这份考卷实现，verify 按它判）\n"
+		case criteriaRevised && planOut.CriteriaNotes != "":
 			execPrompt += "（以上验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）\n"
 		}
 		// 合同可见性（execute 侧）：plan 冻结的步骤（含签名）+ tier-1 验收脚本直达
 		// execute——被合同约束的人必须能看到合同。#71 三轮 blocked 的病根就是
 		// execute 看不到 plan 冻结的 parseClaudeResult 签名，每轮瞎猜一个。
-		execPrompt += executeContractSection(planOut)
+		// M1 启用时脚本段展示 test-prep 的考卷（判它的是这份，不是 plan 的）。
+		execPrompt += executeContractSection(planOut, effScript)
 		// 编译错误特化（#46）：上一轮 verify 驳回若是编译/构建类错误，作为独立且显眼的段
 		// 直达 execute prompt——不埋进下面的战报散文（issue 评论）。这是确定性、可机械判定
 		// 的杠杆：字符串特征命中 + prompt 拼装，直接命中 #46「execute 连续多轮不修编译错误」
@@ -526,7 +592,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 				return sl.report(ctx, taskID, task, "blocked", "fatal model error: "+err.Error()), nil
 			}
 			priorFailure = "execute error: " + err.Error()
-			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "fail", ModelRef: execModelRef, InputJSON: execPrompt, Error: err.Error()})
+			sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + seqExec, Role: "execute", Status: "fail", ModelRef: execModelRef, InputJSON: execPrompt, Error: err.Error()})
 			// 增益门槛（execute error）：同签名连续失败 → 零增益升级 blocked。wt 已 Discard。
 			if out, esc := sl.escalateIfZeroGain(ctx, taskID, task.Ref, task, runID, attempt, priorFailure, "", false, &prevFailureSig); esc {
 				return out, nil
@@ -550,7 +616,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			Out  string `json:"out"`
 			Diff string `json:"diff"`
 		}{Out: execOut, Diff: diff})
-		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + 2, Role: "execute", Status: "ok", ModelRef: execModelRef, InputJSON: execPrompt, OutputJSON: string(rec), TokensIn: u2.TokensIn, TokensOut: u2.TokensOut})
+		sl.Store.AppendStep(state.StepRow{RunID: runID, Seq: attempt*10 + seqExec, Role: "execute", Status: "ok", ModelRef: execModelRef, InputJSON: execPrompt, OutputJSON: string(rec), TokensIn: u2.TokensIn, TokensOut: u2.TokensOut})
 		sl.logf("[subloop] %s phase=execute done", sid)
 
 		// 协作式 cancel：phase 边界自查（spec §4.5/§7）。命中则提前以 cancelled 收尾。
@@ -571,8 +637,8 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		// 移交包（agent→人）：tier-3 到达时 Human tier 经 Chain 拿到完整现场
 		// （轮次/token/分支/机器已验过/环境/风险/历轮）——见 loop/handoff.go。
 		// verify 驳回短路时包无人消费，纯字符串无副作用。
-		res, err := verify.Chain(ctx, sl.tiersFor(wt, planOut, llm), diff, effTask.AcceptanceCriteria, priorFailure,
-			sl.buildHandoff(attempt, wt, branchName(taskID, attempt), planOut, criteriaRevised, execOut, runHistory, runTokensIn, runTokensOut))
+		res, err := verify.Chain(ctx, sl.tiersFor(wt, effScript, llm), diff, effTask.AcceptanceCriteria, priorFailure,
+			sl.buildHandoff(attempt, wt, branchName(taskID, attempt), planOut, exam, criteriaRevised, execOut, runHistory, runTokensIn, runTokensOut))
 		// tier-2 真实用量（llm.Usage 由 verify.LLM.Check 旁路写回）计入 run 累计；
 		// 放 Chain 后：tier-1 短路时为零值，天然不虚增。
 		runTokensIn, runTokensOut = runTokensIn+llm.Usage.TokensIn, runTokensOut+llm.Usage.TokensOut
@@ -586,7 +652,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			FailingCriteria: res.FailingCriteria,
 		})
 		sl.Store.AppendStep(state.StepRow{
-			RunID: runID, Seq: attempt*10 + 3, Role: "verify",
+			RunID: runID, Seq: attempt*10 + seqVerify, Role: "verify",
 			Status:     statusOf2(res.Passed),
 			ModelRef:   verifyModelRef,
 			OutputJSON: string(vt),
@@ -672,10 +738,14 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 					" [land: worktree commit failed: "+cerr.Error()+"; worktree preserved at "+wt+"]"), nil
 			}
 			_ = sl.Store.ClearInFlight()
-			// plan 修订过验收标准时，在 done 战报里留人可见的审计线索（tier-3 人审
-			// 与 issue 读者能看到「按修订版判过」及理由）。
+			// 标准经出题人评审/出题时，在 done 战报里留人可见的审计线索（tier-3 人审
+			// 与 issue 读者能看到「按这份考卷判过」及理由——M1 启用时是 test-prep 的
+			// 出题说明，legacy 时是 plan 的修订说明）。
 			doneDetail := res.Detail
-			if criteriaRevised {
+			switch {
+			case exam != nil && examNotes != "":
+				doneDetail += "\n（验收标准由 test-prep 独立出题：" + examNotes + "）"
+			case criteriaRevised:
 				doneDetail += "\n（验收标准经 plan 评审修订：" + planOut.CriteriaNotes + "）"
 			}
 			out := sl.report(ctx, taskID, task, "done", doneDetail)

@@ -16,10 +16,10 @@ import (
 
 // ---- key 构造助手 ----
 
-func kEnter() tea.KeyMsg  { return tea.KeyMsg{Type: tea.KeyEnter} }
-func kDown() tea.KeyMsg   { return tea.KeyMsg{Type: tea.KeyDown} }
-func kUp() tea.KeyMsg     { return tea.KeyMsg{Type: tea.KeyUp} }
-func kCtrlC() tea.KeyMsg  { return tea.KeyMsg{Type: tea.KeyCtrlC} }
+func kEnter() tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyEnter} }
+func kDown() tea.KeyMsg  { return tea.KeyMsg{Type: tea.KeyDown} }
+func kUp() tea.KeyMsg    { return tea.KeyMsg{Type: tea.KeyUp} }
+func kCtrlC() tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyCtrlC} }
 func kRunes(s string) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 }
@@ -60,16 +60,17 @@ func TestWizardGitHubDefaultFlow(t *testing.T) {
 	stubGHLabelCreate(t, nil)
 	w, dir := newTestWizard(t)
 	drive(t, w,
-		kEnter(),       // welcome → channel
-		kDown(),        // github
-		kEnter(),       // 选定 → repo 输入
+		kEnter(), // welcome → channel
+		kDown(),  // github
+		kEnter(), // 选定 → repo 输入
 		kRunes("myorg/myrepo"),
-		kEnter(),       // repo 确认 → 标签选择
-		kEnter(),       // 用默认标签 → 标签创建步骤
-		kEnter(),       // 现在就创建 → scope
-		kEnter(),       // 全局 → agent
-		kEnter(),       // 第一个（claude）→ confirm
-		kEnter(),       // 保存 → done
+		kEnter(), // repo 确认 → 标签选择
+		kEnter(), // 用默认标签 → 标签创建步骤
+		kEnter(), // 现在就创建 → scope
+		kEnter(), // 全局 → agent
+		kEnter(), // 第一个（claude）→ test-prep 取舍
+		kEnter(), // test-prep 不启用 → confirm
+		kEnter(), // 保存 → done
 	)
 	if !w.saved {
 		t.Fatalf("flow should end saved, step=%v quit=%v err=%q", w.step, w.quit, w.errMsg)
@@ -95,8 +96,9 @@ func TestWizardGitHubCustomLabel(t *testing.T) {
 		kRunes("myorg/myrepo"), kEnter(),
 		kDown(), kEnter(), // 自定义标签前缀
 		kRunes("ai"), kEnter(),
-		kEnter(),                   // 标签创建步骤：现在就创建
-		kEnter(), kEnter(), kEnter(), // scope 全局 → claude → 保存
+		kEnter(),                     // 标签创建步骤：现在就创建
+		kEnter(), kEnter(), kEnter(), // 全局 → claude → test-prep 不启用
+		kEnter(), // 保存
 	)
 	if !w.saved {
 		t.Fatalf("should be saved, err=%q", w.errMsg)
@@ -125,12 +127,12 @@ func TestWizardPerRoleAgents(t *testing.T) {
 	w, dir := newTestWizard(t)
 	drive(t, w,
 		kEnter(), kEnter(), // welcome → channel → local
-		kEnter(),           // inbox 用预填默认
-		kDown(), kEnter(),  // scope=逐角色
+		kEnter(),          // inbox 用预填默认
+		kDown(), kEnter(), // scope=逐角色
 	)
 	// 4 个角色：triage=第1个, plan=第2个, execute=第1个, verify=第1个
 	drive(t, w, kEnter(), kDown(), kEnter(), kEnter(), kEnter())
-	drive(t, w, kEnter()) // confirm 保存
+	drive(t, w, kEnter(), kEnter()) // test-prep 不启用 → confirm 保存
 	if !w.saved {
 		t.Fatalf("should be saved, err=%q", w.errMsg)
 	}
@@ -183,7 +185,8 @@ func TestWizardGuidanceRenders(t *testing.T) {
 	if v := w.View(); !strings.Contains(v, "任务分诊") {
 		t.Fatalf("per-role view missing role meaning:\n%s", v)
 	}
-	drive(t, w, kEnter(), kEnter(), kEnter(), kEnter()) // 选完 4 角色 → confirm
+	drive(t, w, kEnter(), kEnter(), kEnter(), kEnter()) // 选完 4 角色 → test-prep 取舍
+	drive(t, w, kEnter())                               // test-prep 不启用 → confirm
 	if v := w.View(); !strings.Contains(v, "确认配置") || !strings.Contains(v, "任务来源") {
 		t.Fatalf("confirm view missing summary:\n%s", v)
 	}
@@ -229,7 +232,7 @@ func TestWizardLabelsCreateOK(t *testing.T) {
 	calls := stubGHLabelCreate(t, nil)
 	w, dir := newTestWizard(t)
 	driveGitHubToLabelsStep(t, w)
-	drive(t, w, kEnter(), kEnter(), kEnter(), kEnter()) // 创建 → scope 全局 → claude → 保存
+	drive(t, w, kEnter(), kEnter(), kEnter(), kEnter(), kEnter()) // 创建 → 全局 → claude → test-prep 不启用 → 保存
 	if !w.saved {
 		t.Fatalf("should be saved, err=%q", w.errMsg)
 	}
@@ -290,9 +293,12 @@ func TestWizardCustomPrefixEmptyFallsBack(t *testing.T) {
 		kEnter(), kDown(), kEnter(),
 		kRunes("myorg/myrepo"), kEnter(),
 		kDown(), kEnter(), // 自定义标签前缀
-		kEnter(),          // 留空回车 → 默认
-		kEnter(),          // 标签创建步骤
-		kEnter(), kEnter(), kEnter(), // 全局 → claude → 保存
+		kEnter(), // 留空回车 → 默认
+		kEnter(), // 标签创建步骤 → scope
+		kEnter(), // 全局 → agent
+		kEnter(), // claude → test-prep 取舍
+		kEnter(), // test-prep 不启用 → confirm
+		kEnter(), // 保存
 	)
 	if !w.saved {
 		t.Fatalf("should be saved, err=%q", w.errMsg)
@@ -318,10 +324,13 @@ func TestWizardRerunKeepsCustomPrefix(t *testing.T) {
 	w = newWizard(dir, w.cfg)
 	drive(t, w,
 		kEnter(), kDown(), kEnter(), // welcome → channel → github
-		kEnter(),       // repo 预填 myorg/myrepo → 直接回车
-		kEnter(),       // 用默认标签（=保持现状）
-		kEnter(),       // 标签创建步骤
-		kEnter(), kEnter(), kEnter(), // 全局 → claude → 保存
+		kEnter(), // repo 预填 myorg/myrepo → 直接回车
+		kEnter(), // 用默认标签（=保持现状）
+		kEnter(), // 标签创建步骤 → scope
+		kEnter(), // 全局 → agent
+		kEnter(), // claude → test-prep 取舍
+		kEnter(), // test-prep 不启用 → confirm
+		kEnter(), // 保存
 	)
 	if !w.saved {
 		t.Fatalf("should be saved, err=%q", w.errMsg)

@@ -64,6 +64,8 @@ const (
 	stepScope
 	stepAgentGlobal
 	stepAgentRole
+	stepTestPrepOpt   // M1 出题权分离：启用/不启用（可选角色，默认不启用）
+	stepTestPrepAgent // 启用时：选 test-prep 的引擎
 	stepConfirm
 	stepDone
 )
@@ -82,12 +84,12 @@ type wizard struct {
 	cfgDir string // .loop dir (scaffolded by caller)
 
 	step   wizStep
-	cursor int           // selected option index in menu steps
-	input  []rune        // text-input buffer in input steps
-	errMsg string        // inline validation error (red), cleared on next keystroke
-	roleIx int           // per-role agent picking: which role we're on
-	roles  []string      // fixed role order for stepAgentRole
-	agents []wzOption    // agent menu built from the registry
+	cursor int        // selected option index in menu steps
+	input  []rune     // text-input buffer in input steps
+	errMsg string     // inline validation error (red), cleared on next keystroke
+	roleIx int        // per-role agent picking: which role we're on
+	roles  []string   // fixed role order for stepAgentRole
+	agents []wzOption // agent menu built from the registry
 
 	// answers
 	provider    string
@@ -96,13 +98,16 @@ type wizard struct {
 	labelPrefix string // 状态标签族前缀（空 = "loop:"；自定义时 taskLabel=prefix+"task"）
 	labelNote   string // 标签创建步骤的结果说明（confirm/done 页展示）
 	inbox       string
-	keyChoice string // "1"=env 指令, "2"=写 .loop/linear.key
-	linearKey string
-	project   string
-	team      string
-	statusMap string
-	scope     string // "1"=全局, "2"=逐角色
-	agentPick map[string]string // role → provider (全局时全部同值)
+	keyChoice   string // "1"=env 指令, "2"=写 .loop/linear.key
+	linearKey   string
+	project     string
+	team        string
+	statusMap   string
+	scope       string            // "1"=全局, "2"=逐角色
+	agentPick   map[string]string // role → provider (全局时全部同值)
+
+	tpEnable bool   // test-prep（出题权分离）启用与否；false=legacy（plan 兼出题）
+	tpAgent  string // 启用时 test-prep 的 provider
 
 	saved bool
 	quit  bool // ctrl+c before save
@@ -122,6 +127,11 @@ func newWizard(repo string, cfg *config.Config) *wizard {
 		roles:     []string{"triage", "plan", "execute", "verify"},
 		agents:    agents,
 		agentPick: map[string]string{},
+		// test-prep（M1 出题权分离）的「保持现状」基线：再配置场景从现有 config
+		// 预填——不触碰 test-prep 步的默认答案是「维持现状」，重跑向导不会把已
+		// 启用的出题权分离静默抹掉；显式选「不启用」才会清零。
+		tpEnable: !cfg.Models.TestPrep.IsZero(),
+		tpAgent:  cfg.Models.TestPrep.Provider,
 		// 再配置场景的「保持现状」基线：labelPrefix 从现有 config 预填——选
 		// 「用默认标签」路径不动它（只改 taskLabel），否则重跑向导会把已有的
 		// 自定义前缀静默抹回 "loop:"（task_label 与 label_prefix 配对撕裂）。
@@ -449,6 +459,33 @@ func (w *wizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				w.advance()
 			}
 		}
+	case stepTestPrepOpt:
+		// 可选角色：默认高亮「不启用」（光标落在 0）；已启用的再配置场景光标
+		// 预置在「启用」上（advance() 里置），回车即维持现状。
+		opts := w.testPrepOptions()
+		if w.keySelect(key, len(opts)) {
+			return w, nil
+		}
+		if i := jumpSelect(key, len(opts)); i >= 0 {
+			w.cursor = i
+		}
+		if key.String() == "enter" {
+			w.tpEnable = opts[w.cursor].Value == "1"
+			w.cursor = 0
+			w.advance()
+		}
+	case stepTestPrepAgent:
+		if w.keySelect(key, len(w.agents)) {
+			return w, nil
+		}
+		if i := jumpSelect(key, len(w.agents)); i >= 0 {
+			w.cursor = i
+		}
+		if key.String() == "enter" {
+			w.tpAgent = w.agents[w.cursor].Value
+			w.cursor = 0
+			w.advance()
+		}
 	case stepConfirm:
 		opts := []wzOption{
 			{Value: "save", Label: "保存配置", Desc: "写入 .loop/config.yaml"},
@@ -563,7 +600,32 @@ func (w *wizard) advance() {
 			w.step = stepAgentGlobal
 		}
 	case stepAgentGlobal, stepAgentRole:
+		// 引擎选完进 test-prep 取舍步；已启用的再配置场景光标预置在「启用」上，
+		// 回车即维持现状（不静默抹掉已有配置）。
+		w.step = stepTestPrepOpt
+		if w.tpEnable {
+			w.cursor = 1
+		} else {
+			w.cursor = 0
+		}
+	case stepTestPrepOpt:
+		if w.tpEnable {
+			w.step = stepTestPrepAgent
+			w.cursor = 0
+		} else {
+			w.tpAgent = "" // 显式不启用：清引擎选择，保存时 TestPrep 清零
+			w.step = stepConfirm
+		}
+	case stepTestPrepAgent:
 		w.step = stepConfirm
+	}
+}
+
+// testPrepOptions 是 stepTestPrepOpt 的菜单项（opt-in：默认不启用=legacy）。
+func (w *wizard) testPrepOptions() []wzOption {
+	return []wzOption{
+		{Value: "0", Label: "不启用（默认，推荐先用这个）", Desc: "plan 兼出题，行为与现有版本一致"},
+		{Value: "1", Label: "启用出题权分离（test-prep）", Desc: "验收标准+tier-1 脚本由独立出题人盲出，plan 只做实施规划"},
 	}
 }
 
@@ -603,6 +665,14 @@ func (w *wizard) applyAndSave() error {
 	}
 	for role, p := range w.agentPick {
 		setRoleProvider(cfg, role, p)
+	}
+	// test-prep 是显式取舍（不是「没提到=保持」）：启用 → 写入（readonly 强制，
+	// 出题人绝不落笔）；不启用 → 清零——否则再配置场景选了「不启用」也抹不掉
+	// 旧的 test_prep 段。
+	if w.tpEnable && w.tpAgent != "" {
+		cfg.Models.TestPrep = config.ModelRef{Provider: w.tpAgent, Binary: w.tpAgent, ReadOnly: true}
+	} else {
+		cfg.Models.TestPrep = config.ModelRef{}
 	}
 	return config.Save(filepath.Join(w.cfgDir, "config.yaml"), cfg)
 }
@@ -774,6 +844,20 @@ func (w *wizard) View() string {
 			[]string{roleMeaning(role), "直接回车选高亮项；对应的 CLI 需要已安装并登录。"},
 			w.agents, w.cursor))
 
+	case stepTestPrepOpt:
+		b.WriteString(renderMenu("第 3 步 · 出题权分离（可选）",
+			[]string{
+				"test-prep 是可选的「测试工程师」角色：在实现开始前独立出验收考卷",
+				"（验收标准 + tier-1 脚本），看不到实施方案——开发与测试互相独立。",
+				"不启用则维持现状：plan 既做实施规划、也兼出题。",
+			},
+			w.testPrepOptions(), w.cursor))
+
+	case stepTestPrepAgent:
+		b.WriteString(renderMenu("选择 test-prep 引擎（独立出题人）",
+			[]string{"出题人只读探索仓库（强制 readonly），对应的 CLI 需要已安装并登录。"},
+			w.agents, w.cursor))
+
 	case stepConfirm:
 		b.WriteString(wzStep.Render("确认配置") + "\n\n")
 		for _, line := range w.summaryLines() {
@@ -845,6 +929,11 @@ func (w *wizard) summaryLines() []string {
 	}
 	for _, role := range w.roles {
 		lines = append(lines, fmt.Sprintf("%s（%s）: %s", role, roleMeaning(role), w.agentPick[role]))
+	}
+	if w.tpEnable && w.tpAgent != "" {
+		lines = append(lines, "test-prep（出题权分离）: "+w.tpAgent+"（只读，独立出题）")
+	} else {
+		lines = append(lines, "test-prep: 未启用（plan 兼出题）")
 	}
 	return lines
 }

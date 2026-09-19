@@ -72,7 +72,7 @@ func TestTier1VerifyDirBudgetPreCheck(t *testing.T) {
 // tiers[0]=llm。Tier 接口签名 / 链结构不变。
 func TestTier1VerifyDirTiersForInjects(t *testing.T) {
 	sl := &SubLoop{}
-	tiers := sl.tiersFor("/wt-x", skill.PlanOutput{}, verify.LLM{})
+	tiers := sl.tiersFor("/wt-x", nil, verify.LLM{})
 	got, ok := tiers[0].(verify.LLM)
 	if !ok {
 		t.Fatalf("tier[0] must be verify.LLM, got %T", tiers[0])

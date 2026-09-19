@@ -47,6 +47,11 @@ type Models struct {
 	Plan    ModelRef `yaml:"plan"`
 	Execute ModelRef `yaml:"execute"`
 	Verify  ModelRef `yaml:"verify"`
+	// TestPrep 是 M1 出题权分离的可选角色：验收合同 + tier-1 脚本由 test-prep
+	// 盲出（不见 plan 输出），plan 只规划实施。零值（yaml 不配 test_prep）=
+	// legacy——plan 兼出题，行为与旧版完全一致；这就是本特性的回滚开关。
+	// 建议配 readonly: true（与 plan 同款只读探索 profile）。
+	TestPrep ModelRef `yaml:"test_prep,omitempty"`
 }
 type ModelRef struct {
 	Provider string   `yaml:"provider"`
@@ -61,6 +66,14 @@ type ModelRef struct {
 	// zero-value (false) out of the YAML, so existing config.yaml parses with
 	// zero migration and execute (ReadOnly=false) round-trips unchanged.
 	ReadOnly bool `yaml:"readonly,omitempty"`
+}
+
+// IsZero reports whether the ref is entirely unset. ModelRef 含切片字段（Cmd），
+// 不可比较（==），零值判定集中在这里。test-prep 的启用判定（IsZero=legacy /
+// 非 zero=启用）与 applyTaskAgent 的「未配置不得误启用」都走它。
+func (r ModelRef) IsZero() bool {
+	return r.Provider == "" && r.Name == "" && r.Via == "" && r.Binary == "" &&
+		len(r.Cmd) == 0 && !r.ReadOnly
 }
 
 type Budget struct {
@@ -124,6 +137,11 @@ func (c *Config) validate() error {
 		if r.ref.Name == "" && r.ref.Binary == "" {
 			return fmt.Errorf("models.%s 未配置（需 name 或 binary 之一）", r.role)
 		}
+	}
+	// test-prep 是可选角色：零值 = legacy（合法，开关关）；一旦配置了任何字段
+	// 就必须能组装 Client（name 或 binary 之一），与其他角色同一硬门槛。
+	if tp := c.Models.TestPrep; !tp.IsZero() && tp.Name == "" && tp.Binary == "" {
+		return fmt.Errorf("models.test_prep 已配置但不完整（需 name 或 binary 之一；不启用请整段删除）")
 	}
 	if c.Channel.Provider == "github" && (c.Channel.Repo == "" || c.Channel.TaskLabel == "") {
 		return fmt.Errorf("channel: github provider 需 repo 与 task_label")

@@ -19,10 +19,12 @@ const maxEnvNotesRunes = 4000
 
 // buildHandoff 组装 agent→人的移交包。branch 是本轮 park 前将 commit 的分支名
 // （branchName(taskID, attempt)）——即使本轮最终未 park（verify 驳回短路），
-// 包里的分支名也只是无人消费的字符串，无副作用。criteriaRevised 时带 plan 的
-// 修订理由（人审的审计线索：按修订版判过）。
+// 包里的分支名也只是无人消费的字符串，无副作用。人审的审计线索（CriteriaNotes）
+// 按 M1 出题权分离分叉：exam 非 nil 时带 test-prep 的出题说明 + 出题人 risks
+// （与 plan 的实施 risks 合并——移交包的读者关心全部「拿不准的点」）；legacy 时
+// criteriaRevised 才带 plan 的修订理由（按修订版判过）。
 func (sl *SubLoop) buildHandoff(attempt int, wt, branch string, planOut skill.PlanOutput,
-	criteriaRevised bool, execOut, runHistory string, tokensIn, tokensOut int) verify.Handoff {
+	exam *skill.TestPrepOutput, criteriaRevised bool, execOut, runHistory string, tokensIn, tokensOut int) verify.Handoff {
 	ho := verify.Handoff{
 		Attempt:    attempt,
 		MaxRetries: sl.Budget.MaxRetries,
@@ -33,6 +35,13 @@ func (sl *SubLoop) buildHandoff(attempt int, wt, branch string, planOut skill.Pl
 		Risks:      planOut.Risks,
 		TokensIn:   tokensIn,
 		TokensOut:  tokensOut,
+	}
+	if exam != nil {
+		ho.CriteriaNotes = exam.CriteriaNotes
+		if len(exam.Risks) > 0 {
+			ho.Risks = append(append([]string{}, planOut.Risks...), exam.Risks...)
+		}
+		return ho
 	}
 	if criteriaRevised {
 		ho.CriteriaNotes = planOut.CriteriaNotes

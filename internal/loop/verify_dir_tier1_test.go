@@ -65,7 +65,7 @@ func TestTier1VerifyRunsInWorktree(t *testing.T) {
 func TestTier1TiersForInjectsWorktree(t *testing.T) {
 	sl := &SubLoop{}
 	llm := verify.LLM{}
-	tiers := sl.tiersFor("/wt-x", skill.PlanOutput{}, llm)
+	tiers := sl.tiersFor("/wt-x", nil, llm)
 	got, ok := tiers[0].(verify.LLM)
 	if !ok {
 		t.Fatalf("tier[0] must be verify.LLM, got %T", tiers[0])

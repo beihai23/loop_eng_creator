@@ -25,7 +25,7 @@ func TestBuildHandoffWiresAllFields(t *testing.T) {
 		Risks:         []string{"并发路径未覆盖"},
 		CriteriaNotes: "删掉了不可脚本化的第 3 条",
 	}
-	ho := sl.buildHandoff(2, "/wt", "loop/task_x-r2", planOut, true,
+	ho := sl.buildHandoff(2, "/wt", "loop/task_x-r2", planOut, nil, true,
 		"实现完成。\n### 环境与复现\n跑 make test", "- verify-FAIL — 缺错误处理", 100, 50)
 	if ho.Attempt != 2 || ho.MaxRetries != 3 {
 		t.Fatalf("attempt/maxRetries 接线错误: %d/%d", ho.Attempt, ho.MaxRetries)
@@ -49,9 +49,35 @@ func TestBuildHandoffWiresAllFields(t *testing.T) {
 		t.Fatalf("RunHistory 接线错误: %q", ho.RunHistory)
 	}
 	// 未修订时不带 CriteriaNotes（人审评论里不应出现空审计线索）。
-	ho2 := sl.buildHandoff(1, "/wt", "b", planOut, false, "", "", 0, 0)
+	ho2 := sl.buildHandoff(1, "/wt", "b", planOut, nil, false, "", "", 0, 0)
 	if ho2.CriteriaNotes != "" {
 		t.Fatalf("未修订不应带 CriteriaNotes: %q", ho2.CriteriaNotes)
+	}
+}
+
+// TestBuildHandoffExamAudit（M1 出题权分离）：exam 非 nil 时 CriteriaNotes 来自
+// test-prep 的出题说明，risks 与 plan 的实施 risks 合并；plan 的 criteriaRevised
+// 不再参与（出题权已移交）。
+func TestBuildHandoffExamAudit(t *testing.T) {
+	sl := &SubLoop{Budget: budget.New(1000, 10000, 3)}
+	planOut := skill.PlanOutput{
+		Plan:          []skill.PlanStep{{Step: "s"}},
+		Risks:         []string{"实施风险"},
+		CriteriaNotes: "plan 的修订说明（不应出现）",
+		// RevisedCriteria 非 nil 也应被忽略——legacy 语义只在 exam==nil 时生效。
+		RevisedCriteria: &[]string{"x"},
+	}
+	exam := &skill.TestPrepOutput{
+		Criteria:      []string{"c1", "c2"},
+		CriteriaNotes: "test-prep 出题说明",
+		Risks:         []string{"出题风险"},
+	}
+	ho := sl.buildHandoff(1, "/wt", "b", planOut, exam, false, "", "", 0, 0)
+	if ho.CriteriaNotes != "test-prep 出题说明" {
+		t.Fatalf("exam 启用时 CriteriaNotes 应来自 test-prep: %q", ho.CriteriaNotes)
+	}
+	if len(ho.Risks) != 2 || ho.Risks[0] != "实施风险" || ho.Risks[1] != "出题风险" {
+		t.Fatalf("exam 启用时 Risks 应合并 plan+test-prep: %v", ho.Risks)
 	}
 }
 

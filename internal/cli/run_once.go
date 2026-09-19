@@ -57,10 +57,11 @@ func NewRunOnceCmd() *cobra.Command {
 			// 任务级 agent override：issue frontmatter `agent: codex` 把整任务切到指定
 			// provider（覆盖各角色默认）。未知 provider 静默回落 config 默认（不崩进程）。
 			cfg = applyTaskAgent(cfg, tasks[0].Agent)
-			exec, plan, verifySkill, _, help := buildModels(cfg, models, bz)
+			exec, plan, verifySkill, _, help, tp := buildModels(cfg, models, bz)
 
-			// tier-1 不再从 config 接入——plan 每轮按任务产出验收脚本，SubLoop.tiersFor
-			// 据此挂 tier-1（在当前 worktree 里跑）。无静态/兜底列表。
+			// tier-1 不再从 config 接入——legacy 由 plan 每轮按任务产出验收脚本；
+			// M1 启用 test-prep 后由考卷产出。SubLoop.tiersFor 据此挂 tier-1（在当前
+			// worktree 里跑）。无静态/兜底列表。
 			sl := &loop.SubLoop{
 				Repo:            repo,
 				Store:           st,
@@ -68,6 +69,7 @@ func NewRunOnceCmd() *cobra.Command {
 				Execute:         exec,
 				Plan:            plan,
 				Help:            help,
+				TestPrep:        tp,
 				VerifyLLM:       verify.LLM{Skill: verifySkill},
 				Tier3Human:      cfg.Verify.Tier3Human,
 				HumanTier:       humanTierFor(cfg, ch, tasks[0].Ref),
@@ -76,6 +78,9 @@ func NewRunOnceCmd() *cobra.Command {
 				ExecuteModelRef: providerLabel(cfg.Models.Execute),
 				VerifyModelRef:  providerLabel(cfg.Models.Verify),
 				AgentForRole:    agentForRole(cfg),
+			}
+			if tp != nil {
+				sl.TestPrepModelRef = providerLabel(cfg.Models.TestPrep)
 			}
 			out, err := sl.Run(context.Background(), tasks[0])
 			// Integrate done work + decide close-vs-defer (finalizeLand). Same
@@ -195,25 +200,37 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	vs skill.Skill[skill.VerifyInput, skill.VerifyOutput],
 	triage skill.Skill[skill.TriageInput, skill.TriageOutput],
 	help skill.Skill[skill.HelpInput, skill.HelpOutput],
+	tp *skill.Skill[skill.TestPrepInput, skill.TestPrepOutput],
 ) {
+	// test-prep（M1 出题权分离）可选：models.test_prep 未配置 = nil = legacy
+	// （plan 兼出题，SubLoop 行为与旧版一致）；配置了才装配。cfg nil（部分测试）
+	// 同未配置。
+	tpEnabled := cfg != nil && !cfg.Models.TestPrep.IsZero()
 	if mode == "fake" {
 		// fakeHelp: help skill 的 fake 输出（零增益 blocked 战报的结构化求助占位）。
 		fakeHelp := skill.HelpOutput{}
 		fakeHelp.HelpRequest.StuckAt = "（fake）零增益卡住"
 		fakeHelp.HelpRequest.Tried = []string{"（fake）已重试多轮，失败签名相同"}
 		fakeHelp.HelpRequest.NeedFromHuman = "（fake）请人决策合同/补信息/排查环境"
-		f := model.NewFake(map[string]string{
+		entries := map[string]string{
 			"TRIAGE:":  jsonStr(skill.TriageOutput{Startable: true, LoopDoable: true}),
 			"PLAN:":    jsonStr(skill.PlanOutput{Plan: []skill.PlanStep{{Step: "实现任务以满足验收标准"}}}),
 			"EXECUTE:": "ok",
 			"VERIFY:":  jsonStr(skill.VerifyOutput{Passed: true}),
 			"HELP:":    jsonStr(fakeHelp),
-		})
+		}
+		if tpEnabled {
+			entries["TEST-PREP:"] = jsonStr(skill.TestPrepOutput{Criteria: []string{"（fake）验收标准一", "（fake）验收标准二"}})
+		}
+		f := model.NewFake(entries)
 		exec = f
 		plan = skill.Skill[skill.PlanInput, skill.PlanOutput]{Name: "plan", PromptTmpl: mustSkillPrompt("plan"), ParseJSON: parseJSON[skill.PlanOutput], Model: f}
 		vs = skill.Skill[skill.VerifyInput, skill.VerifyOutput]{Name: "verify", PromptTmpl: mustSkillPrompt("verify"), ParseJSON: parseJSON[skill.VerifyOutput], Model: &budget.Client{Base: f, Enf: bz, Role: "verify"}}
 		triage = skill.Skill[skill.TriageInput, skill.TriageOutput]{Name: "triage", PromptTmpl: mustSkillPrompt("triage"), ParseJSON: parseJSON[skill.TriageOutput], Model: &budget.Client{Base: f, Enf: bz, Role: "triage"}}
 		help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: &budget.Client{Base: f, Enf: bz, Role: "help"}}
+		if tpEnabled {
+			tp = &skill.Skill[skill.TestPrepInput, skill.TestPrepOutput]{Name: "test-prep", PromptTmpl: mustSkillPrompt("test-prep"), ParseJSON: parseJSON[skill.TestPrepOutput], Model: f}
+		}
 		return
 	}
 	// real: dispatch each role's agent by config.ModelRef.Provider via NewAgent
@@ -237,6 +254,11 @@ func buildModels(cfg *config.Config, mode string, bz *budget.Enforcer) (
 	// Verify），help 与 triage 同属分类/诊断类，按 spec §8.8 原设计接线上（模板/类型早就在，
 	// 本次补接线）。零增益 blocked 战报由此产出结构化 stuck_at/tried/need_from_human。
 	help = skill.Skill[skill.HelpInput, skill.HelpOutput]{Name: "help", PromptTmpl: mustSkillPrompt("help"), ParseJSON: parseJSON[skill.HelpOutput], Model: &budget.Client{Base: model.AsClient(mustAgent(cfg.Models.Triage)), Enf: bz, Role: "help"}}
+	// test-prep 挂 raw client：subloop 的 runTestPrep 手动包预算（Estimate/BeforeCall/
+	// Record），与 plan/execute 同款——这里再包 budget.Client 会双计。
+	if tpEnabled {
+		tp = &skill.Skill[skill.TestPrepInput, skill.TestPrepOutput]{Name: "test-prep", PromptTmpl: mustSkillPrompt("test-prep"), ParseJSON: parseJSON[skill.TestPrepOutput], Model: model.AsClient(mustAgent(cfg.Models.TestPrep))}
+	}
 	return
 }
 
@@ -291,8 +313,20 @@ func applyTaskAgent(cfg *config.Config, agent string) *config.Config {
 		Plan:    forProvider(cfg.Models.Plan, agent),
 		Execute: forProvider(cfg.Models.Execute, agent),
 		Verify:  forProvider(cfg.Models.Verify, agent),
+		// test-prep 只在已配置时跟随任务级 override——未配置（零值）保持零值，
+		// 否则 agent: codex 会把 legacy 任务误推进 M1 出题权分离模式。
+		TestPrep: forProviderIfSet(cfg.Models.TestPrep, agent),
 	}
 	return &clone
+}
+
+// forProviderIfSet 是 forProvider 的保零值变体：ref 零值（未配置）原样返回。
+// test-prep 的「未配置 = legacy 开关关」语义靠它在对 override 时存活。
+func forProviderIfSet(ref config.ModelRef, provider string) config.ModelRef {
+	if ref.IsZero() {
+		return ref
+	}
+	return forProvider(ref, provider)
 }
 
 // forProvider resets a ModelRef to a provider's defaults: provider+binary set to
