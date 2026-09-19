@@ -140,6 +140,18 @@ func TestTestPrepEmbedRenders(t *testing.T) {
 			t.Fatalf("test-prep prompt 缺少 %q", want)
 		}
 	}
+	// M2 争议路由：DisputePacket 非空渲染修订模式段；空时不渲染（正常出题）。
+	withDispute := renderTemplate(t, tp.PromptTmpl, skill.TestPrepInput{
+		AcceptanceCriteria: []string{"标准甲"},
+		PriorExam:          `{"criteria":["旧考卷"]}`,
+		DisputePacket:      "归因指控：标准甲 exam（证据：不可判定）",
+	})
+	if !strings.Contains(withDispute, "考卷争议") || !strings.Contains(withDispute, "修订纪律") || !strings.Contains(withDispute, "归因指控") {
+		t.Fatalf("争议包应渲染修订模式段:\n%s", withDispute)
+	}
+	if strings.Contains(prompt, "考卷争议") {
+		t.Fatalf("无争议包不应渲染修订模式段:\n%s", prompt)
+	}
 }
 
 // TestPlanEmbedExamSeparate：plan.md 的 ExamSeparate 条件化——启用时验收标准评审

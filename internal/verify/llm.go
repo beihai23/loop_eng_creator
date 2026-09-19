@@ -44,7 +44,27 @@ func (l LLM) Check(ctx context.Context, diff string, criteria []string, priorFai
 		Passed:          out.Passed,
 		Detail:          detailFor(out),
 		FailingCriteria: out.FailingCriteria,
+		FailureClasses:  validClasses(out.FailureClasses),
 	}, nil
+}
+
+// validClasses 过滤归因分类：只保留 class ∈ {work, exam, requirement} 且 criterion
+// 非空的条目——LLM 输出不可信（tier-1 契约同款宽容纪律：提示词要求 ≠ 模型必然
+// 照办，解析端永不报错、不发明），杂讯按「未分类」处理（路由回落 work）。
+func validClasses(in []skill.FailureClass) []skill.FailureClass {
+	var out []skill.FailureClass
+	for _, fc := range in {
+		switch fc.Class {
+		case "work", "exam", "requirement":
+		default:
+			continue
+		}
+		if strings.TrimSpace(fc.Criterion) == "" {
+			continue
+		}
+		out = append(out, fc)
+	}
+	return out
 }
 
 // detailFor 把 verify skill 的结构化输出（skill.VerifyOutput）落成 VerifyResult.Detail。

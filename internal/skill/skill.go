@@ -186,6 +186,12 @@ type TestPrepInput struct {
 	// 出题铁律「默认沿用上轮考卷，仅证据证明考卷本身错误才修订」的载体。
 	// 空 = 首次出题（无既往考卷）。
 	PriorExam string
+	// DisputePacket 是 M2 争议路由的修订触发器：上一轮 verify 驳回中归因为 exam
+	// （考卷缺陷）的指控 + 证据。空 = 正常出题（盲，默认沿用）；非空 = 修订模式
+	// ——这是「知情修订」的合法通道：首考保持盲（独立性），争议时带着实现侧
+	// 证据修订（可解性，#47 的自动化形态）。全文落 input_json 可审计，tier-3
+	// 人审的复核对象就是这段。
+	DisputePacket string
 }
 
 // TestPrepOutput 是 test-prep 的产出：有效验收合同（考卷正文）+ tier-1 脚本 +
@@ -268,10 +274,28 @@ type VerifyInput struct {
 	AcceptanceCriteria []string
 	PriorFailureSignal string
 }
+
+// FailureClass 是 verify 驳回时对单条未满足标准的归因分类（M2 争议路由）：
+//   - work：实现未做好/未做完（默认类——争议路由不触发，走既有重试）；
+//   - exam：考卷缺陷（标准误读需求 / 不可判定 / 结构性不可满足）→ 争议包回灌
+//     test-prep 知情修订；
+//   - requirement：需求本身矛盾/缺关键信息 → 挂 needs-human-decision 等人裁决。
+//
+// 铁律见 verify.md：exam/requirement 是严肃指控，必须给具体 evidence；拿不准
+// 一律归 work（宁重试、不轻易上交人）。
+type FailureClass struct {
+	Criterion string `json:"criterion"`
+	Class     string `json:"class"` // work | exam | requirement
+	Evidence  string `json:"evidence,omitempty"`
+}
+
 type VerifyOutput struct {
 	Passed          bool     `json:"passed"`
 	Reason          string   `json:"reason"`
 	FailingCriteria []string `json:"failing_criteria"`
+	// FailureClasses 是可选的归因分类（M2）：旧输出/未给出 → nil → 全按 work
+	// 处理（路由零兼容成本，现行为不变）。仅 Passed=false 时有意义。
+	FailureClasses []FailureClass `json:"failure_classes,omitempty"`
 }
 
 type HelpInput struct {

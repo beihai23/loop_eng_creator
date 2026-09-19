@@ -26,8 +26,10 @@ import (
 )
 
 // Outcome is the terminal result of a SubLoop.Run. Status is one of
-// done | blocked | needs-info | needs-review (M1 only produces done/blocked;
-// needs-review is M3 machinery). On done, Worktree+Branch identify where the
+// done | blocked | needs-info | needs-review | needs-human-decision (M1 only
+// produces done/blocked; needs-review is M3 machinery; needs-human-decision
+// is M2's requirement-dispute park — the requirement itself needs a human
+// ruling, retries cannot self-heal). On done, Worktree+Branch identify where the
 // committed work lives so the caller can land it on main (the execute model is
 // forbidden from committing, so SubLoop captures the diff on the worktree's
 // branch and hands the branch off).
@@ -305,6 +307,11 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 	if sl.TestPrep != nil {
 		priorExam = sl.loadPriorExam(task.Ref)
 	}
+	// 考卷争议包（M2 争议路由）：上一轮 verify 驳回中归因为 exam 的指控 + 证据。
+	// 空串 = 正常出题；非空 = 下一轮 test-prep 进修订模式（知情修订，testprep
+	// 白名单的唯一设计例外）。每次驳回就地重建（无 exam 类指控即清空——考卷
+	// 没被指控时不该带着陈旧争议出题）。
+	examDispute := ""
 	// sceneKept：重试耗尽的末轮被驳回时保留的 worktree（供人排查/复用；GC 按 TTL
 	// 清理）。非末轮的 attempt 树仍即建即弃——diff 已进 lastRejectedDiff 与
 	// steps.output_json，弃树不丢信息。
@@ -471,7 +478,7 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 			}
 		} else {
 			var tpUsage model.Usage
-			exam, tpUsage = sl.runTestPrep(ctx, taskID, runID, attempt, task, priorExam, wt)
+			exam, tpUsage = sl.runTestPrep(ctx, taskID, runID, attempt, task, priorExam, examDispute, wt)
 			runTokensIn, runTokensOut = runTokensIn+tpUsage.TokensIn, runTokensOut+tpUsage.TokensOut
 			if exam != nil {
 				priorExam = examJSONOf(exam) // 考卷回灌（run 内）：下一 attempt 默认沿用
@@ -755,6 +762,23 @@ func (sl *SubLoop) Run(ctx context.Context, task channel.Task) (out Outcome, err
 		}
 		// 不过 → 反馈，下一轮重试
 		sl.logf("[subloop] %s phase=verify done rejected: %s", sid, res.Detail)
+
+		// ---- M2 争议路由（先于驳回评论与重试机器）----
+		// tier-2 的归因分类（FailureClasses；旧输出/未分类 = nil = 全 work，现行为）。
+		//   requirement → 需求本身矛盾/缺信息：重试无意义（实现与考卷都可能没错），
+		//     挂 needs-human-decision 等人裁决——复用 triage-gate 全套基建
+		//     （评论/打标/pollSignals/resume），SubLoop 只负责返回该状态。树即弃
+		//     （diff 已在 execute step output_json，跨 run 现场回灌照常）。
+		//   exam → 考卷被指控：争议包就地重建，回灌下一轮 test-prep 知情修订。
+		//   work → 现行路径（examDispute 清空——考卷没被指控不带陈旧争议出题）。
+		if hasClass(res.FailureClasses, "requirement") {
+			isolation.Discard(sl.Repo, wt)
+			sl.logf("[subloop] %s verify dispute: requirement → needs-human-decision (park)", sid)
+			_ = sl.Store.ClearInFlight()
+			return sl.report(ctx, taskID, task, "needs-human-decision", requirementDisputeComment(res)), nil
+		}
+		examDispute = examDisputeOf(res)
+
 		// verify 不过必给「失败理由 + 改进建议」，落进 issue 评论：纯人可读写回
 		// （驳回不再黑箱）。带 bot 标记——collectIssueComments 会滤除它（只写不读）；
 		// 下一轮/跨 run 的驳回理由改由 DB 的 verify step + BuildRunHistory 传递。
@@ -1072,6 +1096,20 @@ func verifyFailComment(task channel.Task, attempt int, res verify.VerifyResult) 
 		b.WriteString("（verify 驳回但未给出理由——请逐条复核验收标准）")
 	}
 	b.WriteString("\n\n")
+
+	// 归因分类（M2 争议路由，模型给出时展示）：人看到的不再是「失败了」，还有
+	// 「谁的责任」——work=实现问题、exam=考卷被指控、requirement=需求问题。
+	if len(res.FailureClasses) > 0 {
+		b.WriteString("### 归因分类\n")
+		for _, fc := range res.FailureClasses {
+			line := "- " + truncateStr(fc.Criterion, 200) + " → " + fc.Class
+			if e := strings.TrimSpace(fc.Evidence); e != "" {
+				line += "（" + truncateStr(e, 300) + "）"
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("\n")
+	}
 
 	b.WriteString("### 改进建议\n")
 	for _, s := range improvementSuggestions(task, res) {

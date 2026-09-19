@@ -206,16 +206,14 @@ models:
   plan:    { provider: claude }
   execute: { provider: claude }
   verify:  { provider: claude }                 # 每次调用开新会话
+  # test_prep: { provider: claude, binary: claude, readonly: true }  # 可选：出题权分离（§8.4，不配 = plan 兼出题）
 budget:
   per_call_tokens: 20000
   per_task_tokens: 200000
   max_retries: 3
 verify:
-  deterministic:
-    - { label: tests, cmd: ["pytest", "-q"] }
-    - { label: types, cmd: ["mypy", "src/"] }
-    - { label: lint, cmd: ["ruff", "check", "."] }
   tier3_human: true              # 关掉则跳过 tier-3（仅限你想纯自动跑时）
+  # tier-1 无静态脚本列表——验收脚本由出题侧按任务产出（§8.6）。
 isolation:
   worktree: true
 gate:
@@ -241,15 +239,18 @@ daemon 任何阶段都不阻塞在人上（原则 7）。**没有并发、没有
 
 ### 8.4 子循环编排
 
-计划→执行→验证→写回 的骨架，按任务跑，重试有上限。每轮开始时从落盘存储**重新读**状态（原则 4）。任务结束后子循环销毁，只留下它落盘的结果（原则 7）。tier-3 时 park 并释放活跃位，daemon 之后恢复。
+计划→（出题）→执行→验证→写回 的骨架，按任务跑，重试有上限。每轮开始时从落盘存储**重新读**状态（原则 4）。任务结束后子循环销毁，只留下它落盘的结果（原则 7）。tier-3 时 park 并释放活跃位，daemon 之后恢复。
+
+**出题权分离（test-prep，可选角色）**：`models.test_prep` 配置即启用——plan 之后插入 test-prep step（每轮 attempt 重跑，输入带上轮考卷），验收合同与 tier-1 脚本由 test-prep **盲出**：输入白名单 = `{需求全文, 标准原件, repo HEAD, 上轮考卷}`，**实现侧产物（plan 输出/被拒 diff/verify 判决）一律不进**。依据：考卷必须从「被要求的」导出、不从「被打算的」导出——被考的是实施侧联合产物（diff 凝固 plan 的解读），plan 输出若进考卷，考卷对「plan 误读需求」结构性失明；串行时序下 diff 尚不存在，plan 输出是唯一需要立法的泄露通道。未配置 = legacy（plan 兼出题，行为与旧版一致；即回滚开关）。出题器挂了不 gate loop（可用性优先，同 triage）：回落 issue 原版标准、tier-1 缺席。
 
 ### 8.5 skill（用户拥有，覆盖 `go:embed` 默认；v1 内置初稿）
 
-无状态、I/O 契约固定、版本化。JSON 进出。子项目 1 **内置四个 skill 的初稿 prompt**，用户随后在 `.loop/skills/` 覆盖、用 seed 任务调。
+无状态、I/O 契约固定、版本化。JSON 进出。子项目 1 **内置 skill 的初稿 prompt**（triage / plan / test-prep / verify / help 五个），用户随后在 `.loop/skills/` 覆盖、用 seed 任务调。
 
 - **triage** —— 入：`{task_description, acceptance_criteria, task_type}` → 出：`{startable, missing_info[], loop_doable, suggested_type, difficulty, needs_human_decision, reason}`
-- **plan** —— 入：`{task, acceptance_criteria, battle_report(前几轮), repo_state_summary}` → 出：`{plan:[{step, files, expected}], risks[]}`（不写代码）
-- **verify**（tier-2）—— 入：`{diff, acceptance_criteria, prior_failure_signal?}` → 出：`{passed, reason, failing_criteria[]}`（新鲜上下文；执行推理**绝不**在输入里）
+- **plan** —— 入：`{task, acceptance_criteria, human_feedback, run_history, ...}` → 出：`{plan:[{step, files, expected}], risks[], agent_hints?}`（不写代码；legacy 下另有 `verify_script?/revised_criteria?`——test-prep 启用时出题职责移交，模板条件化隐藏）
+- **test-prep**（可选角色，`models.test_prep` 启用）—— 入（白名单）：`{task, acceptance_criteria(原件), body, prior_exam?, dispute_packet?}` → 出：`{criteria[], criteria_notes, verify_script?, risks[]}`。首考盲；`prior_exam` 非空默认沿用；`dispute_packet` 非空进修订模式（见 §8.6 争议路由）
+- **verify**（tier-2）—— 入：`{diff, acceptance_criteria, prior_failure_signal?}` → 出：`{passed, reason, failing_criteria[], failure_classes?}`（新鲜上下文；执行推理**绝不**在输入里）
 - **help** —— 入：`{task, blocked_state, attempts_summary, last_error}` → 出：`{help_request:{stuck_at, tried[], need_from_human}}`
 
 **执行不是 skill** —— 它经 provider 中立的 `Agent` 层 shell-out（默认 `claude`，可配；要用工具 / 改文件）。skill 的 I/O 是强类型 Go struct；强类型**就是**「固定 I/O 契约」的强制手段。
@@ -260,11 +261,18 @@ daemon 任何阶段都不阻塞在人上（原则 7）。**没有并发、没有
 
 对独立性的结构性强制（原则 2）：`verify` 包是一个**与执行分离的组件**，与执行**不共享**任何内存上下文。它只从落盘存储读 `(diff, acceptance_criteria)`。
 
-- **tier 1 —— 确定性脚本。** 对 worktree 跑每条配置好的 `verify.deterministic` 命令；解析退出码 + 输出。最独立（不碰 LLM）。默认第一道筛。脚本报错（而非失败）按「失败带详情」处理，绝不按通过。
+- **tier 1 —— 确定性脚本。** 对 worktree 跑**本轮生效的验收脚本**（无任何静态配置列表：legacy 由 plan 产出；test-prep 启用由考卷产出）；解析退出码 + 输出。最独立（不碰 LLM）。默认第一道筛。脚本报错（而非失败）按「失败带详情」处理，绝不按通过。脚本未产出（判不可脚本化）或非法（缺运行命令）→ tier-1 缺席，落 tier-2。
 - **tier 2 —— LLM 新鲜上下文。** 经 `Agent` 层开全新会话（默认 `claude`），只给 **diff + 验收标准**（重试时再加**上一轮的验证失败详情**——绝不是 execute/plan 的输出）。绝不给执行对话。处理脚本覆盖不到的语义标准。
 - **tier 3 —— 异步人审。** 子循环不阻塞：发 review-request 评论（diff 摘要 + 验收标准 + 要人判断的点）→ 置 `needs-review` → park → 释放活跃位 → 子循环结束。daemon 轮询到人在该 issue 上的回复后，带反馈恢复任务。人 accept → 写回 → done；reject/反馈 → 带反馈重试。用于业务正确性、审美、外部依赖正确性这类判断。
 
-**顺序：** tier 1 → 2 → 3。tier 1 不过就短路（不浪费 tier 2/3）。tier 1/2 任何一层不过 → 失败成为下一轮 计划 的反馈，预算内重试。**反馈分两路，判决与现场都传**：判决（驳回理由）经 priorFailure / verify-fail 评论 / 重试诊断；现场（被驳回的完整 diff）在 run 内由驳回处就地更新、跨 run 由 Run 开头按 issue_ref 从 steps.output_json 读回，两路都注入下一轮 plan（`RejectedDiff`）与 execute prompt——下一轮是「带完整信息决定沿用修正还是推倒重来」，不是对着判决书从零重掷。**执行端的自报只触发这条链，绝不是结论**（原则 3，结构性强制：execute 的输出不是任何一层「通过」判定的输入）。
+**顺序：** tier 1 → 2 → 3。tier 1 不过就短路（不浪费 tier 2/3）。tier 1/2 任何一层不过 → 失败成为下一轮 计划 的反馈，预算内重试。**反馈分两路，判决与现场都传**：判决（驳回理由）经 priorFailure / verify-fail 评论 / 重试诊断；现场（被驳回的完整 diff）在 run 内由驳回处就地更新、跨 run 由 Run 开头按 issue_ref 从 steps.output_json 读回，两路都注入下一轮 plan（`RejectedDiff`）与 execute prompt——下一轮是「带完整信息决定沿用修正还是推倒重来」，不是对着判决书从零重掷。**执行端的自报只触发这条链，绝不是结论**（原则 3，结构性强制：execute 的输出不是任何一层「通过」判定的输入；M1 起同理对出题侧成立：实施方的规划输出不得是验收合同的输入）。
+
+**争议路由（M2，分歧路由表）**：tier-2 驳回时对每条未满足标准输出归因分类 `failure_classes`（缺省/未给 = 全 work，现行为）——
+- **work**（实现缺陷）→ 上述现行重试路径，一行不改；
+- **exam**（考卷缺陷：误读需求/不可判定/结构性不可满足，必附证据）→ 争议包（指控+证据，facts only）回灌下一轮 test-prep 的 `dispute_packet`，**知情修订**：首考保持盲（独立性），被正式指控时带证据修订（可解性，#47 人工预演的自动化）；修订必附具体诊断、指控不成立须写明「争议不成立」（乱指控由此可观测）；修订全程落 input_json/output_json 审计、tier-3 人审复核；
+- **requirement**（需求本身矛盾/缺信息）→ 重试无意义（实现与考卷都可能没错）：挂 `needs-human-decision` 等人裁决——复用 triage-gate 全套基建（评论/打标/pollSignals/resume/重新分诊），人的回复经 resume 反馈进下一轮。
+
+有界性：零新增调用（争议修订搭每轮 test-prep 既有调用）；max_retries 照旧兜底；「拿不准一律 work」——重试便宜，上交人贵。
 
 **验证查的是验收标准，不是 plan。** plan 是预测、用完即弃；验收标准才是契约。执行偏离 plan 是常态（执行 agentic、可自适应——Occam 那轮已定：不把执行绑死在 plan 上），只要 diff 满足验收标准就过——**偏离 plan 不算「脱节」**，因为验证从不依赖 plan。真正的脱节只有两种：① 实现没满足标准（→ 正常失败、重试）；② 执行发现标准本身错/不全（→ 见 §10，criteria-mismatch 走人，**执行端不得自改标准**）。
 
@@ -297,7 +305,7 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 
 ### 8.10 模型集成（默认 `claude`，provider 可配置）
 
-**四个角色（triage、plan、execute、verify-tier2）都经 provider 中立的 `Agent` 层 shell-out**（`internal/model/agent.go`），每次调用开**全新会话**（不共享对话）——这也是验证独立性强制的一部分（verify-tier2 永远是干净上下文）。`Providers` 注册表（`claude`/`codex`/`opencode`/`kimi`/`kilo` 五家，`agent.go` 的 `var Providers`）是 provider 集合的**单一真相源**——config 校验（`ValidateProviders`）、`doctor` 派发、交互式配置菜单都读它，加 provider 是一行 map 编辑。`NewAgent(ref config.ModelRef)` 按 `ref.Provider` 派发（`ResolveProvider` 把 `""` 归一为 `claude`，保留开箱即用的 `claude -p` 行为）；未知 provider 直接报错（带全部合法集合），不静默回落。
+**五个角色（triage、plan、execute、verify-tier2；test-prep 可选，`models.test_prep` 启用、强制 readonly）都经 provider 中立的 `Agent` 层 shell-out**（`internal/model/agent.go`），每次调用开**全新会话**（不共享对话）——这也是验证独立性强制的一部分（verify-tier2 永远是干净上下文；test-prep 每轮出题同理）。`Providers` 注册表（`claude`/`codex`/`opencode`/`kimi`/`kilo` 五家，`agent.go` 的 `var Providers`）是 provider 集合的**单一真相源**——config 校验（`ValidateProviders`）、`doctor` 派发、交互式配置菜单都读它，加 provider 是一行 map 编辑。`NewAgent(ref config.ModelRef)` 按 `ref.Provider` 派发（`ResolveProvider` 把 `""` 归一为 `claude`，保留开箱即用的 `claude -p` 行为）；未知 provider 直接报错（带全部合法集合），不静默回落。doctor 对 test-prep 配置了才体检（零值走 legacy，无可查）。
 
 **为什么不直连 API（v3.1 砍掉曾经设计的 SDK 直连路径；默认 `claude`，可配置）：**
 1. **安装/配置最简**：用户只需装好 `claude` CLI（execute/verify 本来就要用），无需再配 `ANTHROPIC_API_KEY`——一条认证路径。
@@ -312,7 +320,7 @@ SQLite，走 `modernc.org/sqlite`（纯 Go → 二进制全静态）。schema **
 
 **步骤级 agent override（#71-B）**：plan 可在产出里带 `agent_hints`（execute/verify 各一个已注册 provider key）。子循环在 plan 返回后、execute 前解析 hint，经 `AgentForRole` 工厂按 forProvider 语义（换 provider+binary、保留 model 名、丢弃旧 provider 的 cmd 旗标）现构 agent；选择优先级 **step hint → 任务级 `agent:` → 角色配置 → 全局默认**。hint 不可用（未知 provider）回落角色配置，不崩。生效步的 `steps.model_ref` 写实际运行的 provider。冻结的 `Client`/`Executer` 接口不动——override 经 `AsClient`/`AsExecuter` 桥接。
 
-**合同可见性（plan↔execute）**：plan 冻结的实现合同（steps 里冻结的签名 + tier-1 验收脚本）直达 execute prompt——被合同约束的人必须能看到合同；上一轮冻结的合同回灌下一轮 plan（run 内内存直传、跨 run 按 issue_ref 从 steps.output_json 读回），plan 默认保持合同稳定、仅在驳回证明合同本身错误时修订。治 #71 三轮 blocked 的振荡病根（双方互不可见、同时对陈旧信号反应）。
+**合同可见性（plan↔execute）**：plan 冻结的实现合同（steps 里冻结的签名 + tier-1 验收脚本）直达 execute prompt——被合同约束的人必须能看到合同；上一轮冻结的合同回灌下一轮 plan（run 内内存直传、跨 run 按 issue_ref 从 steps.output_json 读回），plan 默认保持合同稳定、仅在驳回证明合同本身错误时修订。治 #71 三轮 blocked 的振荡病根（双方互不可见、同时对陈旧信号反应）。test-prep 启用时脚本段展示**考卷的**脚本（判 execute 的是这份），且考卷自身跨 run 回灌（`LatestTestPrepOutputByRef`）——出题人每轮是全新会话，看不到前任考卷就会盲重出、判分基准漂移。
 
 ### 8.11 工单通道（可插拔）
 
@@ -355,7 +363,7 @@ type: bugfix
 - [ ] 修复符合产品意图（不改 UX）     # → tier 3（人审）
 ```
 
-分诊（triage skill）判断标准是否充分、哪些可脚本化。验证 tier-1 把可脚本化的标准映射到配置的脚本；tier 2/3 处理其余。没有可检查的验收标准时，分诊在 issue 评论里说清缺什么、置 `needs-info`。
+分诊（triage skill）判断标准是否充分、哪些可脚本化。验证 tier-1 把可脚本化的标准映射到本轮产出的验收脚本（legacy=plan 产出；test-prep 启用=考卷产出，见 §8.6）；tier 2/3 处理其余。没有可检查的验收标准时，分诊在 issue 评论里说清缺什么、置 `needs-info`。
 
 ---
 

@@ -28,8 +28,9 @@ const maxPriorExamRunes = 8000
 // runTestPrep 执行一轮 test-prep step：预算闸 → 渲染 prompt → 调模型（worktree
 // 只读探索，与 plan 同款 RunIn）→ 记账 → step 落盘（seq=attempt*10+2，role=
 // "test-prep"）。返回考卷与真实用量；基础设施错误/解析失败返回 (nil, usage)——
-// 调用方回落 issue 原版标准并缺席 tier-1，绝不阻塞 loop。
-func (sl *SubLoop) runTestPrep(ctx context.Context, taskID, runID string, attempt int, task channel.Task, priorExam, wt string) (*skill.TestPrepOutput, model.Usage) {
+// 调用方回落 issue 原版标准并缺席 tier-1，绝不阻塞 loop。examDispute 非空 =
+// 修订模式（M2 争议包回灌，知情修订）。
+func (sl *SubLoop) runTestPrep(ctx context.Context, taskID, runID string, attempt int, task channel.Task, priorExam, examDispute, wt string) (*skill.TestPrepOutput, model.Usage) {
 	sid := shortID(taskID)
 	sl.logf("[subloop] %s phase=test-prep start", sid)
 	_ = sl.Store.SetInFlight(taskID, "test-prep")
@@ -47,6 +48,7 @@ func (sl *SubLoop) runTestPrep(ctx context.Context, taskID, runID string, attemp
 		AcceptanceCriteria: task.AcceptanceCriteria, // 标准原件（出题对象）
 		Body:               task.Body,               // 全文：出题以原文为准
 		PriorExam:          priorExam,               // 上轮考卷（默认沿用）
+		DisputePacket:      examDispute,             // M2 争议包（空=正常出题）
 	}
 	prompt, _ := skill.RenderPrompt(sl.TestPrep.PromptTmpl, in)
 	out, u, err := sl.TestPrep.RunIn(ctx, in, wt)

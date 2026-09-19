@@ -258,6 +258,10 @@ func (e *Engine) tick(ctx context.Context) error {
 	}
 	if status == "needs-review" {
 		e.logf("[daemon] tick park: task %s parked on tier-3 human review", shortTaskID(ready.ID))
+	} else if status == "needs-human-decision" {
+		// M2 争议路由：verify 把失败归因为需求本身的问题 → 挂起等人裁决；
+		// pollSignals 拾起人的回复后重新排队（复用 triage-gate 的全部基建）。
+		e.logf("[daemon] tick park: task %s parked on requirement dispute (needs-human-decision)", shortTaskID(ready.ID))
 	} else {
 		e.logf("[daemon] tick done: task %s → %s", shortTaskID(ready.ID), status)
 	}
